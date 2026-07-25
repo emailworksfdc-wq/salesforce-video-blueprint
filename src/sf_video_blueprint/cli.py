@@ -9,11 +9,12 @@ import typer
 
 from .correlation import correlate_all
 from .extractor import HeuristicVideoExtractor
-from .html_report import AgentBlueprintSection, MasterBlueprintRenderer
-from .models import ExtractedAction
+from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
+from .models import ActionType, ExtractedAction
 from .replay import ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
+from .spec_builder import build_agent_spec, write_spec
 from .telemetry import CorrelationKey, ObjectSnapshot, TelemetryCollector, TelemetryEvent, TelemetryLayer, TelemetryRegistry
 
 app = typer.Typer(help="Generate Salesforce process blueprint from video inputs.")
@@ -70,6 +71,11 @@ def run(
     username: str = typer.Option("analyst@example.com", help="Replay username for trace metadata."),
     profile_name: str = typer.Option("System Administrator", help="Replay profile name."),
     output_path: Path = typer.Option(Path("./outputs/master_blueprint.html"), help="Output HTML path."),
+    spec_output: Path | None = typer.Option(
+        None,
+        help="Output path for the machine-readable agent spec (JSON). "
+        "Defaults to <output-path>.agent-spec.json.",
+    ),
     mode: str = typer.Option(
         "mock",
         help="Execution mode: mock or live.",
@@ -85,6 +91,9 @@ def run(
 ) -> None:
     extractor = HeuristicVideoExtractor()
     extraction = extractor.extract(video_path)
+    # HeuristicVideoExtractor does not decode the video; it emits placeholder
+    # steps. Track that so the report can never present them as observed.
+    extraction_source = "stub"
     run_metadata = ReplayRunMetadata(
         run_id=f"run-{uuid4().hex[:8]}",
         org_url=org_url,
@@ -115,30 +124,56 @@ def run(
         telemetry.collect_step(collector, run_metadata.run_id, action.step_id)
 
     analyses = correlate_all(extraction.actions, replay_events, telemetry.events, telemetry.snapshots)
+
+    # The agent spec is DERIVED from the correlated run, never hardcoded: the
+    # whole point of the pipeline is that a different recording yields a
+    # different spec.
+    spec = build_agent_spec(extraction.actions, analyses)
+    provenance = DataProvenance(
+        extraction_source=extraction_source,
+        telemetry_source="live-org" if mode == "live" else "mock",
+        replay_source="browser" if mode == "live" else "noop",
+        agent_spec_source="derived",
+    )
     ai_sections = [
         AgentBlueprintSection(
-            intent="Update case status from UI workflow",
-            required_entities=["caseId", "newStatus", "userContext"],
-            orchestration_steps=[
-                "Validate caller authorization for record update.",
-                "Load current record state and confirm editable status.",
-                "Execute update flow and persist status change.",
-                "Return confirmation with audit metadata.",
-            ],
-            guardrails=[
-                "Reject updates when record is locked.",
-                "Require explicit confirmation for terminal statuses.",
-            ],
-            failure_handling=[
-                "On validation error, surface exact field-level issue.",
-                "On flow/apex exception, log correlation key and return fallback guidance.",
-            ],
+            intent=spec.intent,
+            required_entities=[item.name for item in spec.entities],
+            orchestration_steps=spec.orchestration_steps,
+            guardrails=spec.guardrails,
+            failure_handling=spec.failure_handling,
+            derived=True,
         )
     ]
 
     renderer = MasterBlueprintRenderer()
-    path = renderer.write_html(output_path, extraction, run_metadata, analyses, ai_sections)
+    path = renderer.write_html(output_path, extraction, run_metadata, analyses, ai_sections, provenance)
+
+    spec_path = spec_output or output_path.with_suffix(".agent-spec.json")
+    written_spec = write_spec(
+        spec_path,
+        spec,
+        {
+            "extraction_source": provenance.extraction_source,
+            "telemetry_source": provenance.telemetry_source,
+            "replay_source": provenance.replay_source,
+            "run_id": run_metadata.run_id,
+            "recording_id": extraction.recording_id,
+        },
+    )
+
     typer.echo(f"Master blueprint generated: {path}")
+    typer.echo(f"Agent spec (machine-readable) generated: {written_spec}")
+    typer.echo(f"Derived intent: {spec.intent} (confidence {spec.confidence:.2f})")
+    if provenance.is_simulated:
+        typer.secho(
+            "WARNING: this run contains SIMULATED data and is not audit evidence. "
+            f"Simulated: {'; '.join(provenance.simulated_parts)}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+    for unknown in spec.unknowns:
+        typer.secho(f"UNKNOWN: {unknown}", fg=typer.colors.YELLOW)
 
 
 if __name__ == "__main__":

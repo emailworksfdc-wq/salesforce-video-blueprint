@@ -60,7 +60,28 @@ PY
 }
 
 echo "[1/7] Preflight"
-python3 --version >/dev/null || die "python3 unavailable"
+# The package requires Python >=3.11 (PEP 604 unions are evaluated at runtime by
+# dataclasses). The system python3 on macOS is 3.9, so resolve an interpreter
+# explicitly and fail loudly rather than dying later with a confusing error.
+PY_BIN="${PY_BIN:-}"
+if [[ -z "${PY_BIN}" ]]; then
+  if [[ -x "./.venv/bin/python" ]]; then
+    PY_BIN="./.venv/bin/python"
+  else
+    for cand in python3.13 python3.12 python3.11 python3; do
+      if command -v "${cand}" >/dev/null 2>&1; then PY_BIN="$(command -v "${cand}")"; break; fi
+    done
+  fi
+fi
+[[ -n "${PY_BIN}" ]] || die "no python3 interpreter found"
+"${PY_BIN}" - <<'PY' || die "Python >=3.11 required; set PY_BIN or create ./.venv (uv venv --python 3.13 .venv)"
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+"${PY_BIN}" -c 'import typer, pydantic, jinja2, requests' >/dev/null 2>&1 \
+  || die "missing deps for ${PY_BIN}. Run: uv pip install --python ${PY_BIN} -e ."
+echo "  interpreter: ${PY_BIN} ($(${PY_BIN} -V 2>&1))"
+PREFLIGHT_OK=true
 retry_cmd 3 0.5 "preflight_org_display" env SF_DISABLE_LOG_FILE=true sf org display --target-org "${ORG_ALIAS}" --json || die "org display failed"
 retry_cmd 3 0.5 "preflight_user_query" env SF_DISABLE_LOG_FILE=true sf data query --target-org "${ORG_ALIAS}" --query "SELECT Id FROM User LIMIT 1" --json || die "user query failed"
 
@@ -71,14 +92,25 @@ export SF_BLUEPRINT_HEADLESS=1
 export SF_BLUEPRINT_ARTIFACTS_DIR="${ARTIFACT_DIR}"
 
 echo "[2/7] Mock run"
-PYTHONPATH=src python3 -m sf_video_blueprint.cli run "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode mock --output-path "${OUT_DIR}/mock_blueprint.html" >"${OUT_DIR}/mock_run.log" 2>&1 || die "mock run failed, see ${OUT_DIR}/mock_run.log"
+PYTHONPATH=src "${PY_BIN}" -m sf_video_blueprint.cli "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode mock --output-path "${OUT_DIR}/mock_blueprint.html" >"${OUT_DIR}/mock_run.log" 2>&1 || die "mock run failed, see ${OUT_DIR}/mock_run.log"
 
 echo "[3/7] Live run"
-LIVE_CMD=(python3 -m sf_video_blueprint.cli run "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode live --access-token "${SF_ACCESS_TOKEN}" --output-path "${OUT_DIR}/live_blueprint.html")
+# Token is passed via the exported SF_ACCESS_TOKEN env var, never as a CLI
+# argument: argv is world-readable via `ps` and lands in shell history.
+export SF_ACCESS_TOKEN
+LIVE_CMD=("${PY_BIN}" -m sf_video_blueprint.cli "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode live --output-path "${OUT_DIR}/live_blueprint.html")
 if [[ -n "${TRACK_RECORD}" ]]; then
   LIVE_CMD+=(--track-record "${TRACK_RECORD}")
 fi
 PYTHONPATH=src "${LIVE_CMD[@]}" >"${OUT_DIR}/live_run.log" 2>&1 || die "live run failed, see ${OUT_DIR}/live_run.log"
+
+# A run can exit 0 while individual replay steps failed. Surface that as a
+# critical issue rather than assuming success.
+LIVE_STEP_FAILED=false
+if grep -qE 'Replay status:[[:space:]]*(failed|retried)' "${OUT_DIR}/live_blueprint.html" 2>/dev/null; then
+  LIVE_STEP_FAILED=true
+  echo "WARN: live run contains failed/retried replay steps" >&2
+fi
 
 echo "[4/7] Telemetry checks"
 set +e
@@ -110,7 +142,7 @@ fi
 echo "[6/7] Negative test (track-record format)"
 NEG_OK=false
 set +e
-BAD_OUT="$(PYTHONPATH=src python3 -m sf_video_blueprint.cli run "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode live --access-token "${SF_ACCESS_TOKEN}" --track-record "BadFormat" 2>&1)"
+BAD_OUT="$(PYTHONPATH=src "${PY_BIN}" -m sf_video_blueprint.cli "${VIDEO_PATH}" --org-url "${ORG_URL}" --mode live --track-record "BadFormat" 2>&1)"
 NEG_RC=$?
 echo "${BAD_OUT}" > "${OUT_DIR}/negative_track_record.log"
 if [[ ${NEG_RC} -ne 0 && "${BAD_OUT}" =~ Invalid[[:space:]].*track-record ]]; then
@@ -119,20 +151,27 @@ fi
 set -e
 
 echo "[7/7] Score"
-python3 - <<'PY' "${SUMMARY}" "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${ARTIFACTS_OK}" "${NEG_OK}" "${OUT_DIR}"
+"${PY_BIN}" - <<'PY' "${SUMMARY}" "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${ARTIFACTS_OK}" "${NEG_OK}" "${OUT_DIR}" "${PREFLIGHT_OK}" "${LIVE_STEP_FAILED}"
 import json, sys, pathlib
+def flag(value: str) -> bool:
+    return value.lower() == "true"
 summary_path = pathlib.Path(sys.argv[1])
 q = [int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])]
-artifacts_ok = sys.argv[6] == "true" or sys.argv[6] == "True"
-neg_ok = sys.argv[7] == "true" or sys.argv[7] == "True"
+artifacts_ok = flag(sys.argv[6])
+neg_ok = flag(sys.argv[7])
 out_dir = pathlib.Path(sys.argv[8])
+preflight_ok = flag(sys.argv[9])
+live_step_failed = flag(sys.argv[10])
 data = {
-  "preflight_ok": True,
+  # Previously hardcoded True; now reflects whether preflight actually ran clean.
+  "preflight_ok": preflight_ok,
   "execution_ok": (out_dir / "mock_blueprint.html").exists() and (out_dir / "live_blueprint.html").exists(),
   "telemetry_ok": all(item == 0 for item in q),
   "artifacts_ok": artifacts_ok,
   "negative_tests_ok": neg_ok,
-  "critical_issue": False,
+  # Previously hardcoded False, which made the `not critical_issue` pass
+  # condition unfailable. Now set when the live run reported a step failure.
+  "critical_issue": live_step_failed,
   "details": {
     "telemetry_exit_codes": {"apexlog": q[0], "async": q[1], "flow": q[2], "validation": q[3]},
     "artifact_counts": {
@@ -145,11 +184,20 @@ summary_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 print(json.dumps(data, indent=2))
 PY
 
-python3 ./scripts/score_run.py "${SUMMARY}"
+set +e
+"${PY_BIN}" ./scripts/score_run.py "${SUMMARY}" "${OUT_DIR}"
+SCORE_RC=$?
+set -e
 
 if [[ "${STRICT_ARTIFACTS}" == "1" ]]; then
-  [[ -s "${ARTIFACT_DIR}/replay_manifest.json" ]] || die "STRICT_ARTIFACTS=1 requires replay_manifest.json"
-  [[ -s "${ARTIFACT_DIR}/step_ledger.json" ]] || die "STRICT_ARTIFACTS=1 requires step_ledger.json"
+  # NOTE: nothing in the pipeline emits these two artifacts yet, so
+  # STRICT_ARTIFACTS=1 is expected to fail until an emitter exists.
+  [[ -s "${ARTIFACT_DIR}/replay_manifest.json" ]] || die "STRICT_ARTIFACTS=1 requires replay_manifest.json (no emitter implemented yet)"
+  [[ -s "${ARTIFACT_DIR}/step_ledger.json" ]] || die "STRICT_ARTIFACTS=1 requires step_ledger.json (no emitter implemented yet)"
 fi
 
 echo "Validation complete. See ${OUT_DIR}"
+if [[ ${SCORE_RC} -ne 0 ]]; then
+  die "quality gate FAILED (see blocking_issues above). Artifacts retained in ${OUT_DIR}"
+fi
+echo "Quality gate passed."

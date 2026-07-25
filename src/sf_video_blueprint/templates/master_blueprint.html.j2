@@ -49,11 +49,42 @@
     .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 999px; background: #22c55e; margin-right: 6px; vertical-align: middle; animation: pulse 1.6s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
     .step-num { display:inline-block; width: 24px; height: 24px; line-height: 24px; text-align: center; background: var(--accent); color: #fff; border-radius: 999px; margin-right: 8px; font-size: 12px; }
+    .status-sim { background: #7f1d1d; color: #fff; border-color: #7f1d1d; font-weight: 700; letter-spacing: .04em; }
+    .sim-banner { background: #fef2f2; border: 2px solid #b91c1c; border-radius: 8px; padding: 16px 20px; margin: 0 0 26px; }
+    .sim-title { color: #7f1d1d; font-weight: 700; font-size: 15px; letter-spacing: .01em; margin-bottom: 6px; }
+    .sim-banner ul { margin: 8px 0 10px 20px; }
+    .sim-banner li { margin: 3px 0; color: #7f1d1d; }
+    .sim-foot { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+    .badge-sim { background: #fef2f2; color: #b91c1c; border-color: #fca5a5; }
+    .prov { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
   </style>
 </head>
 <body>
-<div class="status"><span class="dot"></span>Ready · blueprint generated</div>
+{% if provenance.is_simulated %}
+<div class="status status-sim">SIMULATED DATA</div>
+{% else %}
+<div class="status"><span class="dot"></span>Live org evidence</div>
+{% endif %}
 <div class="wrap">
+{% if provenance.is_simulated %}
+  <div class="sim-banner">
+    <div class="sim-title">⚠ NOT AUDIT EVIDENCE — THIS RUN CONTAINS SIMULATED DATA</div>
+    <p>
+      The following parts of this blueprint were <b>not</b> observed in a Salesforce org
+      and must not be presented as audit evidence, shared with stakeholders as findings,
+      or used to justify a go/no-go decision:
+    </p>
+    <ul>
+      {% for part in provenance.simulated_parts %}<li>{{ part }}</li>{% endfor %}
+    </ul>
+    <p class="sim-foot">
+      Sources — extraction: <code>{{ provenance.extraction_source }}</code> ·
+      replay: <code>{{ provenance.replay_source }}</code> ·
+      telemetry: <code>{{ provenance.telemetry_source }}</code> ·
+      agent spec: <code>{{ provenance.agent_spec_source }}</code>
+    </p>
+  </div>
+{% endif %}
   <header>
     <h1>Salesforce Video-to-HTML Master Blueprint</h1>
     <div class="sub">Run-level documentation that maps user UI actions to backend execution, data mutation, and AI-agent implementation design.</div>
@@ -64,6 +95,14 @@
       <span class="badge">Org: <b>{{ run.org_url }}</b></span>
       <span class="badge">Steps: <b>{{ analyses | length }}</b></span>
       <span class="badge">Evidence Artifacts: <b>{{ extraction.evidence | length }}</b></span>
+      {% if provenance.telemetry_source == "live-org" %}
+        <span class="badge">Telemetry: <b>live org</b></span>
+      {% else %}
+        <span class="badge badge-sim">Telemetry: <b>MOCK</b></span>
+      {% endif %}
+      {% if provenance.extraction_source == "stub" %}
+        <span class="badge badge-sim">Extraction: <b>STUB</b></span>
+      {% endif %}
     </div>
   </header>
 
