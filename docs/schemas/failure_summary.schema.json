@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sf-video-blueprint/schemas/failure_summary.schema.json",
+  "title": "FailureSummary",
+  "type": "object",
+  "required": ["schema_version", "run_id", "failed_steps"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "run_id": { "type": "string" },
+    "failed_steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step_id", "failure_layer", "failure_reason", "owner"],
+        "properties": {
+          "step_id": { "type": "string" },
+          "failure_layer": {
+            "type": "string",
+            "enum": ["UI", "Validation", "Flow", "Apex", "Integration", "Async", "Data", "Unknown"]
+          },
+          "failure_reason": { "type": "string" },
+          "owner": { "type": "string" },
+          "remediation": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

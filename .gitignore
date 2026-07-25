@@ -1,0 +1,36 @@
+# Python bytecode (compileall -b writes these next to sources)
+*.pyc
+*.pyo
+__pycache__/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Pipeline outputs — run artifacts, blueprints, screenshots, network traces.
+# These can contain real org data (record ids, field values); never commit them.
+outputs/
+inputs/
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

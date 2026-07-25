@@ -1,0 +1,29 @@
+[project]
+name = "sf-video-blueprint"
+version = "0.1.0"
+description = "Pipeline to convert Salesforce workflow videos into a traceable HTML blueprint."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "jinja2>=3.1.4",
+  "playwright>=1.46.0",
+  "pydantic>=2.8.2",
+  "requests>=2.32.3",
+  "typer>=0.12.3",
+]
+
+[project.scripts]
+sf-blueprint = "sf_video_blueprint.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sf_video_blueprint = ["templates/*.j2"]
+
+[build-system]
+requires = ["setuptools>=68.0.0"]
+build-backend = "setuptools.build_meta"

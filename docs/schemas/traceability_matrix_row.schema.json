@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sf-video-blueprint/schemas/traceability_matrix_row.schema.json",
+  "title": "TraceabilityMatrixRow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "step_id",
+    "business_intent",
+    "ui_action",
+    "backend_layer",
+    "object_api",
+    "record_id",
+    "evidence_ids",
+    "control_ids",
+    "result"
+  ],
+  "properties": {
+    "step_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "business_intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ui_action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "backend_layer": {
+      "type": "string",
+      "enum": ["UI", "API", "Apex", "Flow", "Database", "Integration", "Agent", "Unknown"]
+    },
+    "object_api": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:__c|__mdt|__e|__x)?$"
+    },
+    "record_id": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?:[a-zA-Z0-9]{15}|[a-zA-Z0-9]{18}|UNKNOWN|N/A)$"
+    },
+    "evidence_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "control_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "result": {
+      "type": "string",
+      "enum": ["passed", "failed", "partial", "blocked", "unknown"]
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "event_time": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

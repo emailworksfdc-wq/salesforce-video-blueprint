@@ -1,0 +1,53 @@
+{
+  "catalog_version": "1.0.0",
+  "catalog_id": "governance-compliance-controls",
+  "generated_at": "YYYY-MM-DDTHH:MM:SSZ",
+  "controls": [
+    {
+      "control_id": "GC-001",
+      "objective": "Control objective text",
+      "test_method": {
+        "type": "automated",
+        "frequency": "continuous",
+        "implementation": {
+          "engine": "custom",
+          "policy_path": "policies/domain/GC-001.rego",
+          "input_source": "runtime-config",
+          "assertion": "machine-testable condition"
+        },
+        "manual_fallback": {
+          "required": false,
+          "procedure": "manual verification steps"
+        }
+      },
+      "evidence": {
+        "artifacts": [
+          {
+            "type": "audit-log",
+            "location": "file://path/or/object-store",
+            "retention": "365d",
+            "owner": "security-team",
+            "integrity": {
+              "hash": "sha256:...",
+              "signed": true
+            }
+          }
+        ],
+        "collection": {
+          "mode": "automatic",
+          "collector": "ci-pipeline",
+          "last_collected_at": "YYYY-MM-DDTHH:MM:SSZ"
+        }
+      },
+      "metadata": {
+        "framework_mappings": [
+          { "framework": "SOC2", "requirement": "CC6.1" }
+        ],
+        "owner": "security-team",
+        "severity": "high",
+        "status": "active",
+        "tags": ["governance", "compliance", "policy-as-code"]
+      }
+    }
+  ]
+}

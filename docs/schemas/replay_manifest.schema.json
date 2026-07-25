@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sf-video-blueprint/schemas/replay_manifest.schema.json",
+  "title": "ReplayManifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "generated_at",
+    "org_url",
+    "username",
+    "environment",
+    "browser",
+    "headless",
+    "artifacts_dir",
+    "policy_version",
+    "model_version",
+    "prompt_template_version",
+    "permission_scope"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "run_id": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "org_url": { "type": "string" },
+    "username": { "type": "string" },
+    "environment": { "type": "string" },
+    "browser": { "type": "string" },
+    "headless": { "type": "boolean" },
+    "locale": { "type": "string" },
+    "timezone": { "type": "string" },
+    "viewport": {
+      "type": "object",
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "artifacts_dir": { "type": "string" },
+    "policy_version": { "type": "string" },
+    "model_version": { "type": "string" },
+    "prompt_template_version": { "type": "string" },
+    "permission_scope": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "feature_flags": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean", "null"] }
+    }
+  },
+  "additionalProperties": false
+}

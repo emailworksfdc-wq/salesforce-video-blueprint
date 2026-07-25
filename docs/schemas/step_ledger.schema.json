@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sf-video-blueprint/schemas/step_ledger.schema.json",
+  "title": "StepLedger",
+  "type": "object",
+  "required": ["schema_version", "run_id", "steps"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "run_id": { "type": "string" },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "step_id",
+          "sequence",
+          "attempt_no",
+          "action_type",
+          "target",
+          "ui_context",
+          "status",
+          "selector_contract",
+          "selector_used",
+          "triggered_layers",
+          "evidence_refs",
+          "started_at",
+          "ended_at",
+          "duration_ms"
+        ],
+        "properties": {
+          "step_id": { "type": "string" },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "attempt_no": { "type": "integer", "minimum": 1 },
+          "action_type": { "type": "string" },
+          "target": { "type": "string" },
+          "ui_context": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["success", "failed", "retried", "skipped"],
+            "description": "Mapped to replay_status in blueprint rendering."
+          },
+          "selector_contract": {
+            "type": "object",
+            "required": ["primary_selector", "fallback_selectors", "validation_predicate"],
+            "properties": {
+              "primary_selector": { "type": "string" },
+              "fallback_selectors": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "validation_predicate": { "type": "string" }
+            },
+            "additionalProperties": false
+          },
+          "selector_used": { "type": "string" },
+          "triggered_layers": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "frame_path": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "wait_gates": {
+            "type": "object",
+            "properties": {
+              "dom_ready": { "type": "boolean" },
+              "app_ready": { "type": "boolean" },
+              "data_ready": { "type": "boolean" }
+            },
+            "additionalProperties": false
+          },
+          "started_at": { "type": "string", "format": "date-time" },
+          "ended_at": { "type": "string", "format": "date-time" },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "url_after": { "type": "string" },
+          "title_after": { "type": "string" },
+          "error_code": { "type": ["string", "null"] },
+          "error_message": { "type": ["string", "null"] },
+          "screenshot_paths": {
+            "type": "object",
+            "required": ["before_action", "after_action", "final_state"],
+            "properties": {
+              "before_action": { "type": ["string", "null"] },
+              "after_action": { "type": ["string", "null"] },
+              "on_retry": { "type": ["string", "null"] },
+              "on_failure": { "type": ["string", "null"] },
+              "final_state": { "type": ["string", "null"] }
+            },
+            "additionalProperties": false
+          },
+          "network_events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["url", "method", "status", "resource_type", "timestamp"],
+              "properties": {
+                "url": { "type": "string" },
+                "method": { "type": "string" },
+                "status": { "type": "integer" },
+                "resource_type": { "type": "string" },
+                "timestamp": { "type": "string", "format": "date-time" },
+                "correlation_id": { "type": ["string", "null"] }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sf-video-blueprint/schemas/evidence_metadata.schema.json",
+  "title": "EvidenceMetadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_id",
+    "type",
+    "source",
+    "timestamp",
+    "checksum",
+    "quality_flag",
+    "linked_steps"
+  ],
+  "properties": {
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^EVID-[0-9]{8}-[A-Z0-9]{6,12}$"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["log", "screenshot", "document", "recording", "dataset", "transcript", "api_response", "other"]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "uri"],
+      "properties": {
+        "system": { "type": "string" },
+        "uri": { "type": "string", "minLength": 1 },
+        "collected_by": { "type": "string" }
+      }
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "enum": ["SHA-256", "SHA-512"]
+        },
+        "value": {
+          "type": "string",
+          "pattern": "^(?:[a-fA-F0-9]{64}|[a-fA-F0-9]{128})$"
+        }
+      }
+    },
+    "quality_flag": {
+      "type": "string",
+      "enum": ["verified", "review_required", "low_confidence", "rejected"]
+    },
+    "linked_steps": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^STEP-[0-9]{3,6}$"
+      }
+    }
+  }
+}
