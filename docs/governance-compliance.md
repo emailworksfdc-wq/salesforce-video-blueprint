@@ -1,5 +1,11 @@
 # Governance and Compliance Standard
 
+> **STATUS: ASPIRATIONAL — NOT IMPLEMENTED.**
+> This document describes intended design, not current behaviour. As of this
+> commit there is no code in `src/` that implements or enforces anything below.
+> Do not cite it as evidence of a control, capability, or release gate.
+> See the README status table for what actually works.
+
 ## Data Classification
 
 Every field and artifact must be classified before production use:

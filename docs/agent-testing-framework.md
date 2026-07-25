@@ -1,5 +1,11 @@
 # Agent Testing Framework (Non-Deterministic)
 
+> **STATUS: ASPIRATIONAL — NOT IMPLEMENTED.**
+> This document describes intended design, not current behaviour. As of this
+> commit there is no code in `src/` that implements or enforces anything below.
+> Do not cite it as evidence of a control, capability, or release gate.
+> See the README status table for what actually works.
+
 ## Required Taxonomy
 
 - Happy path

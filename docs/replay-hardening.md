@@ -1,5 +1,18 @@
 # Replay Hardening Standard (Salesforce UI)
 
+> **STATUS: PARTIALLY IMPLEMENTED.** This is a target standard, not a
+> description of current behaviour. As of this commit:
+>
+> | Rule | Reality |
+> | --- | --- |
+> | Retry policy, backoff + jitter | **Implemented** (`replay.py` `RetryPolicy`, `_run_step`) |
+> | Error classification | **Implemented** (`replay_browser.py` `_classify_action_exception`) |
+> | Per-step artifact capture (screenshot, network trace) | **Implemented** |
+> | Wait hardening | **Partial** — no spinner-completion or network-idle gate |
+> | Per-step selector contract (`primary_selector`, `fallback_selectors[]`, `validation_predicate`) | **Not implemented** — candidates are built ad hoc |
+> | Frame/modal state discipline | **Not implemented** — `[role='dialog']` and `.slds-modal__container` are passed to `frame_locator()`, which only accepts iframes, so those scopes silently never resolve |
+> | Reproducibility bundle (manifest, ledger, failure summary) | **Not implemented** — no emitter exists |
+
 This standard defines reliability and auditability rules for browser replay.
 Use it for all process-to-agent conversion runs.
 
