@@ -451,19 +451,25 @@ def build_ngt_test_spec(
     return test_spec, derivations
 
 
+def render_test_spec(test_spec: LegacyTestSpec | NgtTestSpec) -> str:
+    """Render a test spec to YAML text, choosing the emitter by dialect.
+
+    Split out from :func:`write_test_spec` so a caller that needs the YAML
+    in-process — an MCP tool returning it to an agent, a diff, a test assertion —
+    does not have to write a file to a temporary directory to see it.
+    """
+    if isinstance(test_spec, LegacyTestSpec):
+        return _emit_legacy_yaml(test_spec)
+    return _emit_ngt_yaml(test_spec)
+
+
 def write_test_spec(path: Path, test_spec: LegacyTestSpec | NgtTestSpec) -> Path:
     """Write a test spec to YAML with provenance comments.
 
     Detects dialect by type. Key order matches the CLI's write order so diffs are clean.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    if isinstance(test_spec, LegacyTestSpec):
-        yaml_content = _emit_legacy_yaml(test_spec)
-    else:
-        yaml_content = _emit_ngt_yaml(test_spec)
-
-    path.write_text(yaml_content, encoding="utf-8")
+    path.write_text(render_test_spec(test_spec), encoding="utf-8")
     return path
 
 
