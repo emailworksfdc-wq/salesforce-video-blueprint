@@ -4,21 +4,28 @@ version = "0.1.0"
 description = "Pipeline to convert Salesforce workflow videos into a traceable HTML blueprint."
 readme = "README.md"
 requires-python = ">=3.11"
-# Pinning policy: compatible-release (~=) for runtime deps to allow patch/minor
-# updates while preserving reproducibility; exact pins (==) for dev/test tooling.
-# This is a library-plus-CLI: loose runtime pins keep it installable alongside
-# other packages; tight dev pins ensure deterministic CI/local test runs.
+# Pinning policy: lower bounds with a major-version ceiling. This is a
+# library-plus-CLI, so runtime pins stay loose enough to install alongside other
+# packages.
+#
+# The lower bounds are NOT arbitrary — they are the floors that actually build on
+# Python 3.12 and 3.13. A tighter `playwright~=1.46` pulls in an old greenlet
+# whose C extension fails to compile against the 3.12+ C API (_PyCFrame removed),
+# which breaks installation entirely on modern interpreters. Do not lower these
+# without checking a 3.13 build.
 dependencies = [
-  "jinja2~=3.1.4",
-  "playwright~=1.46.0",
-  "pydantic~=2.8.2",
-  "requests~=2.32.3",
-  "typer~=0.12.3",
+  "jinja2>=3.1.4,<4",
+  "playwright>=1.55,<2",
+  "pydantic>=2.8.2,<3",
+  "requests>=2.32.3,<3",
+  "typer>=0.12.3,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest==9.1.1",
+  # Lower bound rather than an exact pin: an exact pytest pin makes the package
+  # uninstallable alongside any other project that pins a different patch.
+  "pytest>=8.0,<10",
   # pyyaml: enables round-trip validation of hand-rolled YAML emitters in
   # agentforce_spec.py and eval_spec.py. Currently those modules emit YAML via
   # string concatenation but never parse their own output — a verification gap.
