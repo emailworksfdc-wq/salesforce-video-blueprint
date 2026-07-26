@@ -191,6 +191,41 @@ awards honesty points for declaring unknowns, and a failed case adds one — so 
 really did get more honest, but a reader diffing `score_before` against `score_after`
 would read the rise as the agent improving. A round with failures whose score rose now
 carries an explicit note. The rubric is untouched.
+### Added — the first real Salesforce capture in the repository
+
+Every fixture in `examples/` until now was written by hand to exercise a code
+path. `examples/case_creation_aft3.dom_capture.jsonl` is the opposite: 175 events
+recorded off a live Developer Edition org while a Case was created and its Status
+changed, committed with a manifest (`.dom_capture.manifest.json`) that records the
+recorder SHA, the browser version, and exactly what was redacted. Org host, org
+id, username and record ids are synthetic; DOM structure, event order, shadow
+depths and — the part that matters — the null selectors are unmodified.
+
+Hand-written fixtures cannot fail in the ways real Lightning DOM does, which is
+why two defects fixed earlier in this release had never been confirmed against
+anything real. Measured on this artifact:
+
+- **Ingest accepts all of it: 175/175 events parsed, 0 lines skipped,
+  `validate_trace()` returns `[]`.** Before the nullable `role`/`name` fix it
+  parsed 4 of 175 and the pipeline rejected the run outright as 98% data loss.
+  The capture still carries 170+ null role/name pairs, so it keeps proving what it
+  was recorded to prove — the fix did not come from sanding the input down.
+- **`evidence_grounding` scores 25/30, not the 5/30 the false padding detector
+  produced, and no `PADDING` finding fires.** That is the `None.None` collapse
+  confirmed dead on the data that exposed it rather than on a reconstruction.
+
+`test_c11_on_lane_02_real_capture_when_available` consequently runs instead of
+skipping, taking the suite from two expected skips to one. A skip retired by
+supplying the evidence it was waiting for, not by relaxing what it asserts.
+
+**The real spec still does not pass: 59/100 displayed (85 raw), band `low`.** The
+sole blocking issue is `telemetry_source` — this capture carries no live-org
+telemetry, so the gate refuses it, exactly as designed. Nothing in `markers.py`
+or `PASS_THRESHOLD` was touched to accommodate the artifact.
+
+A wrongly-typed selector is still malformed: `role=None` is accepted, `role=123`,
+`["button"]`, `{"role": "button"}`, `1.5` and `True` all still raise. Accepting
+absent data is not the same as accepting garbage, and a test pins the difference.
 
 ### Known gap
 
@@ -207,13 +242,9 @@ Whether real telemetry correlates therefore depends on where in the second the
 user clicked. Asserted by tests rather than fixed: widening a *causal* window
 backwards is a semantic decision about what may be claimed as caused.
 
-`test_c11_on_lane_02_real_capture_when_available` is skipped: the real capture
-that exposed the `None.None` collapse cannot be committed as a fixture yet
-because ingest still rejects 171 of its 175 events (`selectors.role_name.role` is
-null for LWC elements with no implicit ARIA role). The property is asserted on a
-synthetic reconstruction in the meantime. Fail-closed rejection is the correct
-behaviour, but it means this defect's own regression test does not yet run
-against the artifact that found it.
+*(Resolved in this release — see "the first real Salesforce capture" above.
+`test_c11_on_lane_02_real_capture_when_available` now runs against the committed
+artifact instead of skipping.)*
 
 ## [0.1.1] — 2026-07-26
 

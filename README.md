@@ -148,17 +148,18 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 1367 passed, 2 skipped
+.venv/bin/python -m pytest -q          # 1386 passed, 1 skipped
 ```
 
-Without the `mcp` extra you get `1327 passed, 3 skipped` — the MCP server tests
+Without the `mcp` extra you get `1346 passed, 2 skipped` — the MCP server tests
 skip rather than fail when the optional dependency is absent.
 
-Two skips are expected. One is an opt-in check that validates artifacts from a
-real end-to-end run; set `SF_BLUEPRINT_E2E_DIR` to enable it. The other is a
-score-gate assertion against a real recorded capture, which stays skipped until
-that capture is committed *and* survives ingest — see `docs/DEFECT_LEDGER.md`.
-Everything else is hermetic — no org, no network, no credentials.
+One skip is expected: an opt-in check that validates artifacts from a real
+end-to-end run, which needs `SF_BLUEPRINT_E2E_DIR` pointed at that run's output.
+The score-gate assertion against a real recorded capture used to be the second
+skip; `examples/case_creation_aft3.dom_capture.jsonl` is now committed and
+survives ingest, so it runs. Everything else is hermetic — no org, no network,
+no credentials.
 
 Then run the pipeline on the bundled example capture — **no Salesforce org, no
 network, no credentials required**:

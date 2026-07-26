@@ -3,19 +3,26 @@
 `examples/case_creation_aft3.dom_capture.jsonl` is a real click-by-click recording
 of a Case being created in a Developer Edition org (lane 02). Every other capture
 in this repo is synthetic, and the synthetic one parses cleanly — which is exactly
-why the ingest path looked healthy for so long. On real Lightning DOM it discards
-98% of the recording.
+why the ingest path looked healthy for so long. On real Lightning DOM the parser
+discarded 98% of the recording: 171 of 175 events failed `RawDomEvent` validation
+because `selectors.role_name.role` is null for LWC hosts with no implicit ARIA role.
+
+**That defect is fixed.** `RawRoleName` now declares both halves nullable while
+keeping `strict=True`, and this capture parses 175/175 with zero skipped lines and
+zero `validate_trace` findings. The assertions below were inverted when the fix
+landed; the history of this file is the record of the defect.
 
 These tests exist to make that fact non-regressible in both directions:
 
 1. The fixture must stay REAL. If someone "fixes" the example by filling in the
    null selectors, the tests that assert nulls will fail and the honesty of the
-   fixture is restored by reverting, not by editing the fixture.
+   fixture is restored by reverting, not by editing the fixture. The nulls are
+   still asserted — they are the evidence that the parser handles real DOM rather
+   than DOM that was cleaned up to suit it.
 2. The fixture must stay REDACTED. `test_real_capture_contains_no_secrets` is the
    gate that keeps a session id or org host from ever landing in git.
-3. The 98% data-loss number is pinned as an XFAIL-style characterization, not as
-   an endorsement. Lane 04 owns the ingest fix. When that fix lands, the loss
-   assertions below are the ones that must be UPDATED (a comment marks each).
+3. Full parse is now pinned, so a regression that reintroduces the loss fails
+   loudly instead of quietly returning to 4 events.
 
 Do NOT make these tests pass by loosening the score gate or by adding
 "mock"/"synthetic" to the real-source marker sets. The whole point of the
@@ -31,7 +38,7 @@ from pathlib import Path
 import pytest
 
 from sf_video_blueprint.dom_capture import parse_capture_file, validate_trace
-from sf_video_blueprint.pipeline import CaptureRejected, run_pipeline
+from sf_video_blueprint.pipeline import run_pipeline
 
 REAL_CAPTURE = Path(__file__).parent.parent / "examples" / "case_creation_aft3.dom_capture.jsonl"
 SYNTHETIC_CAPTURE = Path(__file__).parent.parent / "examples" / "case_triage.dom_capture.jsonl"
@@ -39,9 +46,11 @@ SYNTHETIC_CAPTURE = Path(__file__).parent.parent / "examples" / "case_triage.dom
 #: Total events the recorder wrote during the real session.
 REAL_EVENT_COUNT = 175
 
-#: Events that survive `RawDomEvent` validation today. Lane 04's ingest fix should
-#: raise this toward REAL_EVENT_COUNT; update this constant when it does.
-REAL_PARSEABLE_COUNT = 4
+#: Events that survive `RawDomEvent` validation. Every one of them does, now that
+#: `RawRoleName` accepts the nulls its own recorder emits. This was 4 before that
+#: fix — a regression would show up here as a drop, which is the point of pinning
+#: the full count rather than a floor.
+REAL_PARSEABLE_COUNT = REAL_EVENT_COUNT
 
 
 def _raw_events() -> list[dict]:
@@ -157,17 +166,34 @@ def test_real_capture_is_structurally_real_lightning_dom() -> None:
     ), "real capture had zero derivable sf_field; a non-null one means the fixture was edited"
 
 
-def test_synthetic_example_is_the_optimistic_case() -> None:
-    """Guards the comparison: the synthetic capture parses 100%, the real one does not.
+def test_both_captures_now_parse_but_only_one_proves_anything() -> None:
+    """Both parse cleanly — and that is precisely why the synthetic one is not enough.
 
-    This is the contrast that matters. A test suite that only ever sees the
-    synthetic fixture concludes the ingest path works.
+    A suite that sees only the synthetic fixture concluded the ingest path worked
+    while it was discarding 98% of real recordings, because the synthetic fixture
+    was written to match the parser rather than the recorder. Equal cleanliness here
+    is not evidence of equal value: the real capture is the one carrying null
+    role/name pairs, shadow-DOM-defeated labels and Lightning's actual markup.
     """
     synthetic = parse_capture_file(SYNTHETIC_CAPTURE)
     assert synthetic.skipped_lines == [], "synthetic example is expected to parse cleanly"
 
     real = parse_capture_file(REAL_CAPTURE)
-    assert real.skipped_lines, "real capture is expected to lose events until lane 04's fix"
+    assert real.skipped_lines == [], (
+        "the real capture must parse without loss; a non-empty skipped_lines here "
+        f"means the nullable role/name regression is back: {real.skipped_lines[:3]}"
+    )
+
+    # The distinguishing property, asserted so the two fixtures cannot converge:
+    # the real one still contains the nulls that used to break the parser.
+    raw = _raw_events()
+    null_role = sum(
+        1 for e in raw if (e["selectors"].get("role_name") or {}).get("role") is None
+    )
+    assert null_role >= 170, (
+        "the real capture no longer carries null role/name pairs, so it has been "
+        "sanitized into a second synthetic fixture and proves nothing about real DOM"
+    )
 
 
 # ============================================================================
@@ -175,58 +201,110 @@ def test_synthetic_example_is_the_optimistic_case() -> None:
 # ============================================================================
 
 
-def test_real_capture_loses_events_to_nullable_role_name() -> None:
-    """ROOT CAUSE: recorder.js emits role_name={role: null, name: null} for LWC
-    hosts (no implicit ARIA role), but RawRoleName declares role/name as
-    non-nullable `str`. One type mismatch discards 98% of a real recording.
+def test_nullable_role_name_no_longer_costs_the_recording() -> None:
+    """ROOT CAUSE, now fixed: `recorder.js` emits `role_name={role: null, name: null}`
+    for LWC hosts with no implicit ARIA role, and `RawRoleName` used to declare both
+    halves as required `str`. One type mismatch discarded 171 of 175 real events —
+    the parser was stricter than the format it consumes.
 
-    LANE 04: when you make RawRoleName's fields nullable (or drop an all-null
-    role_name to None at parse time), REAL_PARSEABLE_COUNT goes up and this test
-    must be updated. That is the intended direction.
+    Both halves are nullable now, so all 175 parse. `strict=True` is retained, which
+    is what keeps this from being a blanket loosening: a role that is a *number* or a
+    list is still malformed and still lands in `skipped_lines`.
     """
     trace = parse_capture_file(REAL_CAPTURE)
 
-    assert len(trace.events) == REAL_PARSEABLE_COUNT
-    assert len(trace.skipped_lines) == REAL_EVENT_COUNT - REAL_PARSEABLE_COUNT
-
-    # Every single skip is the same root cause — not a scattering of problems.
-    reasons = [reason for _, reason in trace.skipped_lines]
-    assert all("selectors.role_name" in r for r in reasons), (
-        "expected every dropped line to fail on selectors.role_name; "
-        f"got other reasons: {[r for r in reasons if 'selectors.role_name' not in r][:3]}"
+    assert len(trace.events) == REAL_PARSEABLE_COUNT == REAL_EVENT_COUNT
+    assert trace.skipped_lines == [], (
+        f"expected zero loss on the real capture, lost {len(trace.skipped_lines)}: "
+        f"{[r for _, r in trace.skipped_lines][:3]}"
     )
 
-    # And the raw data really does carry null role/name — the recorder's output,
-    # not a corruption introduced by redaction.
+    # The nulls are still there — this passes because the parser accepts real DOM,
+    # not because the fixture was cleaned up to suit the parser.
     raw = _raw_events()
     null_role = sum(1 for e in raw if (e["selectors"].get("role_name") or {}).get("role") is None)
-    assert null_role >= 170
+    assert null_role >= 170, (
+        "the fixture no longer carries the null role/name pairs that exposed the "
+        "defect; full parse is then meaningless"
+    )
 
 
-def test_real_capture_is_rejected_by_the_pipeline() -> None:
-    """End-to-end honesty check: a real capture produces NO spec today.
+def test_a_wrongly_typed_role_is_still_malformed() -> None:
+    """Nullable is not untyped. The fix must not have turned the schema off.
 
-    The pipeline fails closed at >=50% data loss, so the first real recording this
-    project ever took yields a `CaptureRejected`, not a score. This is the correct
-    behaviour for the current ingest path — a spec derived from 4 of 175 events
-    would be a fabrication wearing a score.
+    If a role of `123` were accepted, the parser would have stopped validating this
+    field at all rather than allowing the one value the recorder really emits.
     """
-    with pytest.raises(CaptureRejected) as excinfo:
-        run_pipeline(
-            REAL_CAPTURE,
-            org_url="https://example-org-dev-ed.develop.my.salesforce.com",
-        )
+    from sf_video_blueprint.dom_capture import RawRoleName
 
-    findings = excinfo.value.findings
-    assert any(f.startswith("DATA LOSS:") for f in findings)
-    assert any("98%" in f for f in findings), f"expected the measured 98% loss, got {findings}"
+    RawRoleName(role=None, name=None)  # the recorder's real output
+    RawRoleName(role="button", name=None)  # a partial pair still narrows a selector
+
+    for bad in (123, ["button"], {"role": "button"}, 1.5, True):
+        with pytest.raises(Exception):  # noqa: B017 - pydantic's own error type
+            RawRoleName(role=bad, name=None)
 
 
-def test_validate_trace_reports_the_data_loss_rather_than_hiding_it() -> None:
-    """The integrity layer must surface the loss, since the parser itself is silent."""
+def test_real_capture_now_yields_a_spec_and_still_does_not_pass_the_gate() -> None:
+    """End-to-end: the first real recording produces a spec, and it honestly fails.
+
+    Before the ingest fix this raised `CaptureRejected` — the pipeline fails closed
+    at >=50% loss, and a spec built from 4 of 175 events would have been a
+    fabrication wearing a score. Now all 175 parse and a real spec comes out.
+
+    It still does not pass, and that is the correct result: telemetry here is
+    `mock`, which is not in `markers.REAL_TELEMETRY_SOURCES`, so the run is blocked
+    on provenance no matter how good the DOM evidence is. Fixing ingest bought real
+    extraction evidence; it did not and must not buy a pass.
+    """
+    result = run_pipeline(
+        REAL_CAPTURE,
+        org_url="https://example-org-dev-ed.develop.my.salesforce.com",
+    )
+
+    assert result.spec is not None
+    assert result.spec.intent, "a real capture must yield a non-empty intent"
+    assert "Case" in (result.spec.objects_touched or [])
+
+    assert result.score.passed is False, "mock telemetry must never pass the gate"
+    assert any(
+        "mock" in issue or "live org" in issue for issue in result.score.blocking_issues
+    ), f"expected a telemetry-provenance block, got {result.score.blocking_issues}"
+
+
+def test_the_gate_does_not_accuse_the_builder_of_padding_on_real_dom() -> None:
+    """128 of 129 observed entities are unresolvable Lightning controls, not an attack.
+
+    Real Lightning markup produces many inputs whose object/field cannot be resolved.
+    An earlier scorer collapsed all of them into one `None.None` bucket that looked
+    like the same field repeated, cut `evidence_grounding` to 5/30 and fired a
+    threshold-surfing block — penalising exactly the honest runs this project wants.
+    Pinned here on the real artifact, which is the only place the bug was visible.
+    """
+    result = run_pipeline(
+        REAL_CAPTURE,
+        org_url="https://example-org-dev-ed.develop.my.salesforce.com",
+    )
+    grounding = result.score.dimensions["evidence_grounding"]
+
+    accusations = [f for f in grounding.findings if "PADDING" in f.upper()]
+    assert not accusations, f"gate accused its own builder of padding: {accusations}"
+    assert grounding.score >= 20, (
+        f"evidence_grounding collapsed to {grounding.score}/30 on a real capture, "
+        "which is the None.None-bucket regression"
+    )
+
+
+def test_validate_trace_finds_nothing_to_report_on_the_real_capture() -> None:
+    """The integrity layer is silent because there is genuinely no loss left.
+
+    It used to report `DATA LOSS: 171 of 175 lines were skipped (98%)`. That the
+    finding is gone is the strongest single statement about the ingest fix — the
+    check that caught the defect no longer has anything to say about this file.
+    """
     trace = parse_capture_file(REAL_CAPTURE)
     findings = validate_trace(trace)
-    assert any(f.startswith("DATA LOSS:") for f in findings), findings
+    assert findings == [], f"expected a clean real capture, got findings: {findings}"
 
 
 # ============================================================================
