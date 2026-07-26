@@ -2462,3 +2462,135 @@ def test_evidence_incomplete_finding_is_greppable_and_specific(
     assert len(incomplete) == 1
     text = incomplete[0]
     assert "2" in text and "10" in text and "20%" in text
+
+
+# ============================================================================
+# 15. REVIEW FINDING R1 — the widened detector fires on ordinary Lightning
+#     markup, which trains operators to ignore it
+# ============================================================================
+#
+# DEFECT L4-6 widened leak detection from `element.name` to fourteen identity
+# signals. Two of the patterns it carries — "card" and "auth" — are bare
+# substrings, and two of the newly-inspected signals (`element.classes`,
+# `selectors.css_path`) are PRESENTATION metadata rather than field identity.
+# Salesforce's own design system puts `slds-card__body` on a large fraction of
+# record-detail markup, so measured before this fix:
+#
+#     Subject field inside an slds-card ->  element.classes~'card'
+#                                           selectors.css_path~'card'
+#     Author__c                         ->  element.name='author__c'
+#     Scorecard__c / Discard_Changes    ->  card
+#     Authorization_Status__c           ->  auth
+#
+# These are non-blocking `SECURITY:` findings, so nothing aborts — which is
+# precisely the problem. A leak detector that fires on most Lightning inputs is
+# one an operator learns to scroll past, and the real leak scrolls past with it.
+# Alarm fatigue is a security defect in a control whose only output is an alarm.
+#
+# The fix keeps every TRUE positive from the L4-6 test matrix. "card" and "auth"
+# move to word-boundary matching, and the payment-card signal is carried by the
+# more specific patterns that already existed ("credit", "cvv", "cvc") plus the
+# word-boundary "card" that still catches `Credit_Card_Number__c`, `card-number`
+# and `Card_Number__c`.
+
+
+def test_slds_card_markup_is_not_a_redaction_leak() -> None:
+    """REVIEW R1: `slds-card__body` is design-system markup, not a payment card.
+
+    Before this fix a Case Subject field rendered inside an SLDS card produced
+    two SECURITY findings.
+    """
+    trace = synthesize_trace([
+        {
+            "value": "Printer is broken",
+            "value_redacted": False,
+            "element": {
+                "tag": "input",
+                "type": "text",
+                "name": "Subject",
+                "classes": ["slds-input", "slds-card__footer"],
+            },
+            "selectors": {
+                "sf_field": "Subject",
+                "css_path": "div.slds-card__body input.slds-input",
+            },
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings == [], f"SLDS card markup produced a false leak finding: {findings}"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "Author__c",
+        "AuthorName__c",
+        "Author_Bio__c",
+        "Authorization_Status__c",
+        "Scorecard__c",
+        "Discard_Changes",
+        "Standard_Card_Layout",
+    ],
+)
+def test_benign_field_names_embedding_card_or_auth_do_not_false_positive(field_name: str) -> None:
+    """REVIEW R1: "card" and "auth" as bare substrings catch ordinary SF fields.
+
+    `Author__c` is a person's name, not a credential. `Scorecard__c` is a
+    number, not a payment instrument.
+
+    NOT in this list, deliberately: `Dashboard_Pin__c`. "pin" stays a
+    word-boundary pattern and still fires on it. A field whose name contains the
+    standalone word "Pin" plausibly IS a PIN, the spelling is rare, and the
+    finding is non-blocking — so the bias goes toward reporting. That is a
+    different situation from "card"/"auth", which matched a large fraction of all
+    Lightning markup via SLDS class names and so drowned the signal.
+    """
+    trace = synthesize_trace([
+        {
+            "value": "some ordinary value",
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "text", "name": field_name},
+            "selectors": {"sf_field": field_name},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings == [], f"{field_name!r} produced a false leak finding: {findings}"
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "Credit_Card_Number__c",
+        "card-number-input",
+        "Card_Number__c",
+        "cardNumber",
+        "credit_card",
+        "Auth_Token__c",
+        "authToken",
+        "oauth_token",
+        "Credential__c",
+    ],
+)
+def test_genuinely_sensitive_card_and_auth_fields_are_still_caught(field_name: str) -> None:
+    """REVIEW R1: narrowing must not cost a single TRUE positive.
+
+    This is the half of the fix that matters — tightening a security pattern is
+    only safe if the sensitive cases it existed for still fire.
+    """
+    trace = synthesize_trace([
+        {
+            "value": _CANARY,
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "text", "name": field_name},
+            "selectors": {"sf_field": field_name},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings, f"{field_name!r} is sensitive but produced NO finding"
+    assert not any(_CANARY in f for f in findings), "finding echoed the value"

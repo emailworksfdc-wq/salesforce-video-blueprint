@@ -556,18 +556,39 @@ def order_events(events: list[RawDomEvent]) -> list[RawDomEvent]:
 
 #: Substrings that mark a field as sensitive. Matched against normalized
 #: identity signals (see `_sensitive_signal_hits`).
+#:
+#: REVIEW FINDING R1 — why "card" and "auth" are NOT here as bare substrings.
+#: They were, and they made the detector fire on ordinary Lightning markup:
+#: `slds-card__body` is on a large fraction of record-detail DOM, so a Case
+#: Subject field produced `element.classes~'card'` + `selectors.css_path~'card'`,
+#: and `Author__c` / `Authorization_Status__c` / `Scorecard__c` all matched too.
+#: Since these findings are non-blocking by design, the cost was not a broken
+#: run but alarm fatigue — an operator who scrolls past the leak detector's
+#: output scrolls past the real leak with it. For a control whose entire output
+#: is an alarm, crying wolf IS the failure mode.
+#:
+#: The payment-card and credential cases are carried by more specific tokens
+#: below. Verified in both directions by
+#: `test_genuinely_sensitive_card_and_auth_fields_are_still_caught` (no true
+#: positive lost, including `Auth_Token__c` and `cardNumber`) and
+#: `test_benign_field_names_embedding_card_or_auth_do_not_false_positive`.
 SENSITIVE_PATTERNS: tuple[str, ...] = (
     "password",
     "passwd",
     "pwd",
     "secret",
-    "token",
+    "token",  # also carries Auth_Token__c / oauth_token / bearer-token fields
+    "bearer",
     "api_key",
     "apikey",
     "ssn",
     "social_security",
     "socialsecurity",
-    "card",
+    # Payment card: specific enough not to match `slds-card__body` or `Scorecard__c`.
+    "card_number",
+    "cardnumber",
+    "cardnum",
+    "cardholder",
     "credit",
     "cvv",
     "cvc",
@@ -578,7 +599,6 @@ SENSITIVE_PATTERNS: tuple[str, ...] = (
     "tax_id",
     "taxid",
     "national_id",
-    "auth",
     "credential",
 )
 
