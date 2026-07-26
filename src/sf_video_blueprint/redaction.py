@@ -881,12 +881,16 @@ def scrub_collected_telemetry(
     `--mode live --track-record Case:<id>` a token sitting in a Case field reached
     `agent-spec.json` verbatim. Measured, not hypothetical.
 
-    Called from the CLI after telemetry collection and before `correlate_all`, which
-    is the last point where the data is still in one place and the first point where
-    it is complete. It lives here rather than inside `TelemetryRegistry` because
-    `telemetry.py` is owned by another lane (orchestrator bulletin 02); a registry
-    that scrubbed on ingest would be the stronger design and is the recommendation
-    handed to that owner.
+    `TelemetryRegistry` now scrubs on ingest, which is the stronger boundary — it
+    covers every caller rather than the ones that remember. This function remains as
+    defence in depth, still called from the CLI after collection and before
+    `correlate_all`, for anything appended to a registry outside its ingest methods.
+
+    It is idempotent: re-scrubbing already-clean data changes nothing and finds no
+    categories. Callers that report what was redacted must therefore use the UNION of
+    this return value and `TelemetryRegistry.redaction_categories`, or the run will
+    stop saying the control fired once ingest has already done the work. `cli.py`
+    does exactly that.
 
     Takes duck-typed sequences rather than importing the telemetry models, so this
     module stays free of a dependency on `telemetry.py` (which already imports
