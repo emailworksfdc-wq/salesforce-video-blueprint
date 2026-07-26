@@ -463,7 +463,7 @@ pass
 
 **Reality:** When `use_cli=True`, the loop calls `sf agent generate agent-spec --spec <prev>.yaml --role "<refined>"` and writes `<next>.yaml`, but it does NOT parse the new YAML back into a `DerivedAgentSpec`. The loop continues to score and refine based on the original derived spec. The CLI-generated YAML is written to disk but not ingested back into the iteration.
 
-### The Emitted `.agent` Does Not Compile
+### The Emitted `.agent` Did Not Compile (Fixed — Now Compiler-Verified)
 
 From `agent_script.py` (B2) line 12:
 
