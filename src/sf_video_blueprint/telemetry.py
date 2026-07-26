@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
 
+from .redaction import pipeline_policy, redact_mapping
+
 
 class TelemetryLayer(str, Enum):
     UI = "ui"
@@ -110,8 +112,38 @@ class TelemetryRegistry:
         run_id: str,
         step_id: str,
     ) -> None:
-        self.events.extend(collector.collect_for_step(run_id, step_id))
-        self.snapshots.extend(collector.snapshot_changes(run_id, step_id))
+        """Collect one step's telemetry, scrubbing secrets on the way in.
+
+        THE SECOND CHOKE POINT. `DomCaptureExtractor._redact_actions` covers
+        everything that came out of the capture file, but it structurally cannot
+        see this data: `ObjectSnapshot.before`/`.after` and `TelemetryEvent.payload`
+        are whole records fetched from the org by `SalesforceRestClient.get_record`
+        and raw SOQL rows, both obtained AFTER extraction has finished. They flow
+        into `spec_builder._derive_entities`, which interpolates field values
+        directly into entity evidence details — and from there into the spec JSON
+        and the HTML report.
+
+        Scrubbing here rather than at each write site because this is the single
+        funnel: `cli.py` and `pipeline.py` both collect exclusively through this
+        method, and nothing else in the tree appends to `.events` or `.snapshots`.
+
+        Uses `pipeline_policy()`, so record ids, field API names, and numeric
+        values are retained — see that function for why redacting them would
+        corrupt the audit trail rather than protect it.
+        """
+        policy = pipeline_policy()
+
+        for event in collector.collect_for_step(run_id, step_id):
+            if event.payload:
+                event.payload, _ = redact_mapping(event.payload, policy)
+            self.events.append(event)
+
+        for snapshot in collector.snapshot_changes(run_id, step_id):
+            if snapshot.before:
+                snapshot.before, _ = redact_mapping(snapshot.before, policy)
+            if snapshot.after:
+                snapshot.after, _ = redact_mapping(snapshot.after, policy)
+            self.snapshots.append(snapshot)
 
     def append_manual_event(
         self,
