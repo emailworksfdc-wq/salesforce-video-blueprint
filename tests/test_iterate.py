@@ -892,6 +892,13 @@ def test_compare_argument_order_regression(tmp_path):
     # Instead, we test the compare function directly.
     from sf_video_blueprint.spec_score import score_spec, compare
 
+    # The evidence details below are full sentences because the builder's are. Every
+    # SpecEvidence detail spec_builder emits is an f-string naming the object, field
+    # and step id; the shortest on the example capture is 41 characters
+    # ("select on 'input:Status' at step step-009"). These fixtures previously read
+    # "observed" and "assumed" (8 and 7 characters), which no builder path can
+    # produce, and `_score_evidence_grounding` now declines to count a stub detail as
+    # grounded — so the fixture, not the scorer, was the thing that had to change.
     spec_better = _make_spec(
         intent="Update Case Status",
         confidence=0.80,
@@ -900,13 +907,13 @@ def test_compare_argument_order_regression(tmp_path):
                 name="status",
                 object_api_name="Case",
                 field_api_name="Status",
-                evidence=[SpecEvidence("data-delta", "observed")],
+                evidence=[SpecEvidence("data-delta", "Case.Status changed 'New' -> 'Working' at step-003")],
             ),
             DerivedEntity(
                 name="recordId",
                 object_api_name="Case",
                 field_api_name="Id",
-                evidence=[SpecEvidence("data-delta", "observed")],
+                evidence=[SpecEvidence("data-delta", "Case.Id resolved from the record page at step-001")],
             ),
         ],
         orchestration_steps=["Step 1", "Step 2", "Step 3"],
@@ -920,7 +927,7 @@ def test_compare_argument_order_regression(tmp_path):
                 name="status",
                 object_api_name="Case",
                 field_api_name="Status",
-                evidence=[SpecEvidence("inference", "assumed")],
+                evidence=[SpecEvidence("inference", "Case.Status assumed to change from the button label")],
             ),
         ],
         orchestration_steps=["Step 1"],

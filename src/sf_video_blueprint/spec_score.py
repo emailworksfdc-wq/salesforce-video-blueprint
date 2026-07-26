@@ -109,6 +109,33 @@ MIN_EVIDENCE_DETAIL_CHARS = 12
 # single point).
 HOLLOW_DIMENSION_FRACTION = 0.1
 
+# C8: the minimum an instruction string must carry to count as an instruction at all.
+#
+# Every specificity check above this line is a blocklist — it looks for known-bad
+# phrases ("generic", "placeholder", "Step 1"). A spec whose steps were "aa", "bb",
+# "ee" and whose guardrails were "cc", "ff" matched none of them and scored a
+# perfect 100/100, outranking the real derived spec at 84. Blocklists cannot catch
+# content that says nothing, because saying nothing has no fingerprint.
+#
+# Both thresholds are set far below honest output, measured rather than guessed. On
+# the example capture the builder's shortest orchestration step or guardrail is 52
+# characters and 7 words ("submit on button:Save -> writes Status (backend: flow)");
+# its shortest is still 4x this floor. The gap exists so the floor never fires on
+# real output — a check that penalises the honest path is worse than no check.
+#
+# This is deliberately a FLOOR, not a defence. Two words of plausible prose defeat
+# it, and nothing here can measure whether a sentence is *true*. It closes the
+# trivial evasion — one where the attacker does not even try — and it is the
+# builder, which cannot write a step it did not observe, that does the real work.
+MIN_INSTRUCTION_CHARS = 12
+MIN_INSTRUCTION_WORDS = 3
+
+# The fraction of a spec's instruction strings that may be filler before the spec is
+# blocked rather than merely docked. Set above zero so a single terse-but-real line
+# is a deduction, not a refusal; set below a half so a spec whose narrative is
+# mostly empty cannot pass on the strength of its metadata.
+MAX_FILLER_INSTRUCTION_FRACTION = 0.4
+
 
 def score_provenance(provenance: dict[str, str] | None) -> tuple[DimensionScore, list[str]]:
     """Score provenance integrity dimension.
@@ -455,6 +482,96 @@ def score_spec(
             "earning it."
         )
 
+    # C8 blocker: a spec whose instructions are mostly filler is not an agent spec.
+    #
+    # MEASURED before this check: steps ["aa", "bb", "ee"] and guardrails ["cc", "ff"],
+    # with concrete well-evidenced entities around them, scored 100/100 passed=True —
+    # all seven dimensions at full marks, outranking the real derived spec at 84.
+    #
+    # The specificity deduction alone is not enough to stop it. specificity is only 10
+    # of 100 points, so an attacker who earns the other 90 still clears a threshold of
+    # 75 with the dimension zeroed. That gap is the direction a refinement loop
+    # optimises: entity metadata is expensive to fabricate, prose is free, so the
+    # cheapest route to a high score is real-looking metadata with the narrative
+    # hollowed out. The instructions ARE the deliverable — a spec that cannot say what
+    # the agent should do fails as a spec no matter how well-evidenced its fields are.
+    #
+    # Blocked rather than docked for the same reason mock telemetry is blocked: it is a
+    # statement about what the artifact is, not a measure of how good it is.
+    instructions = _instruction_strings(spec)
+    filler = [text for text in instructions if _is_filler_instruction(text)]
+    if instructions and len(filler) > len(instructions) * MAX_FILLER_INSTRUCTION_FRACTION:
+        shown = ", ".join(repr(text)[:20] for text in filler[:4])
+        blocking.append(
+            f"{len(filler)} of {len(instructions)} instruction strings carry no instruction "
+            f"(under {MIN_INSTRUCTION_CHARS} chars or {MIN_INSTRUCTION_WORDS} words): {shown}. "
+            "orchestration_steps and guardrails are the spec's actual deliverable — the text "
+            "a human reads to decide whether to trust the agent. Well-evidenced entity "
+            "metadata cannot substitute for instructions that say nothing."
+        )
+
+    # C10 blocker: the instructions must reference the evidence the spec claims.
+    #
+    # MEASURED with the C8 floor in place: steps ["do the thing here", "then do it
+    # again"] with guardrail ["always be careful now"] scored 92/100 passed=True —
+    # HIGHER than the real derived spec's 90. Padding with the object name
+    # (["Case aa bb cc dd", ...]) scored the same 92.
+    #
+    # C8 measures an instruction's SHAPE (12 chars, 3 words), and shape is trivially
+    # cheap: an attacker who reads the constant writes four words of nothing. Every
+    # length floor has that weakness, which C8's own comment concedes. This asks the
+    # question shape cannot: does the narrative describe the same run as the metadata?
+    #
+    # A spec that declares it observed `Case.Priority` change, and whose every
+    # instruction never names `Priority`, is two artifacts describing different things
+    # — at most one of which came from a recording. Cheap for the builder to satisfy
+    # (it derives steps FROM the deltas, so `_derive_orchestration` writes
+    # "-> writes Status" verbatim), expensive for a fabricator, who must now keep two
+    # artifacts consistent instead of one.
+    #
+    # Deliberately conditional on the spec DECLARING a field API name: a UI-only
+    # recording resolves no field, has nothing for a step to name, and must stay able
+    # to pass. And the obvious evasion — delete the field-bearing entity so the rule
+    # never applies — costs evidence_grounding and testability, so it is strictly worse
+    # than writing a real step. `test_c10_coupling_rule_cannot_be_evaded_by_deleting_
+    # the_entity` pins that ordering.
+# The token set is field API names AND entity names, because a UI-only recording
+    # resolves no field at all and would otherwise be exempt. MEASURED: requiring only
+    # field names left the evasion open — deleting the field-bearing entity and keeping
+    # the filler instructions scored 83/100 passed=True. Entity names close it, because
+    # the builder derives the entity name from the same observed target it writes into
+    # the step ("subject" <- "input on 'input:Subject'").
+    #
+    # Two exclusions, both to avoid firing on honest output:
+    #   * field "Id" and the entity named "recordId" — the builder's mandated
+    #     record-identifier, which is an inference about how to act, not an observation
+    #     about the process. A spec whose ONLY entity is that one has an empty token set
+    #     and is exempt; `_score_evidence_grounding` already scores it a quarter of the
+    #     dimension for exactly that reason.
+    #   * tokens under 4 characters, which would match ordinary prose by accident and
+    #     make the check free to pass.
+    observed_tokens: set[str] = set()
+    for entity in spec.entities if isinstance(spec.entities, list) else []:
+        field_name = getattr(entity, "field_api_name", None)
+        if field_name and field_name != "Id":
+            observed_tokens.add(field_name)
+        entity_name = getattr(entity, "name", None)
+        if entity_name and entity_name != "recordId":
+            observed_tokens.add(entity_name)
+    observed_tokens = {token for token in observed_tokens if len(token) >= 4}
+
+    if observed_tokens:
+        narrative = " ".join(text for text in instructions if isinstance(text, str)).lower()
+        named = sorted(token for token in observed_tokens if token.lower() in narrative)
+        if not named:
+            shown = ", ".join(sorted(observed_tokens)[:6])
+            blocking.append(
+                f"No orchestration step or guardrail names anything the spec claims to have "
+                f"observed ({shown}). The entity metadata and the instructions describe "
+                "different runs, so at most one of them came from a recording. The builder "
+                "writes the observed field or target into the step it derived from it."
+            )
+
     # Band calculation: blocking issues force "low" band regardless of numeric score
     if blocking:
         band = "low"
@@ -672,12 +789,62 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
     # PADDING DETECTION: Count entities per field_api_name. If >3 entities target the same field,
     # it's likely padding (e.g., status_1, status_2, ..., status_10 all targeting Case.Status).
     # DEFECT 4 FIX: Defensive checks for missing attributes
+    #
+    # C11 FIX: skip entities whose object AND field are both unresolved.
+    #
+    # The key was `f"{object_api_name}.{field_api_name}"`, which for an unresolved
+    # entity is the literal string "None.None". Every unresolved entity therefore
+    # collided in one bucket and any four of them tripped the detector.
+    #
+    # MEASURED on lane 02's real AFT3 capture (examples/case_creation_aft3): the
+    # builder emits 130 entities, of which 128 are UI inputs that could not be
+    # resolved to an object/field. All 128 have DISTINCT names and DISTINCT evidence
+    # details — they are 128 separate observed keystrokes — and the gate reported
+    # "PADDING DETECTED ... None.None (128x) ... likely an attack to inflate entity
+    # counts artificially", cut evidence_grounding to 20% of base (5/30), and raised a
+    # blocking issue. On the project's only real capture, the gate accused its own
+    # builder of a gaming attack, and the accusation is the reason the run is blocked.
+    #
+    # The detector's premise is still sound where it applies: N entities all claiming
+    # the SAME resolved field is padding, because a resolved field name is a claim
+    # about the org. "Unresolved" is not a claim about anything, so unresolved entities
+    # cannot be duplicates of each other by that key. They are handled by the
+    # `distinct_targets` check below, which compares what they actually observed.
     field_counts: dict[str, int] = {}
     for entity in observed_entities:
         if not hasattr(entity, 'object_api_name') or not hasattr(entity, 'field_api_name'):
             continue
+        if not entity.object_api_name and not entity.field_api_name:
+            continue
         key = f"{entity.object_api_name}.{entity.field_api_name}"
         field_counts[key] = field_counts.get(key, 0) + 1
+
+    # C11: unresolved entities still have to be checked for real duplication, or the
+    # skip above becomes the padding vector itself — an attacker could emit 200
+    # identical unresolved entities. Their evidence details are what they claim to have
+    # observed, so genuine duplication shows up as repeated details. The real capture
+    # has 128 distinct details out of 128, and the honest builder cannot produce two
+    # entities with the same detail (the detail embeds the step id).
+    unresolved = [
+        entity
+        for entity in observed_entities
+        if hasattr(entity, 'object_api_name')
+        and hasattr(entity, 'field_api_name')
+        and not entity.object_api_name
+        and not entity.field_api_name
+    ]
+    if len(unresolved) > 3:
+        details = [
+            ev.detail
+            for entity in unresolved
+            for ev in (entity.evidence if isinstance(entity.evidence, list) else [])
+            if isinstance(ev.detail, str)
+        ]
+        distinct_details = set(details)
+        if details and len(distinct_details) * 3 < len(details):
+            field_counts[f"<unresolved> ({len(distinct_details)} distinct of {len(details)})"] = (
+                len(details)
+            )
 
     padding_detected = any(count > 3 for count in field_counts.values())
     if padding_detected:
@@ -696,6 +863,16 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
 
     for entity in observed_entities:
         sources = [e.source for e in entity.evidence]
+        # C9: an entity whose evidence detail is a stub does not count as grounded.
+        #
+        # See the block below the loop for the measured defect this feeds. The set of
+        # sources is filtered rather than the score being scaled afterwards, so a stub
+        # entity contributes nothing instead of taxing the entities around it.
+        substantive_sources = [
+            e.source
+            for e in entity.evidence
+            if isinstance(e.detail, str) and len(e.detail.strip()) >= MIN_EVIDENCE_DETAIL_CHARS
+        ]
         # C6: raise the minimal-evidence floor from 1 character.
         #
         # The old bound was `len(detail.strip()) <= 1`, so detail="x" was caught and
@@ -715,11 +892,14 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
                 findings.append(f"Entity {entity.name} has minimal evidence detail: {ev.detail!r}")
                 break
 
-        if "data-delta" in sources:
+        # C9: count against substantive_sources, not sources. An entity whose only
+        # evidence detail is "ab" is not a well-grounded entity, and it must not be
+        # counted as one and then compensated for by a multiplicative penalty.
+        if "data-delta" in substantive_sources:
             data_delta_count += 1
-        elif "ui-action" in sources:
+        elif "ui-action" in substantive_sources:
             ui_action_count += 1
-        elif "inference" in sources:
+        elif "inference" in substantive_sources:
             inference_count += 1
 
     # NEW MONOTONE FORMULA (D10 fix):
@@ -779,10 +959,31 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
     score_pct = floor_pct + coverage_bonus_pct
     score = int(score_pct * max_score)
 
-    # Penalty for minimal evidence (F1 fix)
+    # C9 FIX: minimal evidence is now reported, not multiplied.
+    #
+    # The old rule was `score = int(score * 0.5)` — halve the WHOLE dimension if ANY
+    # entity had a stub detail. That is multiplicative and collective, and it broke the
+    # G1 invariant this function's docstring claims to guarantee ("removing one never
+    # raises it").
+    #
+    # MEASURED on a spec with two well-evidenced entities plus one whose detail was
+    # "ab": grounding 15/30, total 85. DELETING the stub entity scored 30/30 and total
+    # 100 — deleting an observed entity paid +15 points, the largest deletion reward
+    # this lane found and the exact gradient the refinement loop must never be taught.
+    # A fabricator hits the same cliff in reverse: the cheapest response to the penalty
+    # is to delete the weakly-evidenced entity rather than to resolve it.
+    #
+    # The fix is upstream, in the counting loop: an entity with a stub detail no longer
+    # counts toward `well_grounded`, so it earns nothing and costs nothing. Keeping it
+    # is then weakly better than deleting it (the floor and the bonus are unchanged),
+    # which is the incentive the gate should have — resolve the evidence, don't remove
+    # the row. What remains here is a finding so the deficiency is still visible.
     if minimal_evidence_count > 0:
-        score = int(score * 0.5)  # Cut score in half if any evidence is minimal
-        findings.append(f"{minimal_evidence_count} entity/entities have minimal/placeholder evidence details")
+        findings.append(
+            f"{minimal_evidence_count} entity/entities have minimal/placeholder evidence "
+            "details and are not counted as grounded. Resolve the evidence rather than "
+            "removing the entity: deleting an observed entity never improves the score."
+        )
 
     # Penalty for padding (Attack 1 fix)
     if padding_detected:
@@ -1064,6 +1265,37 @@ def _score_honesty(spec: DerivedAgentSpec) -> DimensionScore:
     )
 
 
+def _is_filler_instruction(text: object) -> bool:
+    """Is this instruction string too thin to be an instruction at all?
+
+    C8: answers the question no other check in this module asks — not "does this
+    contain a known-bad phrase" but "does this carry any content". See
+    MIN_INSTRUCTION_CHARS for why both thresholds sit far below honest output, and
+    for the limits of what a floor like this can do.
+
+    Deliberately returns True for a non-string: a spec whose steps are integers has
+    no instructions either, and the callers treat malformed and empty alike.
+    """
+    if not isinstance(text, str):
+        return True
+    stripped = text.strip()
+    return len(stripped) < MIN_INSTRUCTION_CHARS or len(stripped.split()) < MIN_INSTRUCTION_WORDS
+
+
+def _instruction_strings(spec: DerivedAgentSpec) -> list[object]:
+    """The strings a human reads to decide whether to trust the agent.
+
+    Steps and guardrails only. `failure_handling` and `unknowns` are excluded on
+    purpose: the honest builder writes short declarative entries there ("UNTESTED"),
+    and penalising terseness in the fields that exist to declare ignorance would
+    reward deleting them — the same declaring-beats-concealing inversion the C5 fix
+    removed from evidence_grounding.
+    """
+    steps = spec.orchestration_steps if isinstance(spec.orchestration_steps, list) else []
+    guardrails = spec.guardrails if isinstance(spec.guardrails, list) else []
+    return [*steps, *guardrails]
+
+
 def _score_specificity(spec: DerivedAgentSpec) -> DimensionScore:
     """Score whether the spec is concrete rather than generic.
 
@@ -1182,10 +1414,31 @@ def _score_specificity(spec: DerivedAgentSpec) -> DimensionScore:
                     findings.append(f"Generic guardrail: {guardrail[:40]}")
                     break
 
+    # C8: dock filler instructions — strings too thin to instruct anything.
+    #
+    # Every check above is a blocklist over known-bad phrases, so steps of "aa",
+    # "bb", "ee" with guardrails "cc", "ff" cleared all of them and the spec scored
+    # 10/10 specificity on its way to a perfect 100/100. Content that says nothing
+    # has no fingerprint to match, so this asks about substance instead.
+    #
+    # The deduction is per-string and capped at the dimension: one terse line should
+    # not zero the dimension, but an all-filler narrative should bottom it out and
+    # thereby also trip the hollow-dimension blocker in score_spec().
+    instructions = _instruction_strings(spec)
+    filler = [text for text in instructions if _is_filler_instruction(text)]
+    if filler:
+        score -= min(score, 2 * len(filler))
+        shown = ", ".join(repr(text)[:20] for text in filler[:4])
+        findings.append(
+            f"{len(filler)}/{len(instructions)} instruction string(s) carry no instruction "
+            f"(under {MIN_INSTRUCTION_CHARS} chars or {MIN_INSTRUCTION_WORDS} words): {shown}. "
+            "The builder's shortest real step on the example capture is 52 characters."
+        )
+
     if score < 0:
         score = 0
 
-    evidence_strs.append(f"Orchestration steps and guardrails checked for generic terms.")
+    evidence_strs.append("Orchestration steps and guardrails checked for generic terms.")
 
     return DimensionScore(
         name="specificity",
