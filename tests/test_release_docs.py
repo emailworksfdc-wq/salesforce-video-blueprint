@@ -211,7 +211,7 @@ class TestQuotedTestCounts:
             assert totals & acceptable, (
                 f"{path.name} quotes passed+skipped totals {sorted(totals)}, none "
                 f"of which is reachable from the {collected} tests pytest actually "
-                f"collects here (allowing up to {phantom_skips} import-time skip(s) "
+                f"collects here (allowing up to {possible_skips} import-time skip(s) "
                 f"that collect nothing). A quoted count a reader cannot reproduce "
                 f"is worse than no count."
             )
