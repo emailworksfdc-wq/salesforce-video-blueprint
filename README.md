@@ -81,21 +81,22 @@ table is the most important thing in this README.
 The pipeline is reachable three ways — an [MCP server](#1--mcp-server--use-it-from-any-ai-tool)
 for any AI harness, a [Python API](#2--python-library), and a [CLI](#3--command-line).
 That is packaging, not progress against the table above: all three run the same
-offline pipeline, and all three stay offline unless you ask otherwise.
+offline pipeline, and all three stay offline unless you ask for an org.
 
-Two code paths can contact an org, both opt-in and both read-only:
+Two code paths can contact one, both opt-in and neither of which deploys anything
+— the CLI POSTs the local file to the compile endpoint:
 
 - `emit_agent_bundle(org_alias=...)` calls `org_validation.py`, which shells out to
   `sf agent validate authoring-bundle` and reports the compiler's verbatim errors
-  under `orgValidation`. Omit `org_alias` and the outcome is `skipped`, which is
-  never reported as a pass.
-- `scripts/agentforce_roundtrip.sh` drives the whole chain — derive, score, emit
-  the bundle into a throwaway SFDX project, then validate. It runs **offline by
-  default**; the org step is opt-in behind `--org <alias>`, and when you omit it
-  the run says so rather than implying a verdict it never got.
+  under `orgValidation`. Omit `org_alias` and the outcome is `skipped` — never a pass.
+- `scripts/agentforce_roundtrip.sh` drives the whole chain: derive, score, emit into
+  a throwaway SFDX project, then validate. It runs **offline by default** and the
+  org stage is opt-in; run it with `-h` for the current flags. It refuses any org
+  whose instance URL is not a sandbox, scratch, or `.develop.my.salesforce.com` dev
+  org, and reports an unrun compile step as `SKIPPED` rather than implying a verdict.
 
-The bundle validated above was compiled both ways, and by the same command typed
-by hand. Either is how you reproduce it.
+The bundle validated above was compiled both ways, and by the same command typed by
+hand. Either is how you reproduce it.
 
 ### How to validate an emitted bundle yourself
 
