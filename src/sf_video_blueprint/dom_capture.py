@@ -17,6 +17,7 @@ correctness — defense in depth.
 from __future__ import annotations
 
 import json
+import re
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -478,6 +479,162 @@ def order_events(events: list[RawDomEvent]) -> list[RawDomEvent]:
 
 
 # ============================================================================
+# Sensitive-field detection (DEFECT L4-6)
+# ============================================================================
+#
+# The leak detector used to inspect `element.name` alone — one of the eight-plus
+# field-identity signals the recorder captures. Measured across twelve signals
+# carrying a sensitive identity next to an unredacted value, it caught 1 and
+# missed 11, including `element.type == "password"` (the strongest signal that
+# exists) and `selectors.sf_field == "Credit_Card_Number__c"` (how a Salesforce
+# field announces itself).
+#
+# RULE FOR EVERYTHING BELOW: report the FACT of a leak, never its content.
+# Findings are printed to terminals and written into reports, so a detector that
+# echoes the secret has leaked it a second time into a file that outlives the
+# capture. Nothing here interpolates `event.value`.
+
+
+#: Substrings that mark a field as sensitive. Matched against normalized
+#: identity signals (see `_sensitive_signal_hits`).
+SENSITIVE_PATTERNS: tuple[str, ...] = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "ssn",
+    "social_security",
+    "socialsecurity",
+    "card",
+    "credit",
+    "cvv",
+    "cvc",
+    "iban",
+    "routing_number",
+    "sort_code",
+    "passport",
+    "tax_id",
+    "taxid",
+    "national_id",
+    "auth",
+    "credential",
+)
+
+#: Patterns short or ambiguous enough that a substring match produces false
+#: positives ("pin" in "Shipping", "spinner", "Opt_In"). These require a WORD
+#: boundary rather than a bare substring.
+_WORD_BOUNDARY_PATTERNS: tuple[str, ...] = ("pin", "otp", "cvv", "cvc", "ssn", "iban")
+
+#: Input types that are sensitive by definition, whatever the field is called.
+_SENSITIVE_INPUT_TYPES: frozenset[str] = frozenset({"password"})
+
+_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_identity_text(value: Any) -> str:
+    """Lowercase a field-identity signal for pattern matching."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " ".join(_normalize_identity_text(v) for v in value)
+    return str(value).lower()
+
+
+def _matches_sensitive_pattern(text: str) -> str | None:
+    """Return the pattern that marks `text` sensitive, or None.
+
+    Ambiguous short patterns are matched on word boundaries so that `Shipping`,
+    `spinner` and `Opt_In_Preference__c` do not trip on "pin".
+    """
+    if not text:
+        return None
+    words = set(_WORD_SPLIT.split(text))
+    # Collapse every separator run to a single "_" so a multi-word pattern such
+    # as "social_security" matches "Social Security Number", "social-security"
+    # and "socialSecurity" alike. Checked alongside the raw text, since patterns
+    # like "api_key" must also match "apikey"-style spellings.
+    collapsed = "_".join(w for w in _WORD_SPLIT.split(text) if w)
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern in _WORD_BOUNDARY_PATTERNS:
+            continue
+        if pattern in text or pattern in collapsed:
+            return pattern
+    for pattern in _WORD_BOUNDARY_PATTERNS:
+        if pattern in words:
+            return pattern
+    return None
+
+
+def _identity_signals(event: RawDomEvent) -> list[tuple[str, str]]:
+    """Every signal that can reveal what field an event's value belongs to.
+
+    Named `(signal, text)` pairs so a finding can say WHICH signal matched
+    without quoting the value.
+    """
+    element = event.element
+    selectors = event.selectors
+    role_name = selectors.role_name
+    return [
+        ("element.name", _normalize_identity_text(element.name)),
+        ("element.id", _normalize_identity_text(element.id)),
+        ("element.type", _normalize_identity_text(element.type)),
+        ("element.aria_label", _normalize_identity_text(element.aria_label)),
+        ("element.classes", _normalize_identity_text(element.classes)),
+        ("element.text", _normalize_identity_text(element.text)),
+        ("element.modal_label", _normalize_identity_text(element.modal_label)),
+        ("selectors.sf_field", _normalize_identity_text(selectors.sf_field)),
+        ("selectors.test_id", _normalize_identity_text(selectors.test_id)),
+        ("selectors.aria", _normalize_identity_text(selectors.aria)),
+        ("selectors.label_for", _normalize_identity_text(selectors.label_for)),
+        ("selectors.css_path", _normalize_identity_text(selectors.css_path)),
+        ("selectors.xpath", _normalize_identity_text(selectors.xpath)),
+        (
+            "selectors.role_name",
+            _normalize_identity_text(role_name.name if role_name else None),
+        ),
+    ]
+
+
+#: Signals safe to quote in a finding. A field's NAME is metadata, not secret,
+#: and an operator needs it to fix the recorder. Deliberately excluded:
+#: css_path, xpath, aria and label_for, which can embed record data or values.
+_QUOTABLE_SIGNALS: frozenset[str] = frozenset(
+    {"element.name", "element.id", "element.type", "selectors.sf_field", "selectors.test_id"}
+)
+
+
+def _sensitive_signal_hits(event: RawDomEvent) -> list[str]:
+    """Names of the identity signals marking this event's field as sensitive.
+
+    Each hit names the signal and the matched pattern. For the handful of
+    signals that are pure field metadata (`_QUOTABLE_SIGNALS`) the text itself
+    is quoted, because an operator needs to know WHICH field to fix. Free-text
+    and path-like signals are never quoted — a css_path or xpath can embed
+    record data. The event's `value` is never included by any path.
+    """
+    hits = []
+
+    # An <input type="password"> is sensitive by definition, whatever it is
+    # called. This is the single most reliable signal and was ignored entirely.
+    if _normalize_identity_text(event.element.type) in _SENSITIVE_INPUT_TYPES:
+        hits.append("element.type=password")
+
+    for signal, text in _identity_signals(event):
+        pattern = _matches_sensitive_pattern(text)
+        if pattern is None:
+            continue
+        if signal in _QUOTABLE_SIGNALS:
+            hits.append(f"{signal}='{text}'")
+        else:
+            hits.append(f"{signal}~'{pattern}'")
+
+    return hits
+
+
+# ============================================================================
 # Validation (integrity checks, NOT input validation)
 # ============================================================================
 
@@ -517,23 +674,8 @@ def validate_trace(trace: CaptureTrace) -> list[str]:
                 f"some events may not have been written to disk."
             )
 
-    # Redaction leak detection
-    sensitive_patterns = [
-        "password",
-        "passwd",
-        "pwd",
-        "secret",
-        "token",
-        "api_key",
-        "apikey",
-        "ssn",
-        "social_security",
-        "card",
-        "credit",
-        "cvv",
-        "pin",
-    ]
-
+    # Redaction leak detection. Patterns and signal extraction live in
+    # SENSITIVE_PATTERNS / _sensitive_signal_hits above (DEFECT L4-6).
     for i, event in enumerate(trace.events):
         # DEFECT A1 FIX: Check for redaction flag set but value still present
         # This is the most serious leak: recorder claims it redacted but didn't.
@@ -560,14 +702,20 @@ def validate_trace(trace: CaptureTrace) -> list[str]:
                 # to terminals and written to reports. Echoing the secret defeats the purpose.
             )
 
-        # Original check: value present without redaction flag, but field name looks sensitive
+        # Value present without the redaction flag, on a field whose identity
+        # looks sensitive. DEFECT L4-6: this used to read `element.name` alone
+        # and missed 11 of 12 signals, `type="password"` among them.
+        #
+        # The finding names the matching SIGNALS and PATTERNS, never the
+        # signal's full text and never the value — a css_path or xpath can embed
+        # data, and findings are written to reports that outlive the capture.
         if event.value is not None and not event.value_redacted:
-            field_name_lower = (event.element.name or "").lower()
-            if any(pattern in field_name_lower for pattern in sensitive_patterns):
+            hits = _sensitive_signal_hits(event)
+            if hits:
                 findings.append(
-                    f"SECURITY: Event {i} (seq={event.seq}): value is present "
-                    f"but field name '{event.element.name}' looks sensitive. "
-                    f"Redaction may have FAILED."
+                    f"SECURITY: Event {i} (seq={event.seq}): value is present but "
+                    f"{len(hits)} field-identity signal(s) look sensitive "
+                    f"[{', '.join(hits)}]. Redaction may have FAILED."
                 )
 
         # Frame path without frame URL
@@ -647,30 +795,19 @@ def redaction_audit(trace: CaptureTrace) -> tuple[int, list[str]]:
     redacted_count = sum(1 for e in trace.events if e.value_redacted)
     leak_findings = []
 
-    sensitive_patterns = [
-        "password",
-        "passwd",
-        "pwd",
-        "secret",
-        "token",
-        "api_key",
-        "apikey",
-        "ssn",
-        "social_security",
-        "card",
-        "credit",
-        "cvv",
-        "pin",
-    ]
-
+    # DEFECT L4-6: shares _sensitive_signal_hits with validate_trace rather than
+    # keeping a second copy of the pattern list. The two had already diverged in
+    # the making — a duplicated security check is a check that will disagree with
+    # itself eventually.
     for i, event in enumerate(trace.events):
         if event.value is not None and not event.value_redacted:
-            field_name_lower = (event.element.name or "").lower()
-            if any(pattern in field_name_lower for pattern in sensitive_patterns):
+            hits = _sensitive_signal_hits(event)
+            if hits:
                 leak_findings.append(
-                    f"Event index {i} (seq={event.seq}, type={event.type}): "
-                    f"value present but field name '{event.element.name}' matches "
-                    f"sensitive pattern. POTENTIAL REDACTION LEAK."
+                    f"Event index {i} (seq={event.seq}, type={event.type}): value "
+                    f"present but {len(hits)} field-identity signal(s) match a "
+                    f"sensitive pattern [{', '.join(hits)}]. POTENTIAL REDACTION "
+                    f"LEAK. (Value deliberately not shown.)"
                 )
 
     return redacted_count, leak_findings
