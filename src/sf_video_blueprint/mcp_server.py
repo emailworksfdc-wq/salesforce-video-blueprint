@@ -481,6 +481,11 @@ def score_spec(spec_path: str) -> dict[str, Any]:
         started,
         path=str(path),
         total=score.total,
+        # The total a caller should SHOW a human. Capped into the low band whenever a
+        # blocking issue is present, because "79/100" reads as near-success for a spec
+        # that is not evidence-backed at all. `total` stays raw for callers comparing
+        # versions across refinement rounds. See SpecScore.display_total.
+        displayTotal=score.display_total,
         maxTotal=score.max_total,
         band=score.band,
         passed=score.passed,

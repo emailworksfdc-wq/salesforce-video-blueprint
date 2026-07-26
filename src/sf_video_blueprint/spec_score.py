@@ -72,6 +72,43 @@ DIMENSION_WEIGHTS = {
 
 PASS_THRESHOLD = 75
 
+# Ceiling on the total *displayed* for a spec that has any blocking issue. Set one
+# below the moderate band (60) so a blocked spec can never render a number that
+# reads as partial success. This caps presentation only — `SpecScore.total` keeps
+# the raw sum, because iterate.py needs a real gradient across blocked versions.
+MAX_BLOCKED_DISPLAY_TOTAL = 59
+
+# The deriver's own confidence ceiling: `_derive_intent` returns at most 0.7, for a
+# single object with observed field changes. A spec claiming more than this asserts
+# certainty the builder cannot produce, so honesty treats it as an overclaim rather
+# than as information. Kept here rather than imported to avoid a circular import;
+# `test_score_calibration.py` pins the two together.
+BUILDER_MAX_CONFIDENCE = 0.7
+
+# Dimensions permitted to score 0 on an honest run, and therefore excluded from the
+# hollow-dimension blocker:
+#   * testability — a recording of a process that simply succeeded has no observed
+#     failure path, which is a fact about the recording, not a defect in the spec.
+#   * provenance_integrity — scores 0 by design for in-memory scoring
+#     (provenance=None), which is the iterate.py path.
+# Blocking on either would make the gate unclearable by honest output, which is
+# worse than the hole it would close.
+ZERO_TOLERATED_DIMENSIONS = frozenset({"testability", "provenance_integrity"})
+
+# Minimum characters an entity evidence detail must carry to count as a real
+# observation. The builder's shortest emitted detail on the example capture is 41
+# characters, so this is far below honest output. It is a floor against the trivial
+# evasion (detail="ab" previously scored full marks), NOT a defence against a
+# fabricator willing to write plausible prose — no length test can be that.
+MIN_EVIDENCE_DETAIL_CHARS = 12
+
+# A dimension scoring at or below this fraction of its weight is treated as absent
+# rather than weak. Set to a tenth: on the 10-point dimensions that is 1 point, which
+# is where the subtractive vacuous-content penalties in `_score_specificity` bottom
+# out (all-"Step N" steps score 1/10, not 0/10, and would evade a `== 0` check by a
+# single point).
+HOLLOW_DIMENSION_FRACTION = 0.1
+
 
 def score_provenance(provenance: dict[str, str] | None) -> tuple[DimensionScore, list[str]]:
     """Score provenance integrity dimension.
@@ -160,7 +197,20 @@ class DimensionScore:
 
 @dataclass(slots=True)
 class SpecScore:
-    """The result of scoring a spec."""
+    """The result of scoring a spec.
+
+    Two totals, deliberately:
+
+    ``total`` is the raw dimension sum. ``iterate.py`` compares totals across
+    versions to detect improvement and convergence, so this must stay a real
+    gradient even for a spec that is blocked — otherwise every blocked version
+    collapses to the same number and the refinement loop has nothing to climb.
+
+    ``display_total`` is what a human should be shown. A blocked spec scoring 79
+    reads as "nearly there" when the correct reading is "not evidence-backed at
+    all", so ``display_total`` is capped below the moderate band whenever a blocker
+    is present. The gradient survives; the misread does not.
+    """
 
     total: int
     max_total: int
@@ -170,9 +220,23 @@ class SpecScore:
     blocking_issues: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
 
+    @property
+    def display_total(self) -> int:
+        """The total as it should be reported to a human.
+
+        Capped to ``MAX_BLOCKED_DISPLAY_TOTAL`` when any blocking issue is present.
+        Blocking means the spec is not evidence-backed, and a number in the
+        moderate or high range contradicts that in the one place a reader looks
+        first.
+        """
+        if self.blocking_issues:
+            return min(self.total, MAX_BLOCKED_DISPLAY_TOTAL)
+        return self.total
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "total": self.total,
+            "display_total": self.display_total,
             "max_total": self.max_total,
             "band": self.band,
             "passed": self.passed,
@@ -192,12 +256,20 @@ class SpecScore:
         }
 
     def summary(self) -> str:
-        """Human-readable one-liner."""
+        """Human-readable one-liner.
+
+        Reports ``display_total``, not ``total``, and says so when the two differ.
+        A reader who sees only this line must not come away with a better
+        impression of the spec than the blocking issues justify.
+        """
         passed_str = "PASS" if self.passed else "FAIL"
-        return (
-            f"{passed_str}: {self.total}/{self.max_total} ({self.band} band), "
+        head = (
+            f"{passed_str}: {self.display_total}/{self.max_total} ({self.band} band), "
             f"{len(self.blocking_issues)} blocking issue(s)"
         )
+        if self.display_total != self.total:
+            head += f" [blocked: capped from raw {self.total}]"
+        return head
 
 
 @dataclass(slots=True)
@@ -308,6 +380,26 @@ def score_spec(
     dimensions["provenance_integrity"] = provenance_dim
     blocking.extend(provenance_blocking)
 
+    # C1: the top-level evidence trail must exist.
+    #
+    # `spec.evidence` is the only field describing the RUN rather than the
+    # conclusions drawn from it: which telemetry layers fired, how many actions were
+    # extracted, which objects were mutated. Every dimension above scores the spec's
+    # prose; this is the one field that scores its provenance, and it was read by
+    # nothing. A fabricated spec could therefore ship with no audit trail at all and
+    # score 95/100, which inverts the cost of honesty — the trail is the cheapest
+    # thing to keep when the recording is real and the hardest to forge when it is not.
+    #
+    # Safe to make blocking: build_agent_spec unconditionally appends
+    # "N action(s) in recording", so no honest spec has an empty trail.
+    trail = spec.evidence if isinstance(spec.evidence, list) else []
+    if not trail:
+        blocking.append(
+            "No top-level evidence trail. The spec builder always records what the run "
+            "observed (telemetry layers, action count, mutated objects); an empty trail "
+            "means the spec does not describe an observed run."
+        )
+
     total = sum(dim.score for dim in dimensions.values())
     max_total = sum(DIMENSION_WEIGHTS.values())
 
@@ -323,6 +415,44 @@ def score_spec(
             f"Threshold surfing detected: {len(dimensions_below_half)} dimensions scored <=50% "
             f"({', '.join(dimensions_below_half)}). This pattern suggests gaming the scorer "
             "by maximizing some dimensions while sacrificing others."
+        )
+
+    # C7: the CONCENTRATED form of threshold surfing.
+    #
+    # The check above needs >=2 weak dimensions, so it catches the diffuse attack
+    # (shave several dimensions a little) and misses the concentrated one (hollow out
+    # a single dimension completely). The concentrated form is strictly cheaper to
+    # execute and was measurably survivable:
+    #
+    #   orchestration_steps=["Step 1","Step 2","Step 3"], guardrails=["Guardrail 1","Rule 2"]
+    #       -> specificity 0/10, total 82/100, passed=True
+    #   orchestration_steps=["Step 1","Step 2"], guardrails=["Guardrail 1"]
+    #       -> specificity 1/10, total exactly 75/100, passed=True
+    #
+    # The second is why this tests a FRACTION rather than `== 0`: the vacuous-content
+    # penalties in `_score_specificity` are subtractive, so a spec whose every step is
+    # the literal word "Step" lands on 1/10 rather than 0/10 and would slip a
+    # zero-only check by a single point. Anything at or below a tenth of a dimension's
+    # weight is an absent signal, not a weak one — the spec has no measurable content
+    # on an axis the gate claims to measure, and averaging that into a number labelled
+    # "75/100" misrepresents it.
+    #
+    # ZERO_TOLERATED_DIMENSIONS documents the two dimensions that may honestly be 0
+    # and are therefore exempt.
+    hollow = [
+        name
+        for name, dim in dimensions.items()
+        if name not in ZERO_TOLERATED_DIMENSIONS
+        and dim.max_score > 0
+        and dim.score <= dim.max_score * HOLLOW_DIMENSION_FRACTION
+    ]
+    if hollow:
+        detail = ", ".join(f"{name}={dimensions[name].score}/{dimensions[name].max_score}" for name in hollow)
+        blocking.append(
+            f"Hollow dimension(s): {detail}. A dimension at or near zero means the spec has "
+            "no measurable content on an axis the gate claims to measure, so the total does "
+            "not describe it. Sacrificing one dimension outright must not be cheaper than "
+            "earning it."
         )
 
     # Band calculation: blocking issues force "low" band regardless of numeric score
@@ -566,9 +696,21 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
 
     for entity in observed_entities:
         sources = [e.source for e in entity.evidence]
-        # Check for minimal evidence (single char, placeholder-like)
+        # C6: raise the minimal-evidence floor from 1 character.
+        #
+        # The old bound was `len(detail.strip()) <= 1`, so detail="x" was caught and
+        # detail="ab" scored full marks. The builder's own shortest emitted detail on
+        # the example capture is 41 characters
+        # ("input on 'input:Subject' at step step-003"), so the gap between what
+        # honest output looks like and what the check tolerated was 39 characters wide.
+        #
+        # This is a FLOOR, not a defence: an attacker who writes 40 characters of
+        # plausible prose defeats any length test, and no length test can distinguish
+        # observed prose from invented prose. The real defence is in the builder,
+        # which cannot emit a detail for a delta it did not see. MIN_EVIDENCE_DETAIL
+        # only removes the trivially-cheap version of the evasion.
         for ev in entity.evidence:
-            if len(ev.detail.strip()) <= 1:
+            if not isinstance(ev.detail, str) or len(ev.detail.strip()) < MIN_EVIDENCE_DETAIL_CHARS:
                 minimal_evidence_count += 1
                 findings.append(f"Entity {entity.name} has minimal evidence detail: {ev.detail!r}")
                 break
@@ -605,9 +747,34 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
     else:
         floor_pct = 0.0  # All inference
 
+    # C5 FIX: coverage bonus counts well-grounded entities, it does not divide by all
+    # of them.
+    #
+    # The old formula was `well_grounded / total_entities`, a RATIO. The docstring
+    # above proves monotonicity in one direction — adding a data-delta entity never
+    # lowers the score — and that is true as written. But the untested direction is
+    # the one that matters: adding an entity whose evidence is honestly labelled
+    # `inference` grew the denominator and cost 8 of 30 points. One data-delta entity
+    # scored 30/30; that same entity plus a declared inference entity scored 22/30.
+    # So CONCEALING the inferred entity paid 8 points.
+    #
+    # That is the same inversion `_score_honesty` calls "the worst possible outcome"
+    # — training the loop to hide gaps — smuggled back in through a different
+    # dimension's arithmetic. And inference entities are precisely what an honest
+    # deriver emits when it cannot resolve a field, so the incentive landed squarely
+    # on honest output. "Declaring beats concealing" has to hold in every dimension,
+    # not just the one named honesty.
+    #
+    # Counting well-grounded entities instead keeps every property the ratio had:
+    #   - adding a data-delta/ui-action entity still raises the score (monotone up),
+    #   - removing one still lowers it (deletion never pays),
+    #   - an all-inference spec still scores 0 (the floor, not the bonus, encodes
+    #     the observed-vs-assumed distinction),
+    # and it drops the one property nobody wanted: that declaring an assumption is
+    # punished. `test_c5_inference_only_spec_still_scores_below_observed_spec` pins
+    # the distinction that must survive.
     well_grounded = data_delta_count + ui_action_count
-    coverage_ratio = well_grounded / total_entities if total_entities > 0 else 0
-    coverage_bonus_pct = coverage_ratio * 0.50  # Up to 50% bonus for full coverage
+    coverage_bonus_pct = min(well_grounded * 0.25, 0.50)  # 2+ grounded entities -> full bonus
 
     score_pct = floor_pct + coverage_bonus_pct
     score = int(score_pct * max_score)
@@ -629,7 +796,10 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
     evidence_strs.append(f"{inference_count}/{total_entities} observed entities from inference")
     if mandated_record_ids:
         evidence_strs.append(f"{len(mandated_record_ids)} mandated recordId(s) (not penalized)")
-    evidence_strs.append(f"Grounding quality: floor={floor_pct:.0%} (best evidence present) + coverage_bonus={coverage_bonus_pct:.0%}")
+    evidence_strs.append(
+        f"Grounding quality: floor={floor_pct:.0%} (best evidence present) + "
+        f"coverage_bonus={coverage_bonus_pct:.0%} ({well_grounded} well-grounded entity/entities)"
+    )
 
     if data_delta_count == 0 and ui_action_count == 0:
         findings.append("No entities grounded in observed data (data-delta or ui-action).")
@@ -841,6 +1011,45 @@ def _score_honesty(spec: DerivedAgentSpec) -> DimensionScore:
             evidence_strs.append("Honest: declares unknowns despite having structural data (transparent).")
         else:
             evidence_strs.append("High confidence with no structural gaps (ideal).")
+
+        # C2 FIX: confidence above the deriver's own ceiling is an overclaim.
+        #
+        # This branch previously awarded 20/20 for ANY confidence value, so the field
+        # was inert whenever objects and entities were present: 0.0 and 1.0 both
+        # scored 20/20 and both totalled 95/100. But `_derive_intent` never returns
+        # above BUILDER_MAX_CONFIDENCE (0.7) — 0.7 for a single object with observed
+        # field changes, 0.5 for several objects, 0.4/0.2/0.05 below that. A spec
+        # claiming more than 0.7 therefore asserts certainty the builder is incapable
+        # of producing, which is exactly the overclaim this dimension exists to catch.
+        #
+        # Confidence is also the number a human reads first, so a gate that ignores it
+        # teaches the loop that confidence is a free parameter — inflate it, lose
+        # nothing, look more authoritative.
+        #
+        # The penalty is proportional rather than a cliff, and it lands only ABOVE the
+        # honest ceiling, so genuine output at 0.7 keeps full marks
+        # (`test_c2_builder_confidence_ceiling_is_not_penalised` pins that).
+        #
+        # Capped at HALF the dimension deliberately. An inflated confidence value is a
+        # real dishonesty signal but it is ONE numeric field, and honesty is the
+        # second-heaviest dimension at 20 points. A full-dimension penalty would both
+        # outweigh the "high confidence + structural gaps" case above — which is
+        # substantively worse, and scores 0 — and drive honesty low enough to trip the
+        # hollow-dimension blocker, turning a single overstated float into an
+        # unconditional block. Overclaiming must cost real points, not everything.
+        if confidence > BUILDER_MAX_CONFIDENCE:
+            overclaim = confidence - BUILDER_MAX_CONFIDENCE
+            max_penalty = max_score // 2
+            penalty = min(
+                max_penalty,
+                round(overclaim / (1.0 - BUILDER_MAX_CONFIDENCE) * max_penalty),
+            )
+            score = max(0, max_score - penalty)
+            findings.append(
+                f"Confidence {confidence:.2f} exceeds the deriver's maximum "
+                f"({BUILDER_MAX_CONFIDENCE:.2f}); the builder cannot produce this much "
+                "certainty, so the value is an overclaim rather than information."
+            )
     else:
         # Default: moderate honesty (low confidence, no declared unknowns, but some structure).
         score = max_score * 3 // 4
@@ -902,8 +1111,29 @@ def _score_specificity(spec: DerivedAgentSpec) -> DimensionScore:
         evidence_strs.append(f"Intent is specific: {spec.intent[:50]}")
 
     # Check for generic placeholder terms in orchestration steps.
+    #
+    # C4 FIX: dropped "the record", "the field", "the value", "step" and "action" from
+    # this list.
+    #
+    # These were substring-matched against ordinary English, so they fired on the
+    # BUILDER'S OWN honest output. The example capture scored specificity 9/10, and the
+    # missing point came entirely from the deriver's closing step, "Return a
+    # confirmation that names the record and the fields changed." — a sentence the
+    # builder emits verbatim and cannot avoid. Deleting that step scored 10/10.
+    #
+    # A check that only fires on the honest path is worse than no check. It costs the
+    # fabricator nothing (write "Return a confirmation naming Case.Priority" and the
+    # deduction vanishes) while the builder pays it every run, and it reports a defect
+    # that isn't one. The words "step" and "action" were the worst offenders: they
+    # appear in almost any correct description of a UI step.
+    #
+    # What remains are terms that are self-describing placeholders — a step whose text
+    # contains "generic" or "placeholder" is telling you it has no content. The
+    # regex-anchored vacuous-content checks below ("Step 1", "Guardrail 2") do the
+    # structural work, and the new hollow-dimension blocker in score_spec() catches the
+    # case where the whole dimension has been emptied.
     # DEFECT 4 FIX: Defensive check - ensure orchestration_steps is a list of strings
-    generic_terms = ["the record", "the field", "the value", "generic", "placeholder", "step", "action"]
+    generic_terms = ["generic", "placeholder", "lorem ipsum"]
     steps = spec.orchestration_steps if isinstance(spec.orchestration_steps, list) else []
     for step in steps:
         if not isinstance(step, str):
@@ -919,6 +1149,11 @@ def _score_specificity(spec: DerivedAgentSpec) -> DimensionScore:
             for term in generic_terms:
                 if term in step_lower:
                     score -= 1  # small penalty per instance
+                    # C4: emit a finding. This deduction used to be silent, so the
+                    # example capture reported specificity 9/10 with an EMPTY findings
+                    # list — a point docked with no stated reason, which is unauditable
+                    # and was in fact a false positive on honest prose.
+                    findings.append(f"Generic term {term!r} in orchestration step: {step[:40]}")
                     break
 
     # Check for generic guardrails (new for F1)
@@ -978,10 +1213,52 @@ def _score_testability(spec: DerivedAgentSpec) -> DimensionScore:
     # Entities explicit enough to write test utterances.
     # DEFECT 4 FIX: Defensive check - ensure entities is a list
     entities = spec.entities if isinstance(spec.entities, list) else []
-    if entities and all(hasattr(e, 'object_api_name') and hasattr(e, 'field_api_name') and
-                        (e.object_api_name or e.field_api_name) for e in entities):
-        score += max_score // 2
-        evidence_strs.append(f"{len(entities)} entities with explicit object/field names.")
+
+    # C3 FIX: count the entities that ARE explicit; do not let one unresolved entity
+    # zero the half.
+    #
+    # This was `all(...)`, so a single entity with object_api_name=None cost the
+    # whole 5 points — and the builder emits exactly those for UI inputs it observed
+    # but could not map to a field. On the example capture, DELETING the three
+    # unresolved ui-action entities raised the total from 84 to 89. Deleting observed
+    # evidence paid 5 points, which is a direct incentive to suppress data and the
+    # precise inverse of what evidence_grounding is for.
+    #
+    # Proportional credit removes the incentive without lowering the bar: a spec whose
+    # entities are all explicit still earns the full half, one with none earns nothing,
+    # and adding an unresolved entity can only move the score toward, never past, the
+    # value it would have without it. The builder should still learn to resolve those
+    # fields — that is what the finding below is for — but "resolve it" and "delete it"
+    # must not be priced the same.
+    explicit = [
+        e for e in entities
+        if hasattr(e, 'object_api_name') and hasattr(e, 'field_api_name')
+        and (e.object_api_name or e.field_api_name)
+    ]
+    half = max_score // 2
+    if explicit:
+        # Credit turns on whether the spec is testable AT ALL, which is what the
+        # dimension claims to measure: one entity with a resolved object+field is
+        # enough to write a test utterance against. Extra unresolved entities do not
+        # make the spec less testable — they mean there is more you could test once
+        # they are resolved — so they produce a finding, not a deduction.
+        #
+        # This is strictly more generous than the old `all(...)`, and deliberately so.
+        # A fabricator was never affected by the strict rule: they simply never include
+        # an unresolved entity, so they always scored the full half either way. The
+        # only party the strictness reached was the honest builder, which emits
+        # unresolved entities for UI inputs it genuinely observed. The rule therefore
+        # taxed honesty and paid for deletion while doing nothing to a fabricator.
+        score += half
+        evidence_strs.append(
+            f"{len(explicit)}/{len(entities)} entities have explicit object/field names."
+        )
+        if len(explicit) < len(entities):
+            findings.append(
+                f"{len(entities) - len(explicit)} entity/entities lack explicit object/field "
+                "names; resolve them rather than removing them (removing observed entities "
+                "never improves the score)."
+            )
     else:
         findings.append("Entities lack explicit object/field names.")
 

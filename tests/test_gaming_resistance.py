@@ -154,7 +154,15 @@ def test_attack_2_evidence_laundering():
         guardrails=["Enforce FLS on Case"],
         failure_handling=["Observed validation failure during recording: x"],
         unknowns=[],
-        evidence=[],
+        # A real trail, because this test is about whether LAUNDERING is detectable.
+        # The fixture used to carry `evidence=[]`, which the gate now blocks on its own
+        # (build_agent_spec always records the run — see the C1 finding in
+        # test_score_calibration.py). That made the test block for a reason unrelated to
+        # laundering and stop measuring the thing it documents.
+        evidence=[
+            SpecEvidence("extraction", "2 action(s) in recording"),
+            SpecEvidence("data-delta", "objects mutated: Case"),
+        ],
     )
 
     result = score_spec(attack)
