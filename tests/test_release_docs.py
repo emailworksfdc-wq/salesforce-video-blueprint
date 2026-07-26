@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import ast
 import itertools
+import os
 import re
 import subprocess
 import sys
@@ -88,15 +89,21 @@ def _collected_count(*extra_env_note: str) -> int:
     Derived rather than hardcoded so this test cannot become the next stale
     number it was written to prevent.
     """
+    # NO_COLOR because pytest wraps its summary line in ANSI escapes when stdout
+    # looks like a terminal, which pushes the digits off column 0 and defeats an
+    # anchored match. Belt and braces: the regex is unanchored and the escapes are
+    # stripped, so this holds whether or not the child honours the environment.
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=False,
+        env={**os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0"},
     )
-    match = re.search(r"^(\d+) tests collected", proc.stdout, re.MULTILINE)
-    assert match, f"could not parse collection output:\n{proc.stdout[-2000:]}"
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+    match = re.search(r"(\d+) tests? collected", plain)
+    assert match, f"could not parse collection output:\n{plain[-2000:]}"
     return int(match.group(1))
 
 
@@ -174,22 +181,28 @@ class TestQuotedTestCounts:
         every quoted number gets verified.
 
         A module-scope `importorskip` reports a skip while contributing **zero**
-        collected items, so a run's `passed + skipped` exceeds `--collect-only` by
-        one for every such module that actually skips. That offset is counted from
-        the tree rather than assumed: hardcoding it here is how this test would
-        start lying about the very number it exists to police.
+        collected items, so a run's `passed + skipped` can exceed `--collect-only`
+        by one for every such module that actually skips. Whether any module skips
+        depends on which extras are installed, so the allowance is bounded by the
+        number of modules that *could* skip and is only ever an upper bound — never
+        added unconditionally. Counting `importorskip` occurrences textually would
+        also count the one inside this very docstring, so the bound is taken from
+        modules whose *code* opens with the call.
         """
         collected = _collected_count()
         pattern = re.compile(r"(\d+) passed, (\d+) skipped")
 
         # Modules that skip at import time collect nothing but still report a skip.
-        phantom_skips = sum(
+        # `possible_skips` is an upper bound: with every extra installed, none skip.
+        possible_skips = sum(
             1
             for path in (REPO_ROOT / "tests").glob("*.py")
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line.startswith("pytest.importorskip")
+            if any(
+                line.startswith("pytest.importorskip")
+                for line in path.read_text(encoding="utf-8").splitlines()
+            )
         )
-        acceptable = {collected, collected + phantom_skips}
+        acceptable = {collected + n for n in range(possible_skips + 1)}
 
         for path in (README, CONTRIBUTING):
             quoted = pattern.findall(_read(path))
