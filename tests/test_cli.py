@@ -633,3 +633,147 @@ def test_validate_trace_is_actually_invoked(
 
     assert result.exit_code == 0
     assert validate_called, "validate_trace must be invoked during capture processing"
+
+
+# ---------------------------------------------------------------------------
+# DEFECT L4-7: sub-threshold loss must be prominent in the terminal.
+#
+# The gate refuses at >=50% loss. Below that, the run proceeds — correctly — but
+# before the fix it proceeded in total silence: no line of output distinguished a
+# capture that lost 40% of its events from a clean one. The operator's only clue
+# was a step count they had no baseline for.
+# ---------------------------------------------------------------------------
+
+
+def _capture_with_loss(tmp_path: Path, *, good: int, bad: int, name: str) -> Path:
+    """A capture with `good` valid events and `bad` unparseable lines."""
+    lines = []
+    for i in range(good):
+        lines.append(json.dumps({
+            "v": 1,
+            "seq": i + 1,
+            "t": 1700000000000 + i * 1000,
+            "type": "click",
+            "url": "https://test.my.salesforce.com/lightning/r/Case/500XX000001AbcAAA/view",
+            "frame_path": [],
+            "selectors": {
+                "test_id": None,
+                "aria": f"[aria-label='Btn{i}']",
+                "role_name": {"role": "button", "name": f"Btn{i}"},
+                "label_for": None,
+                "sf_field": None,
+                "css_path": f"button.b{i}",
+                "text": f"Btn{i}",
+                "xpath": None,
+            },
+            "element": {
+                "tag": "button",
+                "type": None,
+                "name": None,
+                "id": None,
+                "classes": [],
+                "aria_label": f"Btn{i}",
+                "text": f"Btn{i}",
+                "is_in_modal": False,
+                "modal_label": None,
+                "shadow_depth": 0,
+            },
+            "value": None,
+            "value_redacted": False,
+            "sf": {
+                "object": "Case",
+                "record_id": "500XX000001AbcAAA",
+                "page_type": "record_home",
+                "app": "Service",
+            },
+        }))
+    lines.extend("{ truncated line" for _ in range(bad))
+    cap = tmp_path / name
+    cap.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cap
+
+
+@pytest.mark.parametrize("good,bad", [(9, 1), (8, 2), (7, 3), (6, 4)])
+def test_sub_threshold_loss_is_announced_in_the_terminal(
+    runner: CliRunner, tmp_path: Path, good: int, bad: int
+) -> None:
+    """10% through 40% loss: the run succeeds AND says how much it lost.
+
+    Every one of these produced no output at all about the loss before the fix.
+    """
+    cap = _capture_with_loss(tmp_path, good=good, bad=bad, name=f"loss{bad}.jsonl")
+    result = runner.invoke(
+        app,
+        [
+            "--capture", str(cap),
+            "--org-url", "https://test.my.salesforce.com",
+            "--output-path", str(tmp_path / "report.html"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "CAPTURE IS INCOMPLETE" in result.stdout
+    assert "EVIDENCE INCOMPLETE:" in result.stdout
+    # The ratio, not just the count: "1 line discarded" is meaningless alone.
+    assert f"{bad / (good + bad):.0%}" in result.stdout
+    assert "PARTIAL" in result.stdout
+
+
+def test_clean_capture_says_nothing_about_loss(
+    runner: CliRunner, minimal_capture: Path, tmp_path: Path
+) -> None:
+    """No false alarms. A warning that fires on clean input trains operators to
+    ignore it, which is worse than no warning at all."""
+    result = runner.invoke(
+        app,
+        [
+            "--capture", str(minimal_capture),
+            "--org-url", "https://test.my.salesforce.com",
+            "--output-path", str(tmp_path / "report.html"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "CAPTURE IS INCOMPLETE" not in result.stdout
+    assert "EVIDENCE INCOMPLETE" not in result.stdout
+
+
+def test_loss_at_the_threshold_still_aborts(runner: CliRunner, tmp_path: Path) -> None:
+    """The gate is unchanged: 50% loss remains fatal, not a yellow warning.
+
+    LANE_RULES forbids weakening a gate. This test exists so that a future
+    attempt to "improve" the incomplete-evidence path by downgrading the 50%
+    abort into a warning fails loudly.
+    """
+    cap = _capture_with_loss(tmp_path, good=5, bad=5, name="half.jsonl")
+    result = runner.invoke(
+        app,
+        [
+            "--capture", str(cap),
+            "--org-url", "https://test.my.salesforce.com",
+            "--output-path", str(tmp_path / "report.html"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "DATA LOSS" in result.stdout
+    assert not (tmp_path / "report.html").exists()
+
+
+def test_incomplete_notice_is_not_duplicated_as_a_generic_warning(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    """Each finding is reported once, in its own severity block."""
+    cap = _capture_with_loss(tmp_path, good=8, bad=2, name="dupe.jsonl")
+    result = runner.invoke(
+        app,
+        [
+            "--capture", str(cap),
+            "--org-url", "https://test.my.salesforce.com",
+            "--output-path", str(tmp_path / "report.html"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "CAPTURE VALIDATION: EVIDENCE INCOMPLETE:" not in result.stdout
+    assert result.stdout.count("EVIDENCE INCOMPLETE: 2 of 10") == 1

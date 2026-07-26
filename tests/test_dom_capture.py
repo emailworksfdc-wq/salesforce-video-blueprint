@@ -2277,3 +2277,185 @@ def test_leak_finding_names_the_signal_that_matched() -> None:
         f"finding should identify the matching signal: {findings}"
     )
     assert all(_CANARY not in f for f in findings)
+
+
+# ============================================================================
+# 17. DEFECT L4-7 — loss below 50% was surfaced nowhere
+# ============================================================================
+#
+# `validate_trace` warned on 100% loss and on >=50% loss, and said nothing at
+# all below that. Measured, with `discover_manifest=False` to isolate line-level
+# loss:
+#
+#     good  bad   loss  finding
+#       10    0    0%   (nothing — correct)
+#        9    1   10%   NOTHING
+#        8    2   20%   NOTHING
+#        7    3   30%   NOTHING
+#        6    4   40%   NOTHING
+#        5    5   50%   DATA LOSS: ...
+#
+# A capture that quietly lost 40% of its events was stamped as real evidence
+# with no signal anywhere. That is the exact failure the brief names.
+#
+# The fix does NOT lower the 50% fail-closed threshold — cli.py, pipeline.py and
+# mcp_server.py all abort on a `DATA LOSS:` prefix, and turning a 10%-loss
+# capture into a hard failure would be a behaviour change nobody asked for. Any
+# loss instead produces an `EVIDENCE INCOMPLETE:` finding, and `CaptureTrace`
+# grows a computed `loss_ratio` so the number is impossible to miss
+# programmatically rather than only in prose.
+
+
+def _capture_with_bad_lines(tmp_path: Path, good: int, bad: int) -> Path:
+    lines = [json.dumps(_plain_event(i)) for i in range(1, good + 1)]
+    lines += ["{ this line is malformed"] * bad
+    capture = tmp_path / "dom_capture.jsonl"
+    capture.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return capture
+
+
+@pytest.mark.parametrize("good,bad", [(9, 1), (8, 2), (7, 3), (6, 4)])
+def test_sub_threshold_loss_is_surfaced(tmp_path: Path, good: int, bad: int) -> None:
+    """DEFECT L4-7: ANY discarded line must produce a finding.
+
+    Every one of these produced an empty finding list before the fix.
+    """
+    capture = _capture_with_bad_lines(tmp_path, good, bad)
+
+    trace = parse_capture_file(capture, discover_manifest=False)
+    findings = validate_trace(trace)
+
+    incomplete = [f for f in findings if f.startswith("EVIDENCE INCOMPLETE:")]
+    assert incomplete, f"{bad}/{good + bad} lines lost with no finding: {findings}"
+    # The ratio has to be in the text — "some lines were skipped" is not
+    # actionable.
+    assert f"{bad}" in incomplete[0]
+
+
+@pytest.mark.parametrize("good,bad", [(9, 1), (6, 4)])
+def test_sub_threshold_loss_does_not_fail_the_run_closed(
+    tmp_path: Path, good: int, bad: int
+) -> None:
+    """The 50% fail-closed threshold is NOT lowered.
+
+    cli.py, pipeline.py and mcp_server.py all abort on a `DATA LOSS:` prefix.
+    Sub-threshold loss must be loud but non-fatal, so it must NOT carry that
+    prefix.
+    """
+    capture = _capture_with_bad_lines(tmp_path, good, bad)
+
+    findings = validate_trace(parse_capture_file(capture, discover_manifest=False))
+
+    assert not [f for f in findings if f.startswith("DATA LOSS:")], (
+        "sub-threshold loss must not trip the fail-closed gate"
+    )
+
+
+@pytest.mark.parametrize("good,bad", [(5, 5), (4, 6)])
+def test_at_or_above_threshold_still_fails_closed(
+    tmp_path: Path, good: int, bad: int
+) -> None:
+    """REGRESSION GUARD: >=50% loss must still raise the fail-closed finding.
+
+    This is the check LANE_RULES forbids weakening. If this test ever passes
+    vacuously the gate is gone.
+    """
+    capture = _capture_with_bad_lines(tmp_path, good, bad)
+
+    findings = validate_trace(parse_capture_file(capture, discover_manifest=False))
+
+    assert [f for f in findings if f.startswith("DATA LOSS:")], (
+        f"the >=50% fail-closed gate did not fire at {bad}/{good + bad}"
+    )
+
+
+def test_clean_capture_produces_no_loss_finding(tmp_path: Path) -> None:
+    """Zero loss must stay silent, or the signal is worthless."""
+    capture = _capture_with_bad_lines(tmp_path, 10, 0)
+
+    findings = validate_trace(parse_capture_file(capture, discover_manifest=False))
+
+    assert not [f for f in findings if "INCOMPLETE" in f or f.startswith("DATA LOSS:")]
+
+
+def test_loss_ratio_is_exposed_on_the_trace(tmp_path: Path) -> None:
+    """The number must be reachable programmatically, not only greppable in
+    prose. Callers that summarise a run need to render it."""
+    capture = _capture_with_bad_lines(tmp_path, 7, 3)
+
+    trace = parse_capture_file(capture, discover_manifest=False)
+
+    assert trace.total_lines == 10
+    assert trace.loss_ratio == pytest.approx(0.3)
+    assert trace.has_data_loss is True
+
+
+def test_loss_ratio_on_a_clean_trace_is_zero(tmp_path: Path) -> None:
+    capture = _capture_with_bad_lines(tmp_path, 4, 0)
+
+    trace = parse_capture_file(capture, discover_manifest=False)
+
+    assert trace.loss_ratio == 0.0
+    assert trace.has_data_loss is False
+
+
+def test_loss_ratio_on_an_empty_trace_does_not_divide_by_zero() -> None:
+    trace = CaptureTrace(events=[])
+
+    assert trace.total_lines == 0
+    assert trace.loss_ratio == 0.0
+
+
+def test_manifest_gap_counts_toward_loss_even_with_no_bad_lines(
+    tmp_path: Path,
+) -> None:
+    """The subtler loss: the recorder wrote 10, the file holds 6, every line
+    present parses cleanly.
+
+    skipped_lines is EMPTY here — there is no bad line to count — so a
+    line-ratio-only measure reports 0% loss on a capture missing 40% of its
+    events. The manifest count is the only witness.
+    """
+    capture = _write_capture_with_manifest(tmp_path, events=6, claimed=10)
+
+    trace = parse_capture_file(capture)
+    findings = validate_trace(trace)
+
+    assert trace.skipped_lines == []
+    assert any(f.startswith("EVIDENCE INCOMPLETE:") for f in findings), (
+        f"a 4-event manifest gap was not surfaced as incomplete evidence: {findings}"
+    )
+    assert trace.manifest_gap == 4
+
+
+def test_manifest_gap_is_zero_when_counts_agree(tmp_path: Path) -> None:
+    capture = _write_capture_with_manifest(tmp_path, events=6, claimed=6)
+
+    trace = parse_capture_file(capture)
+
+    assert trace.manifest_gap == 0
+    assert not [f for f in validate_trace(trace) if "INCOMPLETE" in f]
+
+
+def test_manifest_gap_is_none_without_a_manifest(tmp_path: Path) -> None:
+    """Unknown is not zero. Without a manifest the gap is unknowable and must
+    not be reported as "no gap"."""
+    capture = _capture_with_bad_lines(tmp_path, 3, 0)
+
+    trace = parse_capture_file(capture, discover_manifest=False)
+
+    assert trace.manifest_gap is None
+
+
+def test_evidence_incomplete_finding_is_greppable_and_specific(
+    tmp_path: Path,
+) -> None:
+    """The finding must carry the counts an operator needs to judge severity."""
+    capture = _capture_with_bad_lines(tmp_path, 8, 2)
+
+    findings = validate_trace(parse_capture_file(capture, discover_manifest=False))
+    incomplete = [f for f in findings if f.startswith("EVIDENCE INCOMPLETE:")]
+
+    assert len(incomplete) == 1
+    text = incomplete[0]
+    assert "2" in text and "10" in text and "20%" in text

@@ -71,6 +71,30 @@ class PipelineResult:
     events_parsed: int = 0
     actions_extracted: int = 0
 
+    #: Events the recorder reported writing that the parser never received, or
+    #: None when there was no manifest to compare against (DEFECT L4-7).
+    #: `None` means UNKNOWABLE, not zero — a capture with no manifest has no
+    #: witness for this class of loss.
+    manifest_gap: int | None = None
+
+    @property
+    def loss_ratio(self) -> float:
+        """Fraction of content lines the parser could not use, 0.0–1.0."""
+        total = self.events_parsed + len(self.skipped_lines)
+        if total == 0:
+            return 0.0
+        return len(self.skipped_lines) / total
+
+    @property
+    def evidence_is_complete(self) -> bool:
+        """True only when nothing was lost through EITHER channel.
+
+        Distinct from `evidence_is_real`: a capture can be entirely real and
+        still be missing 40% of the session. Realness is about provenance,
+        completeness is about how much of the session survived.
+        """
+        return not self.skipped_lines and not self.manifest_gap
+
     @property
     def evidence_is_real(self) -> bool:
         """True only when BOTH extraction and telemetry came from real sources.
@@ -113,6 +137,13 @@ class PipelineResult:
             "skipped_lines": [
                 {"line": line, "reason": reason} for line, reason in self.skipped_lines
             ],
+            # DEFECT L4-7: the ratio and the recorder-side gap, not just the raw
+            # count. "3 skipped lines" reads as negligible until you know the
+            # capture only had 8 lines, and a truncated capture leaves NO skipped
+            # lines at all — only `manifest_gap` witnesses that one.
+            "loss_ratio": round(self.loss_ratio, 4),
+            "manifest_gap": self.manifest_gap,
+            "evidence_is_complete": self.evidence_is_complete,
             "warnings": list(self.warnings),
         }
 
@@ -195,6 +226,7 @@ def run_pipeline(
         skipped_lines=trace.skipped_lines,
         events_parsed=len(trace.events),
         actions_extracted=len(extraction.actions),
+        manifest_gap=trace.manifest_gap,
     )
 
 

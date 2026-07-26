@@ -136,8 +136,42 @@ def run(
             )
             raise typer.Exit(code=1)
 
+        # DEFECT L4-7: incomplete-evidence findings get their own block. Below
+        # the 50% fail-closed threshold this used to be surfaced nowhere at all,
+        # so a capture missing 40% of its events was stamped as real evidence in
+        # silence. Non-blocking by design — the gate is unchanged — but it must
+        # not be one yellow line among many.
+        incomplete = [f for f in findings if f.startswith("EVIDENCE INCOMPLETE:")]
+        if incomplete:
+            typer.secho(
+                "CAPTURE IS INCOMPLETE — evidence was lost:",
+                fg=typer.colors.YELLOW,
+                bold=True,
+            )
+            for finding in incomplete:
+                typer.secho(f"  {finding}", fg=typer.colors.YELLOW)
+            typer.secho(
+                f"  Parsed {len(trace.events)} events; "
+                f"{len(trace.skipped_lines)} line(s) discarded "
+                f"({trace.loss_ratio:.0%} line loss)"
+                + (
+                    f"; {trace.manifest_gap} event(s) never reached the parser"
+                    if trace.manifest_gap
+                    else ""
+                )
+                + ".",
+                fg=typer.colors.YELLOW,
+            )
+            typer.secho(
+                "  The spec below is derived from a PARTIAL recording. It is still "
+                "stamped as real dom-capture evidence, because it is real — but it "
+                "is not complete.",
+                fg=typer.colors.YELLOW,
+            )
+
         # Surface all other findings as warnings (non-blocking)
-        for finding in security_warnings + other:
+        remaining = [f for f in (security_warnings + other) if f not in incomplete]
+        for finding in remaining:
             typer.secho(f"CAPTURE VALIDATION: {finding}", fg=typer.colors.YELLOW)
 
         extraction = DomCaptureExtractor().extract(capture)

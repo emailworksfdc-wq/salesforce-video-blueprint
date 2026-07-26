@@ -210,6 +210,55 @@ class CaptureTrace:
     skipped_lines: list[tuple[int, str]] = field(default_factory=list)
     manifest: CaptureManifest | None = None
 
+    # ------------------------------------------------------------------
+    # Loss accounting (DEFECT L4-7)
+    #
+    # Loss below the 50% fail-closed threshold was surfaced nowhere: a capture
+    # that quietly discarded 40% of its events was stamped as real evidence with
+    # no signal at all. These make the number reachable programmatically, so a
+    # caller summarising a run cannot fail to render it.
+    # ------------------------------------------------------------------
+
+    @property
+    def total_lines(self) -> int:
+        """Lines that carried content: parsed events plus discarded lines."""
+        return len(self.events) + len(self.skipped_lines)
+
+    @property
+    def loss_ratio(self) -> float:
+        """Fraction of content lines the parser could not use, 0.0–1.0.
+
+        0.0 for an empty trace — no lines means no lost lines. Emptiness is
+        reported separately, as a CRITICAL finding.
+        """
+        total = self.total_lines
+        if total == 0:
+            return 0.0
+        return len(self.skipped_lines) / total
+
+    @property
+    def manifest_gap(self) -> int | None:
+        """Events the recorder claims it wrote that this parser never received.
+
+        None when there is no manifest: without the recorder's own count the gap
+        is UNKNOWABLE, and reporting unknown as 0 is the kind of quiet
+        false-negative this module exists to prevent.
+
+        This is a different loss channel from `skipped_lines`. A truncated file
+        leaves no bad line behind, so `skipped_lines` is empty and only the
+        manifest count reveals the gap. Negative values are clamped to 0 —
+        parsing MORE events than the manifest claims is a mismatch, reported by
+        `validate_trace`, not a negative loss.
+        """
+        if self.manifest is None:
+            return None
+        return max(0, self.manifest.event_count - len(self.events))
+
+    @property
+    def has_data_loss(self) -> bool:
+        """True when any evidence was lost through either channel."""
+        return bool(self.skipped_lines) or bool(self.manifest_gap)
+
 
 # ============================================================================
 # Parsing
@@ -217,6 +266,16 @@ class CaptureTrace:
 
 
 SUPPORTED_VERSION = 1
+
+#: Line-loss ratio at or above which `validate_trace` emits a `DATA LOSS:`
+#: finding, which cli.py, pipeline.py and mcp_server.py all treat as fatal.
+#:
+#: DO NOT LOWER THIS to make a lossy capture pass, and do not raise it to make
+#: one fail. Loss below this threshold is reported as `EVIDENCE INCOMPLETE:`
+#: (DEFECT L4-7) — loud, greppable and non-fatal — which is the right place to
+#: tune sensitivity. Named rather than inlined so a change to it is visible in a
+#: diff.
+_FAIL_CLOSED_LOSS_RATIO = 0.5
 
 
 def find_manifest_path(capture_path: Path) -> Path | None:
@@ -764,13 +823,47 @@ def validate_trace(trace: CaptureTrace) -> list[str]:
                 f"were skipped. All capture data was discarded. Check for recorder/parser "
                 f"version drift or schema mismatch."
             )
-        elif skip_ratio >= 0.5:
+        elif skip_ratio >= _FAIL_CLOSED_LOSS_RATIO:
             # Substantial partial loss
             findings.append(
                 f"DATA LOSS: {len(trace.skipped_lines)} of {total_lines} lines were skipped "
                 f"({skip_ratio:.0%}). More than half the capture was discarded. Check for "
                 f"recorder/parser version drift or schema mismatch."
             )
+        elif trace.skipped_lines:
+            # DEFECT L4-7: ANY loss below the 50% threshold used to be surfaced
+            # nowhere at all. Measured before the fix: 1/10, 2/10, 3/10 and 4/10
+            # lines discarded each produced an empty finding list, so a capture
+            # missing 40% of its events was stamped as real evidence in silence.
+            #
+            # A distinct prefix, deliberately NOT "DATA LOSS:": cli.py,
+            # pipeline.py and mcp_server.py all abort on that prefix, and the
+            # 50% fail-closed threshold is not being lowered here. This is loud
+            # and non-fatal.
+            findings.append(
+                f"EVIDENCE INCOMPLETE: {len(trace.skipped_lines)} of {total_lines} "
+                f"lines were discarded ({skip_ratio:.0%} loss). The capture parsed, "
+                f"but it is NOT a complete record of the session — any spec derived "
+                f"from it is missing evidence. Below the {_FAIL_CLOSED_LOSS_RATIO:.0%} "
+                f"threshold that aborts a run, so this is a warning, not a refusal."
+            )
+
+    # The other loss channel: events the recorder wrote that never reached the
+    # parser. A truncated file leaves no bad line behind, so skipped_lines is
+    # empty and the line ratio above reports 0% on a capture missing 40% of its
+    # events. Only the manifest count witnesses this.
+    gap = trace.manifest_gap
+    if gap:
+        claimed = trace.manifest.event_count if trace.manifest else 0
+        gap_ratio = gap / claimed if claimed else 0.0
+        findings.append(
+            f"EVIDENCE INCOMPLETE: the recorder reported {claimed} events but only "
+            f"{len(trace.events)} reached the parser — {gap} missing "
+            f"({gap_ratio:.0%} of the session). Every line present parsed cleanly, so "
+            f"this loss is invisible in the skipped-line count: the events are absent "
+            f"from the file, not malformed within it. Check for sink errors or a "
+            f"truncated write."
+        )
 
     return findings
 
