@@ -52,6 +52,51 @@ class TelemetryCollector(Protocol):
     def snapshot_changes(self, run_id: str, step_id: str) -> list[ObjectSnapshot]: ...
 
 
+class MockTelemetryCollector(TelemetryCollector):
+    """Returns the same fabricated Flow event and Case diff for every step.
+
+    Nothing here is observed. The payload is fixed, the record id is fake, and the
+    Case Status transition is invented — a run through this collector cannot tell
+    you what the org did.
+
+    That is precisely why a run using it is stamped `telemetry_source: "mock"`,
+    which `markers.telemetry_is_real` rejects and the score gate blocks on. Real
+    telemetry requires a live org (see `SalesforceTelemetryCollector`). Do not add
+    "mock" to `REAL_TELEMETRY_SOURCES` to make a run pass; that would make the
+    fabrication invisible, which is the one failure this project exists to prevent.
+
+    Lives here rather than in `cli.py` so library and MCP consumers can assemble a
+    mock run without importing the CLI (and therefore `typer`).
+    """
+
+    def collect_for_step(self, run_id: str, step_id: str) -> list[TelemetryEvent]:
+        return [
+            TelemetryEvent(
+                correlation=CorrelationKey(
+                    run_id=run_id, step_id=step_id, event_time=datetime.now(timezone.utc)
+                ),
+                layer=TelemetryLayer.FLOW,
+                event_name="FlowInterviewExecuted",
+                status="success",
+                payload={"flowApiName": "Sample_Flow"},
+            )
+        ]
+
+    def snapshot_changes(self, run_id: str, step_id: str) -> list[ObjectSnapshot]:
+        return [
+            ObjectSnapshot(
+                correlation=CorrelationKey(
+                    run_id=run_id, step_id=step_id, event_time=datetime.now(timezone.utc)
+                ),
+                object_api_name="Case",
+                record_id="500xx0000012345AAA",
+                before={"Status": "New"},
+                after={"Status": "Working"},
+                changed_fields=["Status"],
+            )
+        ]
+
+
 class TelemetryRegistry:
     """In-memory event contract store; replace with persistent backend in production."""
 

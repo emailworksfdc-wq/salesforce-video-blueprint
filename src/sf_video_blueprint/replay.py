@@ -7,7 +7,7 @@ import random
 import time
 from typing import Protocol
 
-from .models import ExtractedAction
+from .models import ActionType, ExtractedAction
 
 
 class ReplayStatus(str, Enum):
@@ -59,6 +59,30 @@ class ReplayEvent:
 class SalesforceUIAdapter(Protocol):
     def open_org(self, org_url: str) -> None: ...
     def perform_action(self, action: ExtractedAction) -> tuple[bool, str, str | None]: ...
+
+
+class NoopUIAdapter(SalesforceUIAdapter):
+    """Reports every action as replayed without touching a browser or an org.
+
+    This is what makes a mock-mode run possible: the correlation stage needs a
+    replay event per step, and this supplies one without side effects.
+
+    It reports success unconditionally, so a run through this adapter proves
+    nothing about whether the process actually works. That is why provenance
+    stamps `replay_source: "noop"` — the score gate reads that field and refuses
+    to treat the run as evidence-backed.
+
+    Lives here rather than in `cli.py` so that library and MCP consumers can
+    assemble a mock run without importing the CLI (and therefore `typer`).
+    """
+
+    def open_org(self, org_url: str) -> None:
+        _ = org_url
+
+    def perform_action(self, action: ExtractedAction) -> tuple[bool, str, str | None]:
+        if action.action_type == ActionType.CLICK:
+            return True, "Click action replayed.", None
+        return True, "Action replayed.", None
 
 
 class ReplayEngine:

@@ -14,11 +14,16 @@ from .dom_extractor import DomCaptureExtractor
 from .extractor import HeuristicVideoExtractor
 from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
 from .models import ActionType, ExtractedAction
-from .replay import ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
+from .replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
 from .spec_builder import build_agent_spec, write_spec
-from .telemetry import CorrelationKey, ObjectSnapshot, TelemetryCollector, TelemetryEvent, TelemetryLayer, TelemetryRegistry
+from .telemetry import (
+    MockTelemetryCollector,
+    TelemetryCollector,
+    TelemetryLayer,
+    TelemetryRegistry,
+)
 
 app = typer.Typer(help="Generate Salesforce process blueprint from video inputs.")
 
@@ -48,40 +53,6 @@ def _parse_tracked_records(values: list[str]) -> list[tuple[str, str]]:
         parsed.append((object_api_name.strip(), record_id.strip()))
     return parsed
 
-
-class NoopUIAdapter(SalesforceUIAdapter):
-    def open_org(self, org_url: str) -> None:
-        _ = org_url
-
-    def perform_action(self, action: ExtractedAction) -> tuple[bool, str, str | None]:
-        if action.action_type == ActionType.CLICK:
-            return True, "Click action replayed.", None
-        return True, "Action replayed.", None
-
-
-class MockTelemetryCollector(TelemetryCollector):
-    def collect_for_step(self, run_id: str, step_id: str) -> list[TelemetryEvent]:
-        return [
-            TelemetryEvent(
-                correlation=CorrelationKey(run_id=run_id, step_id=step_id, event_time=datetime.now(timezone.utc)),
-                layer=TelemetryLayer.FLOW,
-                event_name="FlowInterviewExecuted",
-                status="success",
-                payload={"flowApiName": "Sample_Flow"},
-            )
-        ]
-
-    def snapshot_changes(self, run_id: str, step_id: str) -> list[ObjectSnapshot]:
-        return [
-            ObjectSnapshot(
-                correlation=CorrelationKey(run_id=run_id, step_id=step_id, event_time=datetime.now(timezone.utc)),
-                object_api_name="Case",
-                record_id="500xx0000012345AAA",
-                before={"Status": "New"},
-                after={"Status": "Working"},
-                changed_fields=["Status"],
-            )
-        ]
 
 @app.command()
 def run(
