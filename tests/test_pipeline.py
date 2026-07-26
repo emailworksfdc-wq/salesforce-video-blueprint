@@ -310,7 +310,7 @@ class _StubOrgCollector:
     step_id, so there is no per-step answer to give.
     """
 
-    def __init__(self, instant: datetime, record_id: str = "500bm00002ZfnikAAB") -> None:
+    def __init__(self, instant: datetime, record_id: str = "500SYNTHETIC00001") -> None:
         self.instant = instant
         self.record_id = record_id
         self.observe_calls = 0

@@ -45,13 +45,15 @@ from sf_video_blueprint.telemetry import (
     TelemetryRegistry,
 )
 
-# Verbatim rows from AFT3 for Case 500bm00002ZfnikAAB (see findings/lane-05.md).
+# The row SHAPE is verbatim from a real AFT3 CaseHistory query; the record Id is
+# synthetic. A real Id is org-identifying and this repository is public, and the
+# Id is never queried here — the runner is stubbed — so a fake one costs nothing.
 # Kept exactly as the org returned them, including the create row whose Old/New
 # values are null and the '+0000' offset with no colon.
 REAL_CASE_HISTORY_ROWS = [
     {
         "Id": "017bm00001tjCQ9AAM",
-        "CaseId": "500bm00002ZfnikAAB",
+        "CaseId": "500SYNTHETIC00001",
         "Field": "created",
         "OldValue": None,
         "NewValue": None,
@@ -60,7 +62,7 @@ REAL_CASE_HISTORY_ROWS = [
     },
     {
         "Id": "017bm00001ti0kHAAQ",
-        "CaseId": "500bm00002ZfnikAAB",
+        "CaseId": "500SYNTHETIC00001",
         "Field": "Status",
         "OldValue": "New",
         "NewValue": "Working",
@@ -69,7 +71,7 @@ REAL_CASE_HISTORY_ROWS = [
     },
     {
         "Id": "017bm00001ti0kIAAQ",
-        "CaseId": "500bm00002ZfnikAAB",
+        "CaseId": "500SYNTHETIC00001",
         "Field": "Priority",
         "OldValue": "Low",
         "NewValue": "High",
@@ -78,7 +80,7 @@ REAL_CASE_HISTORY_ROWS = [
     },
 ]
 
-REAL_CASE_ID = "500bm00002ZfnikAAB"
+REAL_CASE_ID = "500SYNTHETIC00001"
 ORG_CHANGE_INSTANT = datetime(2026, 7, 26, 20, 43, 4, tzinfo=timezone.utc)
 
 # The Status Working->Escalated row, written by a real click in a real browser.
@@ -87,7 +89,7 @@ ORG_CHANGE_INSTANT = datetime(2026, 7, 26, 20, 43, 4, tzinfo=timezone.utc)
 # TestSecondTruncationDefeatsTheForwardWindow.
 REAL_UI_DRIVEN_HISTORY_ROW = {
     "Id": "017bm00001tjCQAAAM",
-    "CaseId": "500bm00002ZfnikAAB",
+    "CaseId": "500SYNTHETIC00001",
     "Field": "Status",
     "OldValue": "Working",
     "NewValue": "Escalated",
