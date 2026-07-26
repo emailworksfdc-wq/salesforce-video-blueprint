@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
 
+from .org_denylist import BLOCKED_ORG_ALIASES as _BLOCKED_ORG_ALIASES
+from .org_denylist import is_org_blocked
+
 
 class TelemetryLayer(str, Enum):
     UI = "ui"
@@ -194,15 +197,25 @@ class EventLogFileResult:
     detail: str = ""  # Human-readable explanation of availability status
 
 
-_FORBIDDEN_ORG_ALIASES = frozenset({"PPCDM", "PPCaccenture", "ppcdm", "ppaccenture"})
+#: Canonical names, re-exported for callers and error messages. The matching
+#: logic lives in `org_denylist`; this is not a match set.
+#:
+#: DEFECT L4-4: this used to be a hand-maintained case-variant set,
+#: {"PPCDM", "PPCaccenture", "ppcdm", "ppaccenture"}, whose lowercase entry read
+#: `ppaccenture` — one `c` — where it meant `ppcaccenture`. So
+#: `_is_org_forbidden("ppcaccenture")`, the spelling a shell user is most likely
+#: to type, returned False and reached a hard-blocked org.
+_FORBIDDEN_ORG_ALIASES = _BLOCKED_ORG_ALIASES
 
 
 def _is_org_forbidden(org_alias: str) -> bool:
-    """Check if org alias is in the forbidden set (case-insensitive)."""
-    return org_alias in _FORBIDDEN_ORG_ALIASES or org_alias.lower() in {
-        "ppcdm",
-        "ppaccenture",
-    }
+    """Check if an org identifier names a permanently out-of-scope org.
+
+    Delegates to `org_denylist.is_org_blocked`, which normalizes case,
+    whitespace and punctuation and matches derived / username / instance-URL
+    forms as well as bare aliases.
+    """
+    return is_org_blocked(org_alias)
 
 
 def _verify_org_is_sandbox(org_alias: str) -> tuple[bool, str]:

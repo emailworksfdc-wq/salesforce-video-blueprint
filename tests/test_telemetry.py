@@ -105,10 +105,26 @@ class TestForbiddenOrgDetection:
     def test_ppcdm_mixedcase(self):
         assert _is_org_forbidden("PpCdm")
 
-    def test_ppaccenture_exact(self):
+    def test_ppcaccenture_exact(self):
         assert _is_org_forbidden("PPCaccenture")
 
-    def test_ppaccenture_lowercase(self):
+    def test_ppcaccenture_lowercase(self):
+        """DEFECT L4-4: this is the assertion that was missing.
+
+        The old test was named `test_ppaccenture_lowercase` and asserted
+        `_is_org_forbidden("ppaccenture")` — one `c`. That is the same typo the
+        deny-set contained, so the test passed while the REAL lowercase
+        spelling, `ppcaccenture`, returned False. A test that shares the
+        implementation's typo verifies nothing.
+        """
+        assert _is_org_forbidden("ppcaccenture")
+
+    def test_ppcaccenture_mixedcase(self):
+        assert _is_org_forbidden("PPCACCENTURE")
+        assert _is_org_forbidden("PpCaccenture")
+
+    def test_ppcaccenture_typo_spelling_still_blocked(self):
+        """The `ppaccenture` near-miss stays blocked — see org_denylist."""
         assert _is_org_forbidden("ppaccenture")
 
     def test_safe_org_aliases(self):

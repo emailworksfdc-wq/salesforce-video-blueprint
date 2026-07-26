@@ -9,12 +9,22 @@ import subprocess
 from typing import Any
 
 from .models import ActionType, ExtractedAction
+from .org_denylist import BLOCKED_ORG_ALIASES as _CANONICAL_BLOCKED
+from .org_denylist import blocked_org_message
+from .org_denylist import is_org_blocked as _is_org_blocked
 from .replay import SalesforceUIAdapter
 
 
 # Hard-blocked org aliases per project rules (PPCDM and PPCaccenture are
 # permanently out of scope, even read-only).
-BLOCKED_ORG_ALIASES = {"PPCDM", "PPCaccenture"}
+#
+# DEFECT L4-4: this set used to be matched with a bare `alias in
+# BLOCKED_ORG_ALIASES`, which is case- and punctuation-sensitive — so `ppcdm`,
+# `PPCACCENTURE`, ` PPCDM ` and `PPC-accenture` all sailed through. Matching now
+# goes through `_is_org_blocked`, which normalizes first. The set itself is kept
+# as the canonical human-readable names for error messages and is re-exported
+# for callers that assert on it.
+BLOCKED_ORG_ALIASES = set(_CANONICAL_BLOCKED)
 
 
 class ProductionOrgError(ValueError):
@@ -123,11 +133,15 @@ def resolve_org_info_from_url(org_url: str, allow_production: bool = False) -> d
         alias = matched_org.get("alias") or matched_org.get("username")
 
         # Rule 1: Hard-block PPCDM and PPCaccenture, no override.
-        if alias in BLOCKED_ORG_ALIASES:
-            raise BlockedOrgError(
-                f"Org alias '{alias}' is permanently out of scope per project rules. "
-                f"PPCDM and PPCaccenture are hard-blocked by name. No override available."
-            )
+        # Checked against the resolved alias, the username AND the instance URL:
+        # a blocked org can be reached without ever naming its alias.
+        for candidate in (
+            alias,
+            matched_org.get("username", ""),
+            matched_org.get("instanceUrl", ""),
+        ):
+            if _is_org_blocked(candidate):
+                raise BlockedOrgError(blocked_org_message(candidate))
 
         # Rule 2: Refuse production unless allow_production=True.
         is_sandbox = matched_org.get("isSandbox", False)
@@ -325,6 +339,13 @@ class BrowserReplayAdapter(SalesforceUIAdapter):
             ValueError: If the org is not authenticated or metadata cannot be resolved.
             subprocess.CalledProcessError: If `sf org open` fails.
         """
+        # 0. Refuse a blocked org BEFORE spawning any subprocess. The old code
+        # only checked the alias `sf org display` echoed back, so a blocked org
+        # was contacted before being refused. Checking the caller's own argument
+        # first means no process touches it at all.
+        if _is_org_blocked(org_alias):
+            raise BlockedOrgError(blocked_org_message(org_alias))
+
         # 1. Verify org safety by alias.
         allow_production = os.getenv("SF_ALLOW_PRODUCTION_ORG", "0") == "1"
         try:
@@ -342,12 +363,16 @@ class BrowserReplayAdapter(SalesforceUIAdapter):
             org_info = data["result"]
             alias = org_info.get("alias") or org_info.get("username")
 
-            # Rule 1: Hard-block PPCDM and PPCaccenture.
-            if alias in BLOCKED_ORG_ALIASES:
-                raise BlockedOrgError(
-                    f"Org alias '{alias}' is permanently out of scope per project rules. "
-                    f"PPCDM and PPCaccenture are hard-blocked by name. No override available."
-                )
+            # Rule 1: Hard-block PPCDM and PPCaccenture. Re-checked against the
+            # RESOLVED identity, not just the caller's argument: an innocuous
+            # local alias can point at a blocked org.
+            for candidate in (
+                alias,
+                org_info.get("username", ""),
+                org_info.get("instanceUrl", ""),
+            ):
+                if _is_org_blocked(candidate):
+                    raise BlockedOrgError(blocked_org_message(candidate))
 
             # Rule 2: Refuse production unless allow_production=True.
             is_production = _is_production_org(
