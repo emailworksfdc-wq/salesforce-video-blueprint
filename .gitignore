@@ -17,6 +17,8 @@ env/
 
 # Scratch space for parallel worktree runs. Holds probe bundles, raw sf --json
 # responses, and run output; same sensitivity as outputs/, never commit it.
+# Specifically: raw UNREDACTED org captures — org ids, tenant names, instance
+# URLs, live agent session UUIDs. Never commit it.
 .lane-tmp/
 
 # Pipeline outputs — run artifacts, blueprints, screenshots, network traces.
