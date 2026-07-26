@@ -330,6 +330,62 @@ def test_only_utils_transition_and_utils_escalate_are_used():
         ), f"Invalid action reference: {ref}"
 
 
+# Compiler-verified invocation namespaces.
+#
+# Measured against org AFT3 on 2026-07-26 by appending a single `actions:` entry
+# to an otherwise-compiling bundle and running
+# `sf agent validate authoring-bundle --json`. The namespace before the dot is a
+# CLOSED SET — `apex` and `flow` are NOT in it:
+#
+#   @flow.SFVB_TEST_Nonexistent_Flow -> exit 1
+#       "Cannot invoke '@flow.SFVB_TEST_Nonexistent_Flow' — 'flow' is not a
+#        valid invocation target."
+#   @apex.SFVB_TEST_NoClass -> exit 1
+#       "Cannot invoke '@apex.SFVB_TEST_NoClass' — 'apex' is not a valid
+#        invocation target."
+#   @nonsense_ns.Foo -> exit 1  (same "not a valid invocation target" shape)
+#   @utils.no_such_util -> exit 1  "'no_such_util' is not defined in utils"
+#
+# Note the two distinct failure shapes: an unknown NAMESPACE is "not a valid
+# invocation target", whereas an unknown MEMBER of a known namespace is "not
+# defined in <ns>". So `apex`/`flow` are not merely unresolved references — the
+# dialect does not accept those namespaces at all in an `.agent` script.
+#
+# This is why `_derive_topics` emits Flow/Apex observations as prose instead of
+# action references: fabricating `@flow.X` would not just be unverified, it would
+# be a hard compile error. The docstring's caution is now measured fact.
+COMPILER_REJECTED_ACTION_NAMESPACES = ("@apex.", "@flow.")
+
+
+def test_emitter_never_uses_a_compiler_rejected_namespace():
+    """`@apex.`/`@flow.` are compile errors, not just unverified guesses.
+
+    Guards the emitter against a future change that "helpfully" resolves an
+    observed Flow into `@flow.Name`. The org rejects that outright:
+    "'flow' is not a valid invocation target."
+    """
+    spec = _minimal_spec(
+        orchestration=[
+            "Call the Update_Case_Flow to persist the change",
+            "Execute the ValidateCase Apex class",
+        ]
+    )
+    script = build_agent_script(spec, developer_name="test_agent", agent_label="Test Agent")
+
+    for namespace in COMPILER_REJECTED_ACTION_NAMESPACES:
+        assert namespace not in script, (
+            f"Emitted script contains {namespace!r}, which the Agentforce "
+            f"compiler rejects with \"'{namespace.strip('@.')}' is not a valid "
+            'invocation target." (measured on AFT3, 2026-07-26). Emit the '
+            "observation as prose instead."
+        )
+
+    # Non-vacuous: the Flow/Apex observations must genuinely be present as prose,
+    # otherwise this test would pass on a script that simply dropped them.
+    assert "Update_Case_Flow" in script
+    assert "ValidateCase" in script
+
+
 # ============================================================================
 # TEST 7: Derived content actually appears
 # ============================================================================
