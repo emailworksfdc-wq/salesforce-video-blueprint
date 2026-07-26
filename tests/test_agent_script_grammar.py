@@ -532,15 +532,21 @@ class TestEmailInDefaultAgentUser:
 
     The org-authored `Local_Info_Agent` bundle retrieved from AFT3 sets
     `default_agent_user` to an agent-user address of the form
-    `afdx-agent@testdrive.org<id>-<uuid>`. `check_action_grammar` reported
-    `cannot invoke '@testdrive.orgab948baa'` on it — a false positive on a bundle
-    the org itself authored. Re-validating that exact value through the
+    `afdx-agent@testdrive.org<11-char-suffix>-<uuid>`. `check_action_grammar`
+    reported `cannot invoke '@testdrive.org<suffix>'` on it — a false positive on
+    a bundle the org itself authored. Re-validating that exact value through the
     compilation API returns exit 0.
+
+    The literal below is a **synthetic** address of that shape, not the real one.
+    Per CONTRIBUTING §3, a test that guards against leaking an identifier should
+    not itself commit the identifier; the checker's behaviour depends only on the
+    shape (`@` preceded by a word character), so a synthetic value exercises the
+    same code path — verified to give a byte-identical verdict to the real value.
     """
 
     EMAIL_LINE = (
         '    default_agent_user: "afdx-agent@testdrive.org'
-        'ab948baa-b469-45df-bc91-121c1cf88892"\n'
+        '0123abcd-1111-2222-3333-444455556666"\n'
     )
 
     def test_an_agent_user_email_is_not_flagged_as_an_invocation(self):

@@ -159,9 +159,10 @@ _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9]*)://(.*)$")
 #
 # The leading `(?<![\\w.@-])` guard is load-bearing: without it the local part of an
 # email address is read as an invocation. The org-authored `Local_Info_Agent` bundle
-# retrieved from AFT3 carries an `afdx-agent@testdrive.org…` value for
-# `default_agent_user`, and this checker reported `cannot invoke '@testdrive.orgab948baa'`
+# retrieved from AFT3 carries an `afdx-agent@testdrive.org<suffix>` value for
+# `default_agent_user`, and this checker reported `cannot invoke '@testdrive.org<suffix>'`
 # on it — a false positive on a bundle the org itself authored and accepted.
+# (The suffix is an org-specific identifier and is deliberately not reproduced here.)
 # Re-validating that exact value through the compilation API returns exit 0.
 _INVOCATION = re.compile(r"(?<![\w.@-])@([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_.]+)")
 

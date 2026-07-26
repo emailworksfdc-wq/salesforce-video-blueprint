@@ -399,10 +399,12 @@ and `"A"` — and the local verdict agrees with the compiler on **9/9**.
 ### A false positive on Salesforce's own artifact
 
 `check_action_grammar` reported
-`cannot invoke '@testdrive.orgab948baa' — 'testdrive' is not a valid invocation target`
+`cannot invoke '@testdrive.org<suffix>' — 'testdrive' is not a valid invocation target`
 on the **org-authored** `Local_Info_Agent` bundle retrieved from AFT3, because
 that bundle's `default_agent_user` is an agent-user address of the form
-`afdx-agent@testdrive.org<id>-<uuid>` and the `@` was read as an invocation.
+`afdx-agent@testdrive.org<11-char-suffix>-<uuid>` and the `@` was read as an
+invocation. The suffix is an org-specific identifier, so per CONTRIBUTING §3 it is
+described here rather than reproduced — the bug depends on the shape, not the value.
 Re-validating that exact value through the compilation API returns **exit 0**. The
 invocation regex now requires the `@` not to follow a word character. After the
 fix, the retrieved org bundle passes `validate_locally` with **0 findings**.
