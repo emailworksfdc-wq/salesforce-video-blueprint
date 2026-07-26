@@ -144,19 +144,33 @@ adversarial audit earns confidence in the pipeline's **internal consistency** �
 scoring, and refinement are now provably non-degenerate and evidence-respecting. It does 
 **not** mean the output is deployable.
 
-### Nothing in this project has ever touched a real Salesforce org
+### One bundle has now touched a real org — this section is narrower than it was
 
-* `sf agent validate authoring-bundle` — the only authority on whether the emitted `.agent` 
-  file's grammar is correct — **has never been run** on output from this pipeline.
+Superseded on 2026-07-26. Nothing here is softened; the scope is corrected to what was
+measured, and the parts still unproven are called out as such.
+
+* `sf agent validate authoring-bundle` — the only authority on whether the emitted `.agent`
+  file's grammar is correct — **has now been run** on output from this pipeline, against a
+  Developer Edition org. It **rejected** the first bundle with 24 `CompilationError`s, and
+  accepted the same bundle after the emitter was fixed (exit 0, `{"success": true}`). The
+  bundle also deployed as `AiAuthoringBundle` metadata and round-tripped byte-identically.
+* **What that does not establish.** One bundle, one intent shape (single-topic router), one
+  org, one CLI version. Compilation is **syntax, not semantics** — no agent was published
+  and nothing has checked how a compiled agent behaves. Any spec shape other than the
+  single-topic router, and any bundle carrying `@apex.*`/`@flow.*` actions, remain unvalidated.
 * `sf agent generate agent-spec` — the real LLM-driven refinement path — **has never been 
   run** in the loop. The `use_cli=True` branch in `iterate.py` is a placeholder; it shells 
   out but does not parse the result.
-* The 80-char API-name cap is an **assumption**. It is documented in Salesforce conventions 
-  and enforced by the round-3 naming fix (cap at 74 to budget prefixes), but it has never 
-  been validated against a real org's metadata limits.
+* The 80-char API-name cap is **no longer an assumption on the compiler channel**: 80
+  passes and 81 fails with `Too big: expected string to have <=80 characters`, measured.
+  It applies to the **subagent name**; router action names are not length-checked at all
+  (a 100-char action compiled). The cap stays at 74 as deliberate headroom, and the
+  **metadata** channel's limit remains unmeasured. See `naming.COMPILER_VERIFIED_NAME_LIMIT`.
 * A clean local validation (0 findings from `validate_trace`, `score >= 75`, 
-  `passed=True`) does **not** mean the artifact deploys. It means the artifact is internally 
-  consistent and evidence-grounded. Deployability requires an org.
+  `passed=True`) does **not** mean the artifact deploys. This is now measured rather than
+  cautionary: `validate_locally()` reported **zero findings** on the exact file the compiler
+  rejected with 24 errors. Local validation is this project's own opinion, and it was
+  demonstrably blind to a whole error class. Deployability requires an org.
 
 ### Event Monitoring collection is still aspirational
 

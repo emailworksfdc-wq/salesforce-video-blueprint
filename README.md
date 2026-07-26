@@ -18,7 +18,7 @@ fabricated evidence is *designed to fail* its own quality gate.
 
 ---
 
-## Status: v0.1.0 — working pipeline, output now compiles in one measured case
+## Status: v0.1.1 — working pipeline, output now compiles in one measured case
 
 Read this before trusting anything this produces.
 
@@ -33,12 +33,13 @@ CompilationError: Syntax error: unexpected `->` [Ln 108, Col 8]
 CompilationError: Syntax error: unexpected `| Follow these steps:` [Ln 109, Col 8]
 ```
 
-Every derived subagent was malformed: the emitter wrote a bare `->` opener where
-the grammar requires `instructions: ->`, with the `|` lines under-indented. The
-three standard subagents compiled fine — they are copy-pasted from the
-first-party template, so they were never testing this project's grammar model at
-all. After fixing the emitter, the same bundle compiles: exit 0,
-`{"success": true}`.
+Every derived subagent was malformed: in each one's `reasoning:` block the emitter
+wrote a bare `->` opener where the grammar requires `instructions: ->`, with the
+`|` lines under-indented. The three standard subagents compiled fine — they are
+copy-pasted from the first-party template, so they were never testing this
+project's grammar model at all. After fixing the emitter, the same bundle
+compiles: exit 0, `{"success": true}`, and it then **deployed** to the org as
+`AiAuthoringBundle` metadata and round-tripped byte-identically.
 
 **What that does and does not license.** Validated: one bundle, one intent
 (`Update Case (Status)`), one org, one CLI version (`@salesforce/cli 2.143.6`,
@@ -55,7 +56,7 @@ findings on the file Salesforce rejected.** Local validation is this repo's own
 opinion, and it was measurably blind to the entire error class. Run the CLI.
 
 Against the stated end goal — *record → derive → run the spec repeatedly →
-deploy as an Agentforce agent* — the honest grade is roughly **55%**:
+deploy as an Agentforce agent* — the honest grade is roughly **58%**:
 
 | Stage | Status | Reality |
 | --- | --- | --- |
@@ -64,7 +65,7 @@ deploy as an Agentforce agent* — the honest grade is roughly **55%**:
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
 | 5 · Iterate | 🔴 Absent | `sf agent test create/run/results` appear **nowhere** in this repo. The offline loop scores 79/79/79 and reports `converged=true` — a loop that cannot change its input is not a loop. |
-| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and reachable from the MCP server. One emitted bundle now **compiles** (`sf agent validate authoring-bundle` → exit 0) and **deploys** as `AiAuthoringBundle` metadata to a DE org. Still partial: one intent shape only, no agent has been published, and nothing checks the compiled agent's behaviour. |
+| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and reachable from the MCP server. One emitted bundle (`SFVB_TEST_Case_Triage`, 2026-07-26) now **compiles** (`sf agent validate authoring-bundle` → exit 0) and **deploys** as `AiAuthoringBundle` metadata to a DE org, round-tripping byte-identically. Still partial: one intent shape only, no agent has been published, and nothing checks the compiled agent's behaviour — compilation is syntax, not semantics. |
 
 The two stages nearest to zero are the two the end goal names explicitly. This
 table is the most important thing in this README.
@@ -131,10 +132,10 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 828 passed, 1 skipped
+.venv/bin/python -m pytest -q          # 857 passed, 1 skipped
 ```
 
-Without the `mcp` extra you get `792 passed, 2 skipped` — the MCP server tests
+Without the `mcp` extra you get `820 passed, 2 skipped` — the MCP server tests
 skip rather than fail when the optional dependency is absent.
 
 One skip is always present: an opt-in check that validates artifacts from a real
@@ -199,7 +200,9 @@ gate.
 
 Three ways, all installable from the repo. Install from `@main` rather than
 `@v0.1.0` — that tag predates a dependency fix and does not install on Python
-3.12+ ([known defect](#known-defects)).
+3.12+ ([known defect](#known-defects)). The fix is on `main` and is what v0.1.1
+carries; no `v0.1.1` tag has been pushed and nothing has been published to PyPI,
+so `@main` is the only install source.
 
 ### 1 · MCP server — use it from any AI tool
 
@@ -408,7 +411,7 @@ This project keeps an honest ledger rather than a feature list. Full detail in
 | Leak detector inspects only `element.name` (`:414`) | The recorder derives field identity from eight signals. A secret identified via `type=password` or an SF field API name is not caught. |
 | `redaction.py` has zero production callers | The redaction primitives exist and are tested, but nothing in the pipeline calls them. |
 | Correlation is temporal, not causal | The join proves telemetry was *fetched during* a step, not *caused by* it. |
-| The `v0.1.0` tag does not install | It predates the dependency fix, so `pip install …@v0.1.0` fails to build `greenlet` on Python 3.12+. Install from `@main`. |
+| The `v0.1.0` tag does not install | Measured on Python 3.13.14: `playwright~=1.46.0` pins `greenlet==3.0.3`, which has no cp313 wheel and whose C++ source fails to build (`error: unknown type name '_PyCFrame'`) → `ERROR: Failed building wheel for greenlet`. Fixed on `main` (relaxed to `playwright>=1.55,<2`, resolving `greenlet 3.5.4` from a wheel) and carried by v0.1.1. The broken tag still exists, so install from `@main`. |
 | Video extraction is a stub | `HeuristicVideoExtractor` never decodes video; any video yields one placeholder step. **Use `--capture`.** |
 
 `pyproject.toml` declares `pyyaml` and `jsonschema` as dev extras. Until you

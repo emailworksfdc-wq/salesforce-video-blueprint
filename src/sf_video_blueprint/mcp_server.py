@@ -100,10 +100,17 @@ Two things to carry into how you report results:
    the expected outcome, not a failure to work around. Do not describe such a spec
    as validated, verified, or production-ready.
 
-2. Nothing this server emits has ever been validated against a real Salesforce
-   org. `locallyValid: true` means it passed this project's own structural checks,
-   not Salesforce's. Always tell the user to run
-   `sf agent validate authoring-bundle` before trusting a bundle.
+2. `locallyValid: true` means the bundle passed this project's own structural
+   checks, not Salesforce's. Treat the two as independent: on 2026-07-26 a bundle
+   from this project was validated against a real org for the first time, and the
+   Salesforce compiler rejected it with 24 errors in the derived `reasoning:`
+   block while `validate_locally` reported zero findings on that same file. That
+   emitter bug is fixed and the same bundle now compiles, but the lesson holds —
+   local validation was measurably blind to a whole error class. Always tell the
+   user to run `sf agent validate authoring-bundle` before trusting a bundle. It
+   is the only authority, it needs no deploy, and here it disagreed. Note also
+   that compiling proves syntax only: no agent has been published and nothing has
+   checked whether a compiled agent behaves as its spec describes.
 
 When a spec scores low, the fix is to capture better evidence — a recording that
 exercises a failure path, or a live-mode run with real telemetry. Never suggest
@@ -259,9 +266,26 @@ def health() -> dict[str, Any]:
         # merges two limitations into one and drops a disclosure.
         limitations=[
             (
-                "No output from this server has ever been validated against a real "
-                "Salesforce org. `sf agent validate authoring-bundle` has never been "
-                "run, so an emitted .agent bundle may be syntactically invalid."
+                "An emitted .agent bundle may be syntactically invalid. "
+                "`sf agent validate authoring-bundle` has been run against this "
+                "project's output exactly once (2026-07-26, bundle "
+                "SFVB_TEST_Case_Triage, exit 0), for one intent shape on one org "
+                "and CLI version. It passed only after an emitter fix: the "
+                "compiler rejected the pre-fix bundle with 24 CompilationErrors. "
+                "Any other spec shape is unvalidated — run the CLI, it needs no "
+                "deploy."
+            ),
+            (
+                "`locallyValid: true` is not org validation. validate_locally() "
+                "reported zero findings on the exact file the Salesforce compiler "
+                "rejected with 24 errors, so it is blind to that error class."
+            ),
+            (
+                "Compiling is syntax, not semantics. No agent built from this "
+                "project's output has been published, and nothing has verified that "
+                "a compiled agent behaves as its spec describes. `[NEEDS EVIDENCE: "
+                "...]` markers compile successfully, so the compiler is not a safety "
+                "net for evidence quality either."
             ),
             (
                 "Telemetry is always mocked here, so every derived spec is stamped "
@@ -496,8 +520,11 @@ def emit_agent_bundle(
     cannot see.
 
     IMPORTANT: local validation is this project's own opinion, not Salesforce's.
-    `sf agent validate authoring-bundle` has never been run against any output of
-    this project. Validate with the Salesforce CLI before trusting the result.
+    Measured on 2026-07-26: the Salesforce compiler rejected an emitted bundle with
+    24 errors in the derived `reasoning:` block while `validate_locally` reported
+    zero findings on that same file. That bug is fixed, but the independence is the
+    point — a clean local pass is not evidence. Validate with the Salesforce CLI
+    before trusting the result; it needs no deploy.
 
     Args:
         capture_path: Path to a dom_capture.jsonl trace.
@@ -579,8 +606,11 @@ def emit_agent_bundle(
         provenance=dict(result.provenance),
         nextStep=(
             "Validate with the Salesforce CLI before trusting this: "
-            "`sf agent validate authoring-bundle`. That has never been run against "
-            "this project's output, so the bundle may be invalid."
+            "`sf agent validate authoring-bundle`. It resolves the bundle from the "
+            "local SFDX project and compiles the file content server-side, so no "
+            "deploy is needed and nothing in the org is mutated. The one time it "
+            "was run against this project (2026-07-26) it caught a real emitter "
+            "bug that local validation missed entirely — so run it, do not assume."
         ),
     )
 
