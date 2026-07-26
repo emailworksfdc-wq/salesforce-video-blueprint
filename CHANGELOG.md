@@ -80,7 +80,78 @@ marker sets at runtime so a weakening edit fails a test before it can weaken a
 run. `tests/test_gaming_resistance.py` and the new
 `tests/test_score_calibration.py` (35 tests) fail if any of these regress.
 
+### Added — `telemetry_source: live-org` is earnable for the first time
+
+Until now the score gate required `telemetry_source` to be `live-org` and the
+pipeline could only ever produce `mock`, so no spec this project derived could
+pass its own gate. That is no longer structurally true.
+
+- **`live_telemetry.LiveOrgTelemetryCollector`** reads real Salesforce field
+  history over `sf data query` and satisfies the same `TelemetryCollector`
+  interface as the mock, plus a run-scoped `observe(run_id)`.
+- **The stamp is derived from observed rows, never from a caller's assertion.** A
+  live collector pointed at an org that returned nothing is stamped
+  `"unavailable"`, not `"live-org"`, because evidence-wise it is indistinguishable
+  from having no org at all. `unavailable` is absent from
+  `markers.REAL_TELEMETRY_SOURCES`, so it blocks at the gate. Verified
+  end-to-end: an empty live collector yields `unavailable` and `passed=False`.
+- **Correlation on real telemetry is `TEMPORAL`, never `HIGH`.** The mock earns
+  `HIGH` only by re-reading the `step_id` the caller handed it — a tautology, the
+  join re-confirms an assertion. Real history rows carry no `step_id`, so events
+  are stamped with the module constant `UNATTRIBUTED_STEP_ID`, deliberately not a
+  parameter, so no caller can manufacture a causal claim. This costs nothing:
+  `TEMPORAL` still maps to the strong `data-delta` evidence source.
+
+Two defects that only a real run could expose:
+
+- **Temporal correlation had never once matched a real observation.**
+  `dom_extractor` writes `timestamp_ms` relative to the first event; `correlation`
+  reads it as absolute epoch ms. Under the relative reading every capture's first
+  action sits at 1970-01-01, so no real org timestamp can fall inside any
+  `[T, T+5s]` window and real telemetry was silently dropped. It stayed hidden
+  because the mock always matched on the caller-asserted `step_id` instead,
+  reporting 1,785,100,742 seconds of "clock skew". Corrected at the pipeline's own
+  join site using the absolute instant already carried by
+  `EvidenceArtifact.captured_at`, so nothing is inferred.
+- **One real org change was multiplied into nine, then dismissed as ambiguous.**
+  A per-step collector interface suits something that fabricates an event on
+  demand; an org is not like that — what happened happened once. Driving the
+  collector per action turned a single `Case.Status` change into 9 identical
+  snapshots, and correlation demoted all of them to `AMBIGUOUS`, grading the field
+  `inference` instead of `data-delta`. Run-scoped collectors are now called
+  exactly once.
+
+Measured against AFT3 (a Developer Edition org, not production): a real Case was
+created, its Status changed through the Lightning UI, and the resulting history row
+correlated back to the click that caused it. Combined effect of the two fixes on
+the real spec: 56/100 → 65/100, `objects_touched` `[]` → `['Case']`.
+
+**The real spec still does not pass the gate: 65/100, band `low`.** One small edit
+is thin evidence and the scorer says so — `evidence_grounding` 6/30,
+`testability` 0/10. The route to 75 is a richer capture, not a scoring change.
+`PASS_THRESHOLD` is still 75 and `markers.py` is untouched.
+
+Also measured and worth knowing before relying on it: `EventLogFile`, `ApexLog`,
+`AsyncApexJob` and `FlowInterview` are all queryable but return **zero rows** on
+Developer Edition, so a `describe`-based capability probe reports "supported" for
+surfaces that can never yield evidence. Field history and `SetupAuditTrail` are the
+only two that returned rows. Only `Case` history was verified; the other objects
+are mapped by naming convention and marked as such in the code.
+
 ### Known gap
+
+`telemetry._verify_org_is_sandbox` cannot succeed as written: `sf org display
+--json` no longer returns an `isSandbox` key (CLI 2.143.6), so the check fails
+closed on every org including permitted dev ones. Anything treating it as a
+production guard is relying on nothing. The alias deny-list in `org_denylist` is
+the control that actually holds.
+
+Salesforce truncates field-history timestamps to whole seconds, so a genuine
+cause/effect pair can have the org's timestamp up to 999 ms *before* the click
+that caused it — outside `correlation.py`'s forward-only `[T, T+5s]` window.
+Whether real telemetry correlates therefore depends on where in the second the
+user clicked. Asserted by tests rather than fixed: widening a *causal* window
+backwards is a semantic decision about what may be claimed as caused.
 
 `test_c11_on_lane_02_real_capture_when_available` is skipped: the real capture
 that exposed the `None.None` collapse cannot be committed as a fixture yet
