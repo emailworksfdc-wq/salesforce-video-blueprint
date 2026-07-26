@@ -17,6 +17,7 @@ correctness — defense in depth.
 from __future__ import annotations
 
 import json
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -217,7 +218,35 @@ class CaptureTrace:
 SUPPORTED_VERSION = 1
 
 
-def parse_capture_file(path: Path) -> CaptureTrace:
+def find_manifest_path(capture_path: Path) -> Path | None:
+    """Locate the manifest that belongs to a capture file.
+
+    Two naming conventions are in use in this repo, so both are tried:
+
+    1. `<capture-stem>.manifest.json` — the `.jsonl` suffix swapped out, e.g.
+       `case_triage.dom_capture.jsonl` -> `case_triage.dom_capture.manifest.json`
+       (the layout `examples/` ships and `docs/` documents).
+    2. `dom_capture.manifest.json` in the same directory — the literal name
+       `capture/inject.py` writes.
+
+    Returns the first existing candidate, or None.
+    """
+    candidates = [
+        capture_path.with_suffix(".manifest.json"),
+        capture_path.parent / "dom_capture.manifest.json",
+    ]
+    for candidate in candidates:
+        if candidate != capture_path and candidate.is_file():
+            return candidate
+    return None
+
+
+def parse_capture_file(
+    path: Path,
+    *,
+    manifest_path: Path | None = None,
+    discover_manifest: bool = True,
+) -> CaptureTrace:
     """Parse a dom_capture.jsonl file into a validated CaptureTrace.
 
     NEVER aborts on malformed lines — a truncated final line is EXPECTED when
@@ -228,6 +257,21 @@ def parse_capture_file(path: Path) -> CaptureTrace:
     - If v != SUPPORTED_VERSION and v > SUPPORTED_VERSION: loud warning + raise
       (forward-incompatible)
     - If v < SUPPORTED_VERSION: warning + best-effort parse (backward-compatible)
+
+    Manifest handling (DEFECT L4-5): the sibling manifest is loaded and attached.
+    It used to return `manifest=None  # loaded separately via load_manifest`, and
+    no production caller ever loaded it — cli.py, pipeline.py and mcp_server.py
+    all call parse_capture_file then validate_trace — so `validate_trace`'s
+    manifest cross-check was structurally dead. That check is the ONLY thing that
+    can detect events the recorder wrote but the parser never received: there is
+    no bad line to land in skipped_lines, the events are simply absent from the
+    file, so only the recorder's own count reveals them.
+
+    Args:
+        path: The capture `.jsonl` file.
+        manifest_path: Explicit manifest location. Overrides discovery.
+        discover_manifest: Set False to skip discovery entirely, for callers
+            that manage the manifest themselves.
     """
     events = []
     warnings = []
@@ -298,11 +342,43 @@ def parse_capture_file(path: Path) -> CaptureTrace:
                 skipped_lines.append((line_num, f"Validation error: {e}"))
                 continue
 
+    # DEFECT L4-5: actually wire the manifest in. `load_manifest` swallows every
+    # exception and returns None, so distinguish "absent" from "present but
+    # unloadable" here — silently treating a corrupt manifest as a missing one
+    # would hide the loss of the only recorder-side cross-check there is.
+    resolved_manifest_path = manifest_path
+    if resolved_manifest_path is None and discover_manifest:
+        resolved_manifest_path = find_manifest_path(path)
+
+    manifest = None
+    if resolved_manifest_path is None:
+        if discover_manifest:
+            warnings.append(
+                "No manifest found beside the capture. The trace is usable but "
+                "DEGRADED: without the recorder's own event_count there is no way "
+                "to detect events the recorder wrote that this parser never "
+                "received (a truncated capture leaves no bad line behind)."
+            )
+    elif not resolved_manifest_path.is_file():
+        warnings.append(
+            f"Manifest path '{resolved_manifest_path.name}' does not exist. "
+            f"Proceeding without the recorder-side event-count cross-check."
+        )
+    else:
+        manifest = load_manifest(resolved_manifest_path)
+        if manifest is None:
+            warnings.append(
+                f"Manifest '{resolved_manifest_path.name}' exists but could not be "
+                f"parsed or validated. Proceeding WITHOUT the recorder-side "
+                f"event-count cross-check, so a truncated capture cannot be "
+                f"detected. Treat this trace's completeness as unverified."
+            )
+
     return CaptureTrace(
         events=events,
         warnings=warnings,
         skipped_lines=skipped_lines,
-        manifest=None,  # loaded separately via load_manifest
+        manifest=manifest,
     )
 
 
@@ -340,20 +416,63 @@ def order_events(events: list[RawDomEvent]) -> list[RawDomEvent]:
 
     SUBTLE: `seq` restarts per document/frame, so it is NOT globally sortable.
     The driver-stamped `ingest_seq` is AUTHORITATIVE — it is set by the trusted
-    driver and cannot be faked by the page. When present, sort by `ingest_seq`.
-    Otherwise fall back to `(t, seq)`, which is the best we can do for traces
-    recorded by an older driver that doesn't stamp ingest_seq.
+    driver and cannot be faked by the page.
 
-    If both ingest_seq and (t, seq) are identical, preserve input order.
+    A partially-stamped trace is MERGED, not partitioned. The previous
+    implementation keyed stamped events `(0, ingest_seq, 0)` and unstamped ones
+    `(1, t, seq)`. That leading 0/1 is a partition, not a tiebreak: every
+    stamped event sorted before every unstamped event regardless of when either
+    actually happened, so a trace where the driver missed a couple of events
+    came back as two concatenated blocks. Measured on a five-event trace whose
+    true order was A B C D E, it returned A C E B D.
+
+    `capture/recorder.js:44` states the contract that broke: "`t` (Date.now())
+    is the global ordering key. Python side uses `t` to merge/sort events from
+    multiple frames and across navigations." Merge, not partition.
+
+    How the merge preserves the driver's guarantee:
+
+    - Stamped events keep their relative order EXACTLY as ingest_seq dictates.
+      `t` is page-controlled and therefore untrusted; it never reorders two
+      stamped events. This is enforced by
+      `test_order_events_ingest_seq_still_absolutely_authoritative`.
+    - An unstamped event is POSITIONED among the stamped ones using the only
+      signal it has, its own `t`, by counting how many stamped events have a
+      `t` at or before it. A running max makes that count non-decreasing, so
+      clock skew between frames cannot drag an unstamped event backwards past a
+      stamped event it was already placed after.
+    - Exact ties preserve input order (`sorted` is stable).
+
+    Honest residual: an unstamped event carries only page-controlled `t`, so a
+    page with a skewed clock can misplace its own unstamped events. There is no
+    trusted signal that would do better — the driver never saw those events.
+    The partition misplaced them unconditionally, which is strictly worse.
     """
+    # Anchor list: for each stamped event, in ingest_seq order, the highest `t`
+    # seen so far. Monotonic by construction, so bisect can search it.
+    stamped = sorted(
+        (e for e in events if e.ingest_seq is not None),
+        key=lambda e: e.ingest_seq,
+    )
+    anchors: list[int] = []
+    running_max = None
+    for event in stamped:
+        running_max = event.t if running_max is None else max(running_max, event.t)
+        anchors.append(running_max)
 
-    def sort_key(event: RawDomEvent) -> tuple[int, int, int]:
+    # Rank of each stamped event within the stamped subsequence.
+    stamped_rank = {id(e): i for i, e in enumerate(stamped)}
+
+    def sort_key(event: RawDomEvent) -> tuple[int, int, int, int]:
         if event.ingest_seq is not None:
-            # Driver-stamped ingest_seq is authoritative
-            return (0, event.ingest_seq, 0)
-        else:
-            # Fallback: (t, seq) — seq is only locally monotonic per frame
-            return (1, event.t, event.seq)
+            # Slot = its own rank in the stamped subsequence.
+            return (stamped_rank[id(event)], 1, 0, 0)
+        # An unstamped event slots in after every stamped event whose t is at or
+        # before its own; bisect_right on the monotonic anchor list is that
+        # count. The 0 in field two places it BEFORE the stamped event holding
+        # that same slot, i.e. between stamped[slot - 1] and stamped[slot].
+        slot = bisect_right(anchors, event.t)
+        return (slot, 0, event.t, event.seq)
 
     return sorted(events, key=sort_key)
 

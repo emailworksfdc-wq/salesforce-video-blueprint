@@ -1863,3 +1863,221 @@ def test_order_events_is_stable_and_total() -> None:
 
 def test_order_events_empty_input() -> None:
     assert order_events([]) == []
+
+
+# ============================================================================
+# 15. DEFECT L4-5 — parse_capture_file never loaded the manifest
+# ============================================================================
+#
+# `parse_capture_file` returned `manifest=None  # loaded separately via
+# load_manifest`, and no production caller ever loaded it: cli.py:97,
+# pipeline.py:151 and mcp_server.py:314 all call parse_capture_file and then
+# validate_trace, so `validate_trace`'s manifest cross-check — the ONLY check
+# that can see events the recorder wrote but the parser never received — was
+# structurally dead.
+#
+# That check is what detects a truncated capture. The parser cannot notice
+# events that are absent from the file; only the recorder's own count can.
+#
+# Measured before the fix, with a manifest reporting event_count=10 and
+# sink_errors=4 sitting next to a capture holding 6 events:
+#
+#     trace.manifest : None
+#     events parsed  : 6
+#     findings       : []        <- 40% of the capture gone, nothing said so
+
+
+def _write_capture_with_manifest(
+    tmp_path: Path, *, events: int, claimed: int, sink_errors: int = 0
+) -> Path:
+    capture = tmp_path / "dom_capture.jsonl"
+    capture.write_text(_jsonl_body(events), encoding="utf-8")
+    (tmp_path / "dom_capture.manifest.json").write_text(
+        json.dumps({
+            "capture_id": "wiring-test",
+            "org_alias": "example-dev",
+            "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+            "is_sandbox": False,
+            "is_scratch": False,
+            "started_at": "2026-03-20T09:00:00Z",
+            "event_count": claimed,
+            "network_event_count": 0,
+            "sink_errors": sink_errors,
+        }),
+        encoding="utf-8",
+    )
+    return capture
+
+
+def test_parse_capture_file_loads_sibling_manifest(tmp_path: Path) -> None:
+    """DEFECT L4-5: the manifest beside the capture must be wired in."""
+    capture = _write_capture_with_manifest(tmp_path, events=6, claimed=6)
+
+    trace = parse_capture_file(capture)
+
+    assert trace.manifest is not None, "sibling manifest was not loaded"
+    assert trace.manifest.capture_id == "wiring-test"
+    assert trace.manifest.event_count == 6
+
+
+def test_manifest_cross_check_detects_recorder_parser_gap(tmp_path: Path) -> None:
+    """DEFECT L4-5, the whole point: events the recorder wrote but the parser
+    never saw must be surfaced.
+
+    Nothing else in the system can detect this. There is no bad line to land in
+    skipped_lines — the events are simply absent from the file.
+    """
+    capture = _write_capture_with_manifest(
+        tmp_path, events=6, claimed=10, sink_errors=4
+    )
+
+    trace = parse_capture_file(capture)
+    findings = validate_trace(trace)
+
+    assert trace.manifest is not None
+    joined = " | ".join(findings)
+    assert "10" in joined and "6" in joined, f"count mismatch not surfaced: {findings}"
+    assert any("sink error" in f for f in findings), f"sink errors not surfaced: {findings}"
+
+
+def test_manifest_is_discovered_by_both_naming_conventions(tmp_path: Path) -> None:
+    """Two names are in use in this repo, so both must resolve.
+
+    - `examples/case_triage.dom_capture.manifest.json` — the `.jsonl` suffix
+      swapped for `.manifest.json` (documented example layout)
+    - `dom_capture.manifest.json` — the literal name `capture/inject.py` writes
+    """
+    # Convention A: <capture-stem>.manifest.json
+    capture_a = tmp_path / "case_triage.dom_capture.jsonl"
+    capture_a.write_text(_jsonl_body(2), encoding="utf-8")
+    (tmp_path / "case_triage.dom_capture.manifest.json").write_text(
+        json.dumps({
+            "capture_id": "convention-a",
+            "org_alias": "example-dev",
+            "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+            "is_sandbox": False,
+            "is_scratch": False,
+            "started_at": "2026-03-20T09:00:00Z",
+            "event_count": 2,
+            "network_event_count": 0,
+            "sink_errors": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    trace_a = parse_capture_file(capture_a)
+    assert trace_a.manifest is not None, "stem-based manifest name not found"
+    assert trace_a.manifest.capture_id == "convention-a"
+
+    # Convention B: the literal dom_capture.manifest.json in the same directory
+    other = tmp_path / "sub"
+    other.mkdir()
+    capture_b = other / "recording.jsonl"
+    capture_b.write_text(_jsonl_body(2), encoding="utf-8")
+    (other / "dom_capture.manifest.json").write_text(
+        json.dumps({
+            "capture_id": "convention-b",
+            "org_alias": "example-dev",
+            "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+            "is_sandbox": False,
+            "is_scratch": False,
+            "started_at": "2026-03-20T09:00:00Z",
+            "event_count": 2,
+            "network_event_count": 0,
+            "sink_errors": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    trace_b = parse_capture_file(capture_b)
+    assert trace_b.manifest is not None, "literal manifest name not found"
+    assert trace_b.manifest.capture_id == "convention-b"
+
+
+def test_missing_manifest_is_still_degraded_but_usable(tmp_path: Path) -> None:
+    """A capture with no manifest must still parse — wiring the manifest in must
+    not turn its absence into a hard failure."""
+    capture = tmp_path / "dom_capture.jsonl"
+    capture.write_text(_jsonl_body(3), encoding="utf-8")
+
+    trace = parse_capture_file(capture)
+
+    assert trace.manifest is None
+    assert len(trace.events) == 3
+    assert any("no manifest" in w.lower() for w in trace.warnings), (
+        f"the absence of a manifest should be visible: {trace.warnings}"
+    )
+
+
+def test_explicit_manifest_argument_overrides_discovery(tmp_path: Path) -> None:
+    """A caller with the manifest somewhere else must be able to pass it."""
+    capture = _write_capture_with_manifest(tmp_path, events=6, claimed=6)
+    elsewhere = tmp_path / "moved.manifest.json"
+    elsewhere.write_text(
+        json.dumps({
+            "capture_id": "explicit",
+            "org_alias": "example-dev",
+            "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+            "is_sandbox": False,
+            "is_scratch": False,
+            "started_at": "2026-03-20T09:00:00Z",
+            "event_count": 99,
+            "network_event_count": 0,
+            "sink_errors": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(capture, manifest_path=elsewhere)
+
+    assert trace.manifest is not None
+    assert trace.manifest.capture_id == "explicit"
+
+
+def test_manifest_discovery_can_be_disabled(tmp_path: Path) -> None:
+    """Opt out, for callers that manage the manifest themselves."""
+    capture = _write_capture_with_manifest(tmp_path, events=6, claimed=6)
+
+    trace = parse_capture_file(capture, discover_manifest=False)
+
+    assert trace.manifest is None
+
+
+def test_malformed_manifest_warns_rather_than_vanishing(tmp_path: Path) -> None:
+    """load_manifest swallows every exception and returns None. When a manifest
+    file EXISTS but will not load, that silence hides the loss of the only
+    recorder-side cross-check, so it must produce a warning."""
+    capture = tmp_path / "dom_capture.jsonl"
+    capture.write_text(_jsonl_body(3), encoding="utf-8")
+    (tmp_path / "dom_capture.manifest.json").write_text(
+        "{ this is not valid json", encoding="utf-8"
+    )
+
+    trace = parse_capture_file(capture)
+
+    assert trace.manifest is None
+    assert any("manifest" in w.lower() for w in trace.warnings), (
+        f"a present-but-unloadable manifest must warn: {trace.warnings}"
+    )
+
+
+def test_example_capture_manifest_is_wired(tmp_path: Path) -> None:
+    """The shipped example must exercise the path end to end.
+
+    examples/case_triage.dom_capture.jsonl has 8 events and its manifest claims
+    event_count=8, so a correctly wired parser produces a manifest and NO count
+    mismatch. Before the fix `trace.manifest` was None here too.
+    """
+    example = (
+        Path(__file__).resolve().parent.parent
+        / "examples"
+        / "case_triage.dom_capture.jsonl"
+    )
+    if not example.is_file():  # pragma: no cover - example is committed
+        pytest.skip("example capture not present")
+
+    trace = parse_capture_file(example)
+
+    assert trace.manifest is not None, "example capture's manifest was not wired in"
+    assert trace.manifest.event_count == len(trace.events) == 8
+    assert not [f for f in validate_trace(trace) if "Manifest reports" in f]
