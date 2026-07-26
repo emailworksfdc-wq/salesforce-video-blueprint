@@ -49,10 +49,32 @@ class RawEventType(str, Enum):
 
 
 class RawRoleName(BaseModel):
-    """Accessibility role + name pair for get_by_role."""
+    """Accessibility role + name pair for get_by_role.
 
-    role: str
-    name: str
+    Both fields are nullable, because the recorder genuinely emits nulls:
+
+    - `capture/recorder.js:161` — `return { role, name: null }` is the terminal
+      branch of `getRoleAndName`. An element with no aria-label, no resolvable
+      aria-labelledby, no text, no title and no alt has no accessible name.
+    - `capture/recorder.js:136` — `role` is `explicitRole || implicitRole`, and
+      the implicit-role map covers only ~17 tags. A `div` or `span`, which is
+      most of Lightning's clickable markup, has no role.
+
+    Requiring both fields made the parser reject its own recorder's documented
+    output: the whole event was discarded because ONE of eight selector
+    strategies was empty. `strict` type checking is retained, so a role that
+    is a number or a list is still malformed input and still lands in
+    `skipped_lines` — this loosens nullability, not typing.
+
+    The invariant that the required fields were really protecting — never
+    emitting a `role=None[name="..."]` selector — is enforced where it belongs,
+    in `selectors._build_role_selector`, which returns None when role is falsy.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    role: str | None = None
+    name: str | None = None
 
 
 class RawSelectors(BaseModel):
