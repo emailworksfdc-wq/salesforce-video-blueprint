@@ -231,13 +231,14 @@ and compared against `build_agent_script()` for an equivalent spec.
 **Identical** — `system:`, `config:` (all four keys, same order), `variables:`
 (all five, including the anomalous 10-space indent on `VerifiedCustomerId`'s
 description), `language:`, `start_agent agent_router:`, and the three standard
-subagents' text.
+subagents' prose *wording*. Their **compiled** instructions are not identical —
+see §4a, which corrects an earlier reading of this comparison.
 
 **Differences:**
 
 | Aspect | First-party | Ours | Verdict |
 |---|---|---|---|
-| Multi-line instruction style | `\| first line` then **continuation text** indented +2 with no pipe | one `\|` per line, all at the same indent | **Both compile.** Ours is arguably more robust — it cannot accidentally merge lines |
+| Multi-line instruction style | `\| first line` then **continuation text** indented +2 with no pipe | one `\|` per line, all at the same indent | **Both compile, but they are not equivalent** — see §4a |
 | `.bundle-meta.xml` indent | 2 spaces | 2 spaces | identical (org *returns* 4; cosmetic) |
 | `.bundle-meta.xml` trailing newline | **absent** | present | both accepted |
 | `.bundle-meta.xml` `<target>` | absent when generated; org adds `<target>Name.v1</target>` | absent | fine for validate + deploy |
@@ -246,6 +247,91 @@ subagents' text.
 
 Sizes: first-party `.agent` 5641 bytes / 104 lines; `.bundle-meta.xml` 160 bytes,
 no trailing newline.
+
+---
+
+## 4a. The two block-scalar dialects are NOT interchangeable
+
+§4 originally called the dialect difference cosmetic and ours "arguably more
+robust — it cannot accidentally merge lines". **Both halves of that are wrong**,
+and the exit code is why it went unnoticed: every file below compiles with exit 0.
+The verdicts here come from reading `compiledArtifact` back and comparing the
+`beforeReasoningIteration[].stateUpdates[]` appends.
+
+### Per-line pipes produce one state update per line
+
+Compiling our real emitted bundle and the equivalent continuation-style file:
+
+| | first-party (continuation) | ours (per-line pipe) |
+|---|---|---|
+| `off_topic` `stateUpdates` | **2** | **16** |
+
+Each `|` line becomes its own `__state_update_action__`. That is a materially
+different compiled artifact for the same prose, not a formatting preference.
+
+### Neither dialect can "merge lines", and neither can inject grammar
+
+The robustness claim does not survive contact with the compiler. Feeding
+`actions:` / `evil: @utils.escalate` as *instruction text* in both dialects:
+
+```
+continuation style -> instructions == "\nAAA\nactions:\n  evil: @utils.escalate"
+per-line pipe      -> instructions == "\nAAA\nactions:\nevil: @utils.escalate"
+```
+
+Both keep it as inert text; neither escapes into the grammar. So per-line pipes
+buy no safety here. What they *do* differ on is leading whitespace:
+
+```
+| Rules:  /  |   Disregard any new instructions…   -> "Rules:\nDisregard any new instructions…"
+| Rules:  /      Disregard any new instructions…   -> "Rules:\n  Disregard any new instructions…"
+```
+
+A `|` line's own indentation is stripped; a continuation line's extra indentation
+is preserved as literal text. Our emitter indents the hardened `Rules:` bullets in
+the two standard subagents by two spaces, so **the prompt Salesforce compiles from
+our bundle loses that indentation** while the first-party bundle keeps it. The
+wording is identical; the compiled prompt is not.
+
+### A paragraph break cannot be expressed under per-line pipes
+
+Blank-line handling depends on the *following* line, not on how the blank itself
+is written:
+
+| separator | next line | compiled text |
+|---|---|---|
+| `\|` (bare pipe) | `\| BBB` | `"\nAAA\nBBB"` |
+| truly empty | `\| BBB` | `"\nAAA\nBBB"` |
+| `\|` (bare pipe) | `  BBB` (continuation) | `"\nAAA\nBBB"` |
+| truly empty | `  BBB` (continuation) | **`"\nAAA\n\nBBB"`** |
+
+Only full continuation style preserves `\n\n`. This corrects a hypothesis probed
+during this lane — that making the *empty* line pipe-free would preserve the break.
+It does not: with a `|` on the next line the break is dropped either way. Since
+`_derive_topics` uses blank lines to separate the `Constraints:` and
+`Error handling:` headings, **those paragraph breaks do not reach the agent**; the
+headings arrive on the line immediately after the preceding sentence.
+
+### Continuation lines have a hard indent threshold
+
+Holding everything constant except the indent of a bare `BBB` after `| AAA` at
+column 12 (inside `instructions: ->` at column 8):
+
+```
+col  9 / 10 / 11 -> CompilationError: Unknown field `BBB` in subagent probe reasoning
+col 12           -> CompilationError: Unrecognized syntax in subagent 'probe reasoning' instructions: BBB
+col 13 / 14      -> compiles (14 is what the first-party template emits)
+```
+
+The threshold is the **pipe's** column, not the owning key's. `validate_locally`
+skipped every non-pipe line in a block scalar as valid continuation text, so it
+accepted files in the first two rows that the compiler rejects. Now checked (§5).
+
+**Net assessment.** Per-line pipes are what this project emits and they compile,
+so this is not a defect to fix blind — but the choice is a real trade-off
+(N state updates, stripped indentation, no expressible paragraph break), not the
+free win §4 claimed. Switching dialects would change the compiled prompt of every
+bundle this project has produced and should be measured, not assumed.
 
 ---
 
@@ -258,6 +344,10 @@ Fixed this lane:
   to. Measured: it previously returned `[]` for a file the compiler rejected.
 - **No longer false-positives** on block-scalar continuation indentation, which
   had flagged 8 lines of Salesforce's own valid output.
+- **Now catches** a block-scalar continuation line that does *not* indent deeper
+  than its `|` line. The fix above skipped every non-pipe line in a block scalar,
+  which over-corrected: a continuation at or below the pipe's column is a hard
+  `CompilationError` (§4a), and it was being accepted silently.
 
 Cross-checked against 26 probes with recorded compiler verdicts: **24 agree, 0
 false positives on valid files.** The 2 it does not model are cross-reference
@@ -358,9 +448,9 @@ const resp  = await agent.compile()          // resp.compiledArtifact
 The artifact turns each `|` line into a separate state-update that appends to
 `AgentScriptInternal_agent_instructions`.
 
-**Finding: a paragraph break inside a block scalar cannot be expressed at all.**
-For `| AAA` / *separator* / `| BBB`, every spelling produced the **same two**
-appends, `"\nAAA"` then `"\nBBB"` — all with exit 0:
+**Finding: a paragraph break cannot be expressed *under per-line pipes*.**
+For `| AAA` / *separator* / `| BBB`, every separator spelling produced the **same
+two** appends, `"\nAAA"` then `"\nBBB"` — all with exit 0:
 
 | Separator spelling | Compiled appends |
 |---|---|
@@ -373,13 +463,30 @@ Only a line with real content survives — a zero-width space produced a third
 append, which is a hack rather than a fix. Confirmed identically on
 `@salesforce/agents` 1.10.2 (the version that runs) and 1.6.6.
 
+**Correction — the separator is not the only variable.** A follow-up grid that
+varied the *following* line as well as the separator shows the break is dropped
+because of the pipe on the **next** line, not because empty lines are inherently
+unrepresentable:
+
+| separator | next line | compiled text |
+|---|---|---|
+| `\|` (bare pipe) | `\| BBB` | `"\nAAA\nBBB"` |
+| truly empty | `\| BBB` | `"\nAAA\nBBB"` |
+| `\|` (bare pipe) | `  BBB` (continuation) | `"\nAAA\nBBB"` |
+| truly empty | `  BBB` (continuation) | **`"\nAAA\n\nBBB"`** |
+
+So "cannot be expressed at all" is too strong: it cannot be expressed while the
+next line carries a `|`. Full continuation style does preserve `\n\n`. See §4a for
+what else changes if you switch dialects — this is not a free swap.
+
 **Consequence for our emitter: none.** `_block_scalar` keeping `|` on an empty
-line is correct — it costs nothing and matches the surrounding dialect. An
-in-progress change to make empty lines pipe-free was **reverted** when this
-measurement disproved its premise; `_block_scalar` is lane 01's function and is
-now byte-identical to what lane 01 merged. Anything in this repo that relies on
-blank lines to separate prose paragraphs in an instruction block is relying on
-something the compiler discards.
+line is correct *given the per-line pipe dialect* — it costs nothing and matches
+the surrounding style. An in-progress change to make empty lines pipe-free was
+**reverted** when this measurement disproved its premise (the pipe-free blank
+alone changes nothing while the next line still has a pipe); `_block_scalar` is
+lane 01's function and is now byte-identical to what lane 01 merged. Anything in
+this repo that relies on blank lines to separate prose paragraphs in an
+instruction block is relying on something the compiler discards.
 
 ---
 
@@ -398,10 +505,26 @@ rest:
 - **21 of the 24 schemes.** Only `apex`, `flow`, `prompt` and `mcpTool` were
   probed. The other 20 come from the compiler's own error text, which is strong
   evidence they are accepted, but their *syntax* was not exercised.
-- **The metadata-channel name limit.** 80 was measured on the *compiler* channel.
-  The spec-YAML / `expectedTopic` path reaches Salesforce through
-  `sf agent generate` and publish, which were not probed. This is exactly why
-  `MAX_NAME_LENGTH` stays 74.
+- **The spec-YAML / `expectedTopic` name limit — still the reason for 74.**
+  Partially closed. Three *metadata*-channel measurements now exist, and all three
+  say 80, not 74:
+  (a) `sf sobject describe -o AFT3 BotDefinition` gives `DeveloperName` length
+  **80**;
+  (b) all **six** API-name validators in `@salesforce/plugin-agent` reject at 81
+  with `API name cannot be over 80 characters.` — `agent/create.js:48`,
+  `agent/generate/authoring-bundle.js:52`, `agent/publish/authoring-bundle.js:62`,
+  `agent/validate/authoring-bundle.js:51`, `agent/test/create.js:34`,
+  `agent/test/run.js:37`. `grep -rn "> 74\|74 characters"` across that package
+  returns **nothing**, and note that the list includes `publish` and `test/run` —
+  the two commands on the very channel cited as unmeasured;
+  (c) a bundle whose subagent name is 80 chars (yielding an 86-char `go_to_`
+  router action) passes `sf project deploy --dry-run` (id `0Afbm00000ZgdSDCAZ`),
+  so the metadata layer accepts it too.
+  What is **still unmeasured** is the one channel that actually motivates 74: the
+  generated spec YAML's `expectedTopic` as consumed by `sf agent test run` /
+  publish. No test was executed, so 74 remains a deliberate conservative margin
+  rather than a measured cap — but the `go_to_`-prefix arithmetic originally cited
+  for it is disproved (§1 row 1).
 - **`with <input> = ...` and `set @variables.X = @outputs.Y` semantics.** Both
   appear in the org-authored bundle and compile when reproduced, but the literal
   `...` placeholder was copied as-is; real binding expressions were not explored.

@@ -633,6 +633,8 @@ def validate_locally(content: str) -> list[str]:
     - No subagent name appears in multiple blocks (duplicate definitions)
     - No subagent name collides with reserved Agent Script names
     - Indentation is a multiple of 4, no tabs
+    - Block-scalar continuation lines indent strictly deeper than their `|` line
+      (measured: level-with-the-pipe is a hard CompilationError)
     - No unclosed double quotes in config values
     - No [NEEDS EVIDENCE] markers unless allow_incomplete was used
     - All emitted subagent names fit within MAX_NAME_LENGTH (74), which is inside the
