@@ -24,9 +24,16 @@
 > - No PyPI/npm publication, so no release automation, no signed artifacts, no
 >   published version-support policy.
 > - No backward-compatibility gate — there are no external consumers yet.
-> - `sf agent validate authoring-bundle` has never been run against any output of
->   this project, so no output has org-level validation. **This is the single most
->   important gap before anyone relies on the emitted bundles.**
+> - Org-level validation is now *partial, not absent*. On 2026-07-26
+>   `sf agent validate authoring-bundle` returned exit 0 for one bundle
+>   (`SFVB_TEST_Case_Triage`, derived from the bundled example capture), which then
+>   deployed as `AiAuthoringBundle` metadata and round-tripped byte-identically. It
+>   passed only after a `reasoning:` emitter fix; the pre-fix bundle was rejected
+>   with 24 `CompilationError`s that this project's own local validator did not see.
+>   No other input has been validated. Compilation is **syntax, not semantics** — no
+>   agent has been published and no behaviour has been verified. **Treat emitted
+>   bundles as unvalidated until you run the CLI on the specific bundle you intend
+>   to use; it needs no deploy, so there is no excuse not to.**
 
 ## Documentation
 
