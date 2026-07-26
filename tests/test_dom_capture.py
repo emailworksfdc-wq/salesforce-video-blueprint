@@ -1550,3 +1550,125 @@ def test_role_name_optional_fields_produce_no_role_selector() -> None:
         f"a role_name without a role must not produce a role selector: {ranked}"
     )
     assert any(r.kind == "css" for r in ranked), "the css fallback must survive"
+
+
+# ============================================================================
+# 13. DEFECT L4-2 — a UTF-8 BOM ate the first event
+# ============================================================================
+#
+# The file was opened with encoding="utf-8", which does not strip a byte-order
+# mark. A recorder running on Windows (PowerShell redirection, .NET
+# StreamWriter, Notepad) writes EF BB BF at the head of the file, so line 1
+# arrives as "﻿{...}". json.loads rejects it with the remarkably specific
+# "Unexpected UTF-8 BOM (decode using utf-8-sig)" and the first event — the one
+# that establishes where the recording started — is discarded.
+#
+# Measured before the fix: 3 events written, 2 parsed, 1 skipped.
+# `encoding="utf-8-sig"` strips a BOM when present and is a no-op when absent.
+
+
+def _plain_event(seq: int) -> dict:
+    return {
+        "v": 1,
+        "seq": seq,
+        "t": 1774000000000 + seq,
+        "type": "click",
+        "url": "https://test.my.salesforce.com",
+        "frame_path": [],
+        "selectors": {"css_path": f"button.n{seq}"},
+        "element": {"tag": "button", "classes": [], "shadow_depth": 0, "text": f"E{seq}"},
+        "value": None,
+        "value_redacted": False,
+        "sf": {},
+        "_ingest_seq": seq,
+    }
+
+
+def _jsonl_body(count: int) -> str:
+    return "\n".join(json.dumps(_plain_event(i)) for i in range(1, count + 1)) + "\n"
+
+
+def test_utf8_bom_does_not_eat_the_first_event(tmp_path: Path) -> None:
+    """DEFECT L4-2: a BOM-prefixed capture must lose no events.
+
+    Before the fix the first line failed with "JSON decode error: Unexpected
+    UTF-8 BOM (decode using utf-8-sig)" and 3 events became 2.
+    """
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_bytes(b"\xef\xbb\xbf" + _jsonl_body(3).encode("utf-8"))
+
+    # Assert the fixture really is BOM-prefixed, so this test cannot pass
+    # vacuously by writing a plain file.
+    assert jsonl_path.read_bytes()[:3] == b"\xef\xbb\xbf"
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.skipped_lines == [], f"BOM ate an event: {trace.skipped_lines}"
+    assert len(trace.events) == 3
+    # The FIRST event specifically — that is the one the BOM destroys.
+    assert trace.events[0].seq == 1
+    assert trace.events[0].element.text == "E1"
+
+
+def test_capture_without_bom_still_parses(tmp_path: Path) -> None:
+    """utf-8-sig must be a no-op on a normal file (the overwhelming case)."""
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(_jsonl_body(3), encoding="utf-8")
+
+    assert jsonl_path.read_bytes()[:1] == b"{"
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.skipped_lines == []
+    assert [e.seq for e in trace.events] == [1, 2, 3]
+
+
+def test_bom_does_not_corrupt_multibyte_content(tmp_path: Path) -> None:
+    """utf-8-sig must strip only the BOM, not mangle real non-ASCII text.
+
+    A BOM-stripping implementation that sliced a fixed number of characters, or
+    decoded as latin-1, would corrupt this.
+    """
+    event = _plain_event(1)
+    event["value"] = "Café ☕ 日本語 — em-dash"
+    event["element"]["text"] = "Zürich"
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_bytes(
+        b"\xef\xbb\xbf" + (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 1
+    assert trace.events[0].value == "Café ☕ 日本語 — em-dash"
+    assert trace.events[0].element.text == "Zürich"
+
+
+def test_bom_prefixed_manifest_loads(tmp_path: Path) -> None:
+    """DEFECT L4-2, same bug in load_manifest.
+
+    A Windows recorder that BOMs the capture BOMs the manifest beside it. A
+    manifest that silently fails to load takes the event-count cross-check down
+    with it, which is exactly the check that detects a truncated capture.
+    """
+    manifest_path = tmp_path / "dom_capture.manifest.json"
+    manifest_path.write_bytes(
+        b"\xef\xbb\xbf"
+        + json.dumps({
+            "capture_id": "bom-test",
+            "org_alias": "example-dev",
+            "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+            "is_sandbox": False,
+            "is_scratch": False,
+            "started_at": "2026-03-20T09:00:00Z",
+            "event_count": 3,
+            "network_event_count": 0,
+            "sink_errors": 0,
+        }).encode("utf-8")
+    )
+
+    manifest = load_manifest(manifest_path)
+
+    assert manifest is not None, "a BOM-prefixed manifest was silently discarded"
+    assert manifest.capture_id == "bom-test"
+    assert manifest.event_count == 3
