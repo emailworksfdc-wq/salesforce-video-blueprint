@@ -46,13 +46,18 @@ compiles: exit 0, `{"success": true}`, and it then **deployed** to the org as
 `@salesforce/agents 1.6.6`). The `.agent` **grammar** for a topic-router agent is
 confirmed, as is the 80-character subagent-name limit (measured: 80 passes, 81
 fails with `Too big: expected string to have <=80 characters`). Also measured:
-**`@apex.*` and `@flow.*` do not compile at all** — the invocation namespace is a
-closed set, and both are rejected with `'flow' is not a valid invocation target`.
-The emitter's long-standing refusal to fabricate them turns out to be load-bearing,
-not merely cautious. Not validated: any spec shape other than the single-topic
-router, how a real Flow *is* wired to an agent (not through the `.agent` file), and
-anything about whether the compiled agent *behaves* correctly — compilation is
-syntax, not semantics. No agent has been published.
+**`@apex.Foo` and `@flow.Bar` do not compile** — the invocation namespace is a
+closed set and both are rejected with `'flow' is not a valid invocation target`.
+That is a fact about the `@` namespace, not about reaching Apex or Flow: an agent
+declares them in a subagent-level `actions:` block whose `target:` is
+`"apex://Cls"` or `"flow://Name"`, then references the declared name as
+`@actions.<name>`. Confirmed against an org-authored bundle
+(`Local_Info_Agent.agent` lines 123 and 180). The emitter emits no `actions:`
+block at all, so it fabricates neither form. Not validated: any spec shape other
+than the single-topic router, whether an emitted `actions:` block would resolve a
+*real* Apex class or Flow in an org (only the grammar is measured), and anything
+about whether the compiled agent *behaves* correctly — compilation is syntax, not
+semantics. No agent has been published.
 
 The critical lesson stands regardless: **`validate_locally()` reported zero
 findings on the file Salesforce rejected.** Local validation is this repo's own
@@ -464,9 +469,11 @@ Ordered by what unblocks the most:
    first attempt (see [Status](#status-v010--working-pipeline-output-now-compiles-in-one-measured-case)).
    The grammar for a single-topic router agent is confirmed and the subagent-name
    cap is measured at 80, and `@apex.*`/`@flow.*` are measured as **hard compile
-   errors** rather than merely unverified. What remains speculative: multi-topic
-   specs, how a Flow/Apex action is *actually* attached to an agent (it is not via
-   the `.agent` file), the name limit on the *metadata* path (spec YAML
+   errors** rather than merely unverified — Apex and Flow are reached through a
+   subagent-level `actions:` block with an `apex://` / `flow://` `target:` instead.
+   What remains speculative: multi-topic specs, whether an emitted `actions:` block
+   would bind to a real Apex class or Flow in an org (the grammar is measured, the
+   binding is not), the name limit on the *metadata* path (spec YAML
    `topics[].name` and `expectedTopic`, which the compiler never sees), and whether
    a published agent behaves as the spec describes. ~~Validation should also become
    a step this repo can run itself, rather than a manual CLI invocation alongside
@@ -474,8 +481,8 @@ Ordered by what unblocks the most:
    calls it when given an `org_alias`. Also measured while wiring it: the action
    `target:` scheme is one of 24 the compiler enumerates, scheme casing is **not**
    enforced (`apexrest://` and `APEX://` both compile), and `@variables.*` /
-   `@outputs.*` are **not** valid invocation namespaces — only `actions`, `utils`,
-   `subagent` and `topic` are.
+   `@outputs.*` are rejected as invocation targets while still being valid in
+   reference positions (`if @variables.x:` compiles).
 2. **Fix the ingest losses** (the first four rows above) so a capture cannot be
    silently truncated while still being stamped as real evidence.
 3. **Close stage 5.** Wire `sf agent test create/run/results` so a spec can
