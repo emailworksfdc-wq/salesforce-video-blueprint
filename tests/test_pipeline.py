@@ -8,11 +8,19 @@ the properties every consumer (CLI, MCP server, library user) depends on.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from sf_video_blueprint.pipeline import CaptureRejected, PipelineResult, run_pipeline
+from sf_video_blueprint.telemetry import (
+    CorrelationKey,
+    ObjectSnapshot,
+    TelemetryEvent,
+    TelemetryLayer,
+)
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "case_triage.dom_capture.jsonl"
 ORG = "https://example-dev.develop.my.salesforce.com"
@@ -288,3 +296,159 @@ def test_summary_always_carries_the_loss_keys() -> None:
     for key in ("loss_ratio", "manifest_gap", "evidence_is_complete"):
         assert key in summary, f"summary() must always report {key}"
     json.dumps(summary)  # still wire-safe with the new keys
+
+# ============================================================================
+# Real-collector plumbing: run-scoped observation, and the correlation clock
+# ============================================================================
+
+
+class _StubOrgCollector:
+    """A run-scoped collector shaped like `LiveOrgTelemetryCollector`.
+
+    Returns ONE observation regardless of how often it is asked, which is what a
+    collector reading a real history table can honestly do — the rows carry no
+    step_id, so there is no per-step answer to give.
+    """
+
+    def __init__(self, instant: datetime, record_id: str = "500bm00002ZfnikAAB") -> None:
+        self.instant = instant
+        self.record_id = record_id
+        self.observe_calls = 0
+        self.per_step_calls = 0
+
+    def observe(self, run_id: str):
+        self.observe_calls += 1
+        key = CorrelationKey(
+            run_id=run_id, step_id="unattributed-org-observation", event_time=self.instant
+        )
+        return SimpleNamespace(
+            events=[
+                TelemetryEvent(
+                    correlation=key,
+                    layer=TelemetryLayer.DATA,
+                    event_name="CaseHistoryChange",
+                    status="observed",
+                    org_timestamp=self.instant,
+                )
+            ],
+            snapshots=[
+                ObjectSnapshot(
+                    correlation=key,
+                    object_api_name="Case",
+                    record_id=self.record_id,
+                    before={"Status": "Working"},
+                    after={"Status": "Escalated"},
+                    changed_fields=["Status"],
+                )
+            ],
+        )
+
+    # Present so the object satisfies TelemetryCollector; must stay unused.
+    def collect_for_step(self, run_id: str, step_id: str):
+        self.per_step_calls += 1
+        return []
+
+    def snapshot_changes(self, run_id: str, step_id: str):
+        self.per_step_calls += 1
+        return []
+
+
+def _example_wall_clock() -> datetime:
+    """The absolute instant of the example capture's last action."""
+    lines = [
+        json.loads(line)
+        for line in EXAMPLE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return datetime.fromtimestamp(max(e["t"] for e in lines) / 1000, tz=timezone.utc)
+
+
+def test_run_scoped_collector_is_observed_once_not_once_per_step() -> None:
+    """One real org observation must not be multiplied by the step count.
+
+    Driving a run-scoped collector per action duplicated the same row N times, and
+    correlation then demoted every copy to AMBIGUOUS ("multiple snapshots ... in
+    window") — reporting one real, unambiguous change as an ambiguous mess.
+    """
+    collector = _StubOrgCollector(_example_wall_clock())
+
+    result = run_pipeline(EXAMPLE, org_url=ORG, telemetry_collector=collector)
+
+    assert collector.observe_calls == 1
+    assert collector.per_step_calls == 0, "run-scoped collectors must not be polled per step"
+    assert result.actions_extracted > 1, "test is only meaningful with several actions"
+
+
+def test_observed_change_correlates_to_the_action_that_caused_it() -> None:
+    """The end-to-end property this lane exists to make possible.
+
+    Actions carry `timestamp_ms` relative to capture start, but correlation reads it
+    as absolute epoch ms, so every action looked like 1970 and no org timestamp
+    could fall in its window. Real telemetry was silently dropped; the mock hid it
+    by correlating on the caller-asserted step_id instead.
+    """
+    collector = _StubOrgCollector(_example_wall_clock())
+
+    result = run_pipeline(EXAMPLE, org_url=ORG, telemetry_collector=collector)
+
+    assert result.provenance["telemetry_source"] == "live-org"
+    assert "Case" in result.spec.objects_touched, "observed object must reach the spec"
+
+    status = [e for e in result.spec.entities if e.field_api_name == "Status"]
+    assert status, "the observed Case.Status change must appear as an entity"
+    assert any("data-delta" in ev.source for ev in status[0].evidence), (
+        "an observed org change must be graded data-delta, not inference"
+    )
+
+
+def test_empty_live_collector_is_unavailable_not_live_org() -> None:
+    """Passing a real collector is a request to observe, not a claim of observation."""
+
+    class _SawNothing:
+        def observe(self, run_id: str):
+            return SimpleNamespace(events=[], snapshots=[])
+
+    result = run_pipeline(EXAMPLE, org_url=ORG, telemetry_collector=_SawNothing())
+
+    assert result.provenance["telemetry_source"] == "unavailable"
+    assert result.evidence_is_real is False
+    assert result.score.passed is False
+
+
+def test_spec_actions_keep_their_relative_timestamps() -> None:
+    """The clock correction is scoped to correlation and must not leak.
+
+    `dom_extractor`'s contract (timestamps relative to capture start, first == 0)
+    stays intact for every other consumer; only correlation's copies are restated.
+    """
+    from sf_video_blueprint.dom_extractor import DomCaptureExtractor
+    from sf_video_blueprint.pipeline import _actions_on_wall_clock
+
+    bundle = DomCaptureExtractor().extract(EXAMPLE)
+    original = [a.timestamp_ms for a in bundle.actions]
+    assert original[0] == 0, "precondition: extractor emits relative timestamps"
+
+    restated = _actions_on_wall_clock(bundle.actions, bundle.evidence)
+
+    assert [a.timestamp_ms for a in bundle.actions] == original, "inputs were mutated"
+    assert restated[0].timestamp_ms > 1_600_000_000_000, "correlation copy must be absolute"
+    # Relative spacing must be preserved exactly, or correlation windows shift.
+    assert [a.timestamp_ms - restated[0].timestamp_ms for a in restated] == original
+
+
+def test_actions_without_evidence_are_passed_through_unchanged() -> None:
+    """No evidence artifact means no absolute instant to use — infer nothing."""
+    from sf_video_blueprint.models import ActionType, ExtractedAction
+    from sf_video_blueprint.pipeline import _actions_on_wall_clock
+
+    orphan = ExtractedAction(
+        step_id="step-001",
+        sequence=1,
+        timestamp_ms=0,
+        action_type=ActionType.CLICK,
+        target="button:Save",
+        confidence=0.9,
+        evidence_ids=["evid-missing"],
+    )
+
+    assert _actions_on_wall_clock([orphan], [])[0].timestamp_ms == 0
