@@ -138,6 +138,60 @@ surfaces that can never yield evidence. Field history and `SetupAuditTrail` are 
 only two that returned rows. Only `Case` history was verified; the other objects
 are mapped by naming convention and marked as such in the code.
 
+### Added — stage 5: a refinement loop that learns from a real agent
+
+`iterate.refine` re-scores the same spec offline and calls it converged after three
+identical scores, which says only that the offline scorer stopped changing its mind.
+`stage5` plus `iterate.refine_with_org_feedback` close that loop against a live
+Agentforce agent: emit a test spec, run it in the org, parse the real per-case
+verdicts, fold them back in as *added* observations, re-score with the existing gate
+unchanged.
+
+Run for real against `Coral_Cloud_Booking_Agent` in AFT3 with no injected runner. The
+agent routed every case to `Booked_Activity_Management` rather than the derived
+`Update_Case_Status` — real evidence that the derived spec does not match that agent,
+which is exactly what an offline loop can never learn.
+
+- **`sf agent test run-eval` accepts the legacy `AiEvaluationDefinition` dialect
+  only.** Measured, and root-caused in the CLI's own `yamlSpecTranslator.js`: it reads
+  only top-level legacy keys (`utterance`, `expectedTopic`, `expectedOutcome`). An NGT
+  file puts its utterance at `inputs[].utterance`, so the translator never sees it and
+  the server rejects the payload. `select_dialect_for_run_eval()` refuses the wrong
+  dialect locally instead of paying for a round trip to a 422.
+- **Feeding an NGT spec to the default `testing-center` runner silently emits a hollow
+  test definition** — five empty `<inputs></inputs>`, zero utterances, 5 expected
+  values against 14 for the legacy spec. The reverse direction fails loudly. A test
+  definition that looks like it worked and verifies nothing is worse than a rejection.
+
+Two defects in this feature were found by review before it landed, both mutation-tested:
+
+- **An injected test runner produced feedback stamped `run-eval` — i.e. real.** Anyone
+  with a fixture and a one-line lambda could have manufactured a `round.json` claiming
+  `trustworthy: true` with no org involved, byte-indistinguishable from a genuine
+  round. Provenance now follows *who produced the bytes*: an injected runner is stamped
+  `injected-runner`, which is not in `REAL_FEEDBACK_SOURCES` and fails closed.
+  Verified — `injected-runner`, `mock` and an arbitrary source are all blocked, and
+  `run-eval` with zero cases is blocked too, so an empty result cannot pass as
+  validation.
+- **The no-overwrite guard ran after the damage.** It fired inside `write_round`, i.e.
+  after the round's `testSpec.yaml` had been overwritten and after the org had been
+  billed for real LLM calls, leaving `round-N/` holding a spec that no longer matched
+  its `round.json`. A half-replaced audit trail is worse than a refused one;
+  `assert_round_unwritten()` now runs before any write and before the subprocess.
+
+Also fixed: `is_pass=bool(...)` read the string `"false"` as a **pass** — the single
+field that decides pass/fail was the only one coerced fail-open. It is now an `is True`
+identity check; verified that `False`, `"false"`, `"FALSE"`, `"FAILED"`, `"true"`, `1`
+and `None` all read as failures and only literal `True` passes. A bare `assert`
+guarding the confidence invariant was replaced (`python -O` strips asserts), and a
+`JSONDecodeError` no longer escapes while discarding the output that failed to parse.
+
+**Disclosed rather than "fixed": a failing round can make the score go up.** The rubric
+awards honesty points for declaring unknowns, and a failed case adds one — so the spec
+really did get more honest, but a reader diffing `score_before` against `score_after`
+would read the rise as the agent improving. A round with failures whose score rose now
+carries an explicit note. The rubric is untouched.
+
 ### Known gap
 
 `telemetry._verify_org_is_sandbox` cannot succeed as written: `sf org display
