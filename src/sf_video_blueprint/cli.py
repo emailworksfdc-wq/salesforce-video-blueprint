@@ -14,6 +14,7 @@ from .dom_extractor import DomCaptureExtractor
 from .extractor import HeuristicVideoExtractor
 from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
 from .models import ActionType, ExtractedAction
+from .redaction import scrub_collected_telemetry
 from .replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
@@ -191,6 +192,18 @@ def run(
 
     for action in extraction.actions:
         telemetry.collect_step(collector, run_metadata.run_id, action.step_id)
+
+    # Scrub org records BEFORE correlation. In live mode the snapshots and payloads
+    # are whole Salesforce records, and `_derive_entities` interpolates their field
+    # values into entity evidence — so an unscrubbed token in a Case field lands in
+    # agent-spec.json. Extraction's choke point cannot see these: they were fetched
+    # after it ran.
+    telemetry_categories = scrub_collected_telemetry(telemetry.events, telemetry.snapshots)
+    if telemetry_categories:
+        typer.echo(
+            f"REDACTION: scrubbed telemetry values from the org "
+            f"(categories: {', '.join(telemetry_categories)})"
+        )
 
     analyses = correlate_all(extraction.actions, replay_events, telemetry.events, telemetry.snapshots)
 
