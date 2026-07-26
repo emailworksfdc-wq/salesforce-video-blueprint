@@ -1,10 +1,32 @@
 # Open-Source MCP Release Checklist
 
-> **STATUS: ASPIRATIONAL — NOT IMPLEMENTED.**
-> This document describes intended design, not current behaviour. As of this
-> commit there is no code in `src/` that implements or enforces anything below.
-> Do not cite it as evidence of a control, capability, or release gate.
-> See the README status table for what actually works.
+> **STATUS: PARTLY SATISFIED — no public package release has happened.**
+>
+> The MCP server itself exists (`src/sf_video_blueprint/mcp_server.py`, installed
+> as `sf-blueprint-mcp`; see [`mcp-install.md`](mcp-install.md)). This checklist
+> was written for a **public npm/PyPI release**, which has not been done — the
+> package installs from the git URL only.
+>
+> The boxes below are unchecked because they are unchecked, not because nothing
+> exists. What is genuinely done:
+>
+> - Install, quickstart, per-harness config, limitations, and troubleshooting are
+>   documented in [`mcp-install.md`](mcp-install.md).
+> - Tool docs match behaviour: the tool descriptions a client sees *are* the
+>   docstrings, so they cannot drift.
+> - A realistic end-to-end example is tested on every CI run
+>   (`scripts/mcp_stdio_check.py` against `examples/case_triage.dom_capture.jsonl`).
+> - Secret scanning and push protection are enabled on the repository.
+> - Apache-2.0 licensed; `CONTRIBUTING.md` and `SECURITY.md` are in place.
+>
+> What is not:
+>
+> - No PyPI/npm publication, so no release automation, no signed artifacts, no
+>   published version-support policy.
+> - No backward-compatibility gate — there are no external consumers yet.
+> - `sf agent validate authoring-bundle` has never been run against any output of
+>   this project, so no output has org-level validation. **This is the single most
+>   important gap before anyone relies on the emitted bundles.**
 
 ## Documentation
 
