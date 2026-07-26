@@ -462,7 +462,18 @@ def test_order_events_falls_back_to_t_and_seq_when_no_ingest_seq(tmp_path: Path)
 
 
 def test_order_events_mixed_ingest_seq_and_fallback(tmp_path: Path) -> None:
-    """Some events have ingest_seq, some don't — ingest_seq events sort first."""
+    """Some events have ingest_seq, some don't — they INTERLEAVE by time.
+
+    ASSERTION CHANGED BY DEFECT L4-3. This test previously asserted
+    "ingest_seq events sort first", which encoded the partition bug as the
+    contract. Its own fixture disproves it: the unstamped event carries t=1000
+    and the stamped one t=2000, so the unstamped event happened FIRST, and the
+    old expectation put it last purely because the driver had not stamped it.
+
+    The fixture data is unchanged; only the expected order is corrected. See
+    section 14 for the full reasoning and for the invariant test proving that
+    page-controlled `t` still cannot reorder two stamped events.
+    """
     events = [
         RawDomEvent.model_validate({
             "v": 1,
@@ -496,9 +507,10 @@ def test_order_events_mixed_ingest_seq_and_fallback(tmp_path: Path) -> None:
 
     ordered = order_events(events)
 
-    # Events with ingest_seq (key = (0, ...)) sort before events without (key = (1, ...))
-    assert ordered[0].element.text == "HasIngest"
-    assert ordered[1].element.text == "NoIngest"
+    # t=1000 happened before t=2000, and that is the only ordering signal the
+    # unstamped event has. It sorts first.
+    assert ordered[0].element.text == "NoIngest"
+    assert ordered[1].element.text == "HasIngest"
 
 
 # ============================================================================
@@ -1672,3 +1684,182 @@ def test_bom_prefixed_manifest_loads(tmp_path: Path) -> None:
     assert manifest is not None, "a BOM-prefixed manifest was silently discarded"
     assert manifest.capture_id == "bom-test"
     assert manifest.event_count == 3
+
+
+# ============================================================================
+# 14. DEFECT L4-3 — order_events partitioned instead of merging
+# ============================================================================
+#
+# DECISION: the partition is REMOVED. Reasoning, since the brief asks for it
+# either way:
+#
+# The old sort key was (0, ingest_seq, 0) for stamped events and (1, t, seq)
+# for unstamped ones. That leading 0/1 is a partition, not a tiebreak: EVERY
+# stamped event sorted before EVERY unstamped event, no matter when either
+# actually happened. A trace where the driver stamped most events and missed a
+# few does not come back mis-tied at the margin, it comes back in two
+# concatenated blocks.
+#
+# Measured before the fix, true order A B C D E (by wall clock):
+#   order_events() -> ['A-stamped', 'C-stamped', 'E-stamped',
+#                      'B-unstamped', 'D-unstamped']
+#
+# `capture/recorder.js:44` states the contract the partition broke: "`t`
+# (Date.now()) is the global ordering key. Python side uses `t` to merge/sort
+# events from multiple frames and across navigations." Merge, not partition.
+#
+# What is kept: ingest_seq remains ABSOLUTELY authoritative for the relative
+# order of stamped events. `t` is page-controlled and therefore untrusted, so
+# it is used only to POSITION unstamped events among the stamped ones — it can
+# never reorder two stamped events. That is the ordering guarantee the driver
+# stamp buys, and it survives intact.
+#
+# Honest residual: an unstamped event carries only page-controlled `t`, so a
+# page with a skewed clock can misplace its own unstamped events. There is no
+# trusted signal to do better — the driver never saw them. The alternative
+# (the partition) misplaced them unconditionally.
+
+
+def _ordering_event(label: str, t: int, seq: int, ingest_seq: int | None = None) -> RawDomEvent:
+    payload = {
+        "v": 1,
+        "seq": seq,
+        "t": t,
+        "type": "click",
+        "url": "https://test.my.salesforce.com",
+        "frame_path": [],
+        "selectors": {},
+        "element": {"tag": "button", "classes": [], "shadow_depth": 0, "text": label},
+        "value": None,
+        "value_redacted": False,
+        "sf": {},
+    }
+    if ingest_seq is not None:
+        payload["_ingest_seq"] = ingest_seq
+    return RawDomEvent.model_validate(payload)
+
+
+def test_order_events_interleaves_partially_stamped_trace() -> None:
+    """DEFECT L4-3: a driver that stamped most events but missed two must not
+    produce two concatenated blocks.
+
+    Before the fix this returned A C E B D.
+    """
+    events = [
+        _ordering_event("A-stamped", t=1000, seq=1, ingest_seq=1),
+        _ordering_event("B-unstamped", t=1100, seq=1),
+        _ordering_event("C-stamped", t=1200, seq=2, ingest_seq=2),
+        _ordering_event("D-unstamped", t=1300, seq=2),
+        _ordering_event("E-stamped", t=1400, seq=3, ingest_seq=3),
+    ]
+
+    ordered = [e.element.text for e in order_events(events)]
+
+    assert ordered == [
+        "A-stamped",
+        "B-unstamped",
+        "C-stamped",
+        "D-unstamped",
+        "E-stamped",
+    ]
+
+
+def test_order_events_unstamped_event_before_all_stamped_sorts_first() -> None:
+    """An unstamped event that happened first must come first.
+
+    The partition forced it to the back of the trace regardless of its clock.
+    """
+    events = [
+        _ordering_event("stamped-later", t=5000, seq=1, ingest_seq=1),
+        _ordering_event("unstamped-first", t=1000, seq=1),
+    ]
+
+    ordered = [e.element.text for e in order_events(events)]
+
+    assert ordered == ["unstamped-first", "stamped-later"]
+
+
+def test_order_events_ingest_seq_still_absolutely_authoritative() -> None:
+    """THE INVARIANT THAT MUST NOT REGRESS.
+
+    A page that lies about `t` must not be able to reorder driver-stamped
+    events. Here the page claims the second-arriving event happened first, by a
+    wide margin. ingest_seq must win.
+    """
+    events = [
+        _ordering_event("arrived-first", t=9_999_999, seq=1, ingest_seq=1),
+        _ordering_event("arrived-second", t=1, seq=2, ingest_seq=2),
+    ]
+
+    ordered = [e.element.text for e in order_events(events)]
+
+    assert ordered == ["arrived-first", "arrived-second"], (
+        "page-controlled `t` must never reorder driver-stamped events"
+    )
+
+
+def test_order_events_non_monotonic_stamped_clock_does_not_misplace_unstamped() -> None:
+    """Stamped `t` values need not be monotonic (clock skew across frames /
+    navigations). Positioning must still be well defined and must not drop or
+    duplicate any event.
+    """
+    events = [
+        _ordering_event("s1", t=1000, seq=1, ingest_seq=1),
+        _ordering_event("s2", t=800, seq=1, ingest_seq=2),  # clock went backwards
+        _ordering_event("s3", t=1200, seq=2, ingest_seq=3),
+        _ordering_event("u-late", t=1150, seq=9),
+    ]
+
+    ordered = order_events(events)
+
+    # ingest_seq order among stamped events is untouched by the skew.
+    assert [e.element.text for e in ordered if e.ingest_seq is not None] == ["s1", "s2", "s3"]
+    # Nothing lost, nothing duplicated.
+    assert len(ordered) == 4
+    assert {e.element.text for e in ordered} == {"s1", "s2", "s3", "u-late"}
+    # The unstamped event lands after the skew-adjusted stamped prefix, not at
+    # the end of the trace by fiat.
+    assert ordered.index(next(e for e in ordered if e.element.text == "u-late")) == 2
+
+
+def test_order_events_all_stamped_is_pure_ingest_seq_order() -> None:
+    """The overwhelmingly common case — every event stamped — must be exactly
+    ingest_seq order, with `t` ignored entirely."""
+    events = [
+        _ordering_event("third", t=1, seq=1, ingest_seq=3),
+        _ordering_event("first", t=999, seq=2, ingest_seq=1),
+        _ordering_event("second", t=500, seq=3, ingest_seq=2),
+    ]
+
+    assert [e.element.text for e in order_events(events)] == ["first", "second", "third"]
+
+
+def test_order_events_all_unstamped_is_t_then_seq_order() -> None:
+    """With no driver stamps at all (older driver), fall back to (t, seq)."""
+    events = [
+        _ordering_event("b", t=1000, seq=2),
+        _ordering_event("a", t=1000, seq=1),
+        _ordering_event("c", t=2000, seq=1),
+    ]
+
+    assert [e.element.text for e in order_events(events)] == ["a", "b", "c"]
+
+
+def test_order_events_is_stable_and_total() -> None:
+    """order_events must be a permutation of its input: no drops, no dupes, and
+    ties preserve input order."""
+    events = [
+        _ordering_event("x", t=1000, seq=1),
+        _ordering_event("y", t=1000, seq=1),  # exact tie with x
+        _ordering_event("z", t=1000, seq=1, ingest_seq=1),
+    ]
+
+    ordered = order_events(events)
+
+    assert len(ordered) == 3
+    xy = [e.element.text for e in ordered if e.element.text in ("x", "y")]
+    assert xy == ["x", "y"], "exact ties must preserve input order"
+
+
+def test_order_events_empty_input() -> None:
+    assert order_events([]) == []
