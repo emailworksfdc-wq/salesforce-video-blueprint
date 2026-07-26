@@ -236,7 +236,14 @@ def parse_capture_file(path: Path) -> CaptureTrace:
     if not path.exists():
         raise FileNotFoundError(f"Capture file not found: {path}")
 
-    with path.open("r", encoding="utf-8") as f:
+    # encoding="utf-8-sig", not "utf-8": a recorder running on Windows
+    # (PowerShell redirection, .NET StreamWriter, Notepad) prefixes the file
+    # with a UTF-8 BOM. Plain "utf-8" hands that BOM to json.loads, which
+    # rejects line 1 with "Unexpected UTF-8 BOM (decode using utf-8-sig)" — so
+    # the first event, the one that establishes where the recording started,
+    # was silently discarded into skipped_lines. "utf-8-sig" strips a BOM when
+    # present and is a no-op when absent.
+    with path.open("r", encoding="utf-8-sig") as f:
         for line_num, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
@@ -309,7 +316,10 @@ def load_manifest(path: Path) -> CaptureManifest | None:
         return None
 
     try:
-        with path.open("r", encoding="utf-8") as f:
+        # utf-8-sig for the same reason as parse_capture_file: a recorder that
+        # BOMs the capture BOMs the manifest beside it, and a manifest that
+        # silently fails to load takes the event-count cross-check down with it.
+        with path.open("r", encoding="utf-8-sig") as f:
             raw = json.load(f)
         return CaptureManifest.model_validate(raw)
     except Exception:
