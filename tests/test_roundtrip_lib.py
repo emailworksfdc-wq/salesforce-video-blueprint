@@ -477,3 +477,212 @@ def test_score_subcommand_reports_without_weakening_the_gate(tmp_path: Path) -> 
     assert payload["threshold"] == 75
     assert payload["passed"] is False, "mock telemetry must not pass the gate"
     assert any("mock" in issue.lower() for issue in payload["blocking_issues"])
+
+
+# ---------------------------------------------------------------------------
+# The failure path: a rejected bundle must be reported as a failure
+# ---------------------------------------------------------------------------
+#
+# Everything above proves the script is honest when the org stage is SKIPPED.
+# That is only half the property. The stage that actually matters is the one that
+# RUNS AND FAILS: `sf agent validate authoring-bundle` exits 1 when Salesforce
+# rejects the .agent grammar, and the original script's summary logic
+# (`all(status in ("pass", "skipped"))`) would have been just as happy to call
+# that a pass as it was to call a skip one.
+#
+# Measured against AFT3 on 2026-07-26: a bundle whose `instructions: ->` key was
+# stripped to a bare `->` — lane 01's original emitter defect — is rejected with
+# exit 1, `code: CompileAgentScriptError`, 135 CompilationErrors. These tests
+# replay that shape through a stub so the reporting is verified with no org and no
+# credentials, which is what lets them run in CI.
+
+
+def _stub_sf(tmp_path: Path, *, validate_exit: int, validate_stdout: str) -> Path:
+    """A fake `sf` that answers the two subcommands the script actually calls.
+
+    Stubbing the CLI rather than mocking Python is deliberate: the behaviour under
+    test is in the shell script's exit-code handling, so the seam has to be the
+    process boundary the script really uses.
+    """
+    bin_dir = tmp_path / "stubbin"
+    bin_dir.mkdir()
+    sf = bin_dir / "sf"
+    sf.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        "  *--version*) echo '@salesforce/cli/2.143.6 stub' ;;\n"
+        "  *'agent --help'*|*agent*--help*) exit 0 ;;\n"
+        # instanceUrl must look like a dev org or the safety guard (exit 3) trips
+        # before validation is ever reached.
+        "  *'org display'*)\n"
+        '    echo \'{"status":0,"result":{"instanceUrl":"https://stub-dev.develop.my.salesforce.com"}}\' ;;\n'
+        "  *'agent validate'*)\n"
+        f"    cat <<'JSON'\n{validate_stdout}\nJSON\n"
+        f"    exit {validate_exit} ;;\n"
+        "  *) echo \"stub: unhandled: $*\" >&2; exit 127 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    sf.chmod(0o755)
+    return bin_dir
+
+
+# The verbatim envelope AFT3 returned for the rejected bundle, trimmed to the
+# fields the script parses.
+_REJECTION_JSON = json.dumps(
+    {
+        "status": 1,
+        "code": "CompileAgentScriptError",
+        "message": "Syntax error: unexpected `->`",
+        "data": {
+            "errors": [
+                {
+                    "errorType": "CompilationError",
+                    "description": "Syntax error: unexpected `->`",
+                    "lineStart": 38,
+                    "colStart": 8,
+                },
+                {
+                    "errorType": "CompilationError",
+                    "description": "Missing required field 'target'",
+                    "lineStart": 41,
+                    "colStart": 12,
+                },
+            ]
+        },
+    },
+    indent=2,
+)
+
+
+def _run_with_stub(tmp_path: Path, bin_dir: Path, out_dir: Path):
+    import os
+
+    env = {
+        **os.environ,
+        "PY_BIN": sys.executable,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+    }
+    return subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--capture",
+            str(EXAMPLE_CAPTURE),
+            "--org",
+            "STUB_DEV",
+            "--out",
+            str(out_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO_ROOT,
+        env=env,
+    )
+
+
+@pytest.mark.skipif(not EXAMPLE_CAPTURE.is_file(), reason="example capture missing")
+def test_a_rejected_bundle_is_reported_as_a_failure(tmp_path: Path) -> None:
+    """Exit 1 from the compiler must not be reportable as a completed round trip."""
+    out_dir = tmp_path / "rt"
+    result = _run_with_stub(
+        tmp_path, _stub_sf(tmp_path, validate_exit=1, validate_stdout=_REJECTION_JSON), out_dir
+    )
+
+    assert result.returncode == 1, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    # Without --keep-going the run aborts at the failed stage, so the abort notice
+    # is the verdict line. What matters either way is that no success is claimed.
+    assert "ABORTED after a failed stage" in result.stdout
+    assert "ROUND TRIP COMPLETE" not in result.stdout
+    assert "Salesforce validated" not in result.stdout
+
+    summary = json.loads((out_dir / "roundtrip_summary.json").read_text(encoding="utf-8"))
+    statuses = {stage["stage"]: stage["status"] for stage in summary["stages"]}
+    assert statuses["s5_org_validate"] == "fail"
+
+    # The critical assertion: a stage that ran and FAILED must not be folded into
+    # a success, and `salesforce_validated` must not become true just because an
+    # org was configured and the stage was attempted.
+    assert summary["all_executed_stages_passed"] is False
+    assert summary["salesforce_validated"] is False
+    assert summary["org_alias"] == "STUB_DEV"
+
+
+@pytest.mark.skipif(not EXAMPLE_CAPTURE.is_file(), reason="example capture missing")
+def test_the_compilers_own_errors_are_printed_not_paraphrased(tmp_path: Path) -> None:
+    """A paraphrased compiler error is how a project ends up guessing at a grammar.
+
+    The line and column matter most: they are what turns "invalid syntax
+    somewhere" into a fix.
+    """
+    out_dir = tmp_path / "rt"
+    result = _run_with_stub(
+        tmp_path, _stub_sf(tmp_path, validate_exit=1, validate_stdout=_REJECTION_JSON), out_dir
+    )
+
+    assert "CompilationError" in result.stdout
+    assert "unexpected `->`" in result.stdout
+    assert "Ln 38" in result.stdout
+    assert "2 compilation error(s)" in result.stdout
+
+
+@pytest.mark.skipif(not EXAMPLE_CAPTURE.is_file(), reason="example capture missing")
+def test_keep_going_still_ends_on_a_failure_verdict(tmp_path: Path) -> None:
+    """`--keep-going` must not turn a failed stage into a completed round trip.
+
+    The flag exists to see every stage's result in one run. A reader who passes it
+    is the most likely to skim to the last line, so that line has to say FAILED.
+    """
+    import os
+
+    out_dir = tmp_path / "rt"
+    bin_dir = _stub_sf(tmp_path, validate_exit=1, validate_stdout=_REJECTION_JSON)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--capture",
+            str(EXAMPLE_CAPTURE),
+            "--org",
+            "STUB_DEV",
+            "--out",
+            str(out_dir),
+            "--keep-going",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PY_BIN": sys.executable,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        },
+    )
+
+    assert result.returncode == 1
+    assert "ROUND TRIP FAILED" in result.stdout
+    assert "ROUND TRIP COMPLETE" not in result.stdout
+
+
+@pytest.mark.skipif(not EXAMPLE_CAPTURE.is_file(), reason="example capture missing")
+def test_a_successful_validation_is_recorded_as_validated(tmp_path: Path) -> None:
+    """The positive control for the two tests above.
+
+    Without it, a script that reported every org run as a failure would pass them
+    both. Mirrors the real AFT3 response: `{"status":0,"result":{"success":true}}`.
+    """
+    out_dir = tmp_path / "rt"
+    success = json.dumps({"status": 0, "result": {"success": True}, "warnings": []})
+    result = _run_with_stub(
+        tmp_path, _stub_sf(tmp_path, validate_exit=0, validate_stdout=success), out_dir
+    )
+
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert "ROUND TRIP COMPLETE" in result.stdout
+    assert "NOTHING WAS VALIDATED" not in result.stdout
+
+    summary = json.loads((out_dir / "roundtrip_summary.json").read_text(encoding="utf-8"))
+    assert summary["salesforce_validated"] is True
+    assert summary["stages_skipped"] == 0
