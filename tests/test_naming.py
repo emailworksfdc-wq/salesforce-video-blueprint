@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from sf_video_blueprint.naming import (
+    COMPILER_VERIFIED_NAME_LIMIT,
     MAX_NAME_LENGTH,
     FALLBACK_TOPIC_NAME,
     topic_api_name,
@@ -23,6 +24,54 @@ from sf_video_blueprint.naming import (
     tokenize,
     snake_case,
 )
+
+
+# === COMPILER-VERIFIED LIMIT ===
+#
+# Measured against org AFT3 on 2026-07-26 via `sf agent validate authoring-bundle`
+# (compile endpoint /einstein/ai-agent/v1.1/authoring/scripts, afScriptVersion
+# 2.0.0), by hand-building bundles with over-long subagent names:
+#
+#   74 chars -> exit 0, {"success": true}
+#   80 chars -> exit 0, {"success": true}
+#   81 chars -> exit 1, "Too big: expected string to have <=80 characters for …"
+#  100 chars -> exit 1, same error
+#
+# The 80-char case produced an 86-char `go_to_…` router action and still compiled,
+# and a 100-char router action with a short subagent name also compiled. The
+# compiler enforces <=80 on the subagent NAME only, not on the router action that
+# references it.
+
+
+def test_compiler_verified_limit_is_80():
+    """The measured compiler boundary is 80 inclusive; don't let it drift silently."""
+    assert COMPILER_VERIFIED_NAME_LIMIT == 80
+
+
+def test_derived_names_stay_inside_the_compiler_verified_limit():
+    """Every derived name must fit the limit the compiler actually enforces.
+
+    MAX_NAME_LENGTH (74) is deliberately stricter than the measured 80 — see the
+    rationale in naming.py. This test asserts the relationship that must hold no
+    matter how the local cap is tuned: nothing we emit may exceed what the
+    compiler accepts.
+    """
+    assert MAX_NAME_LENGTH <= COMPILER_VERIFIED_NAME_LIMIT, (
+        f"MAX_NAME_LENGTH ({MAX_NAME_LENGTH}) exceeds the compiler-verified limit "
+        f"({COMPILER_VERIFIED_NAME_LIMIT}); emitted names would be rejected with "
+        '"Too big: expected string to have <=80 characters".'
+    )
+
+    for length in (1, 40, 74, 80, 100, 200, 500):
+        intent = "Update Case " + "X" * length
+        for form, value in (
+            ("topic_api_name", topic_api_name(intent)),
+            ("subagent_name", subagent_name(intent)),
+        ):
+            assert len(value) <= COMPILER_VERIFIED_NAME_LIMIT, (
+                f"{form}({length} char intent) = {len(value)} chars, over the "
+                f"measured compiler limit of {COMPILER_VERIFIED_NAME_LIMIT}"
+            )
 
 
 # === PROPERTY TEST 1: Length invariant ===

@@ -33,16 +33,42 @@ from __future__ import annotations
 
 import re
 
-# Salesforce API names are conventionally capped at 80 characters. The exact
-# limit for Agent Script subagent names is not documented in the first-party
-# template, so the same cap is applied to both rather than guessing a looser one.
+# The Agentforce compilation API rejects a subagent name longer than 80
+# characters. **This is measured, not assumed.** Probing org AFT3 on 2026-07-26
+# with `sf agent validate authoring-bundle` (compile endpoint
+# `/einstein/ai-agent/v1.1/authoring/scripts`, afScriptVersion 2.0.0):
 #
-# **ROUTER ACTION BUDGET:** The router action name is `go_to_<subagent>`, which
-# adds a 6-char prefix. To keep the router action under 80 chars, the subagent
-# name (and therefore the topic name it derives from) must be capped at 74 chars.
-# We apply this cap uniformly to topic_api_name, subagent_name, and
-# router_action_name to preserve cross-artifact linkage.
-MAX_NAME_LENGTH = 74  # was 80; reduced to 74 to budget for "go_to_" prefix
+#   subagent name 74 chars -> exit 0, {"success": true}
+#   subagent name 80 chars -> exit 0, {"success": true}
+#   subagent name 81 chars -> exit 1, CompilationError:
+#       "Too big: expected string to have <=80 characters for uxxx…"
+#   subagent name 100 chars -> exit 1, same error
+#
+# So the boundary is exactly 80, inclusive.
+COMPILER_VERIFIED_NAME_LIMIT = 80
+
+# **The router-action budget was never a real constraint.** The 80-char subagent
+# name above produced an 86-char `go_to_…` router action and still compiled, and a
+# deliberately-built 100-char router action with a short subagent name ALSO
+# compiled (exit 0). The compiler applies the <=80 rule to the subagent name, not
+# to the action identifier that references it. `docs/INTERFACE_CONTRACT_ROUND3.md`
+# and `docs/DEFECT_LEDGER.md` record the 86-char router action as a defect that
+# would reach an org unchecked; measurement says the org accepts it.
+#
+# The cap is nevertheless left at 74 rather than raised to
+# COMPILER_VERIFIED_NAME_LIMIT, deliberately:
+#
+#   * 74 is strictly inside the measured 80, so it cannot produce a name the
+#     compiler rejects. Raising it removes that headroom for no observed gain.
+#   * `topic_api_name` also feeds the agent spec YAML `topics[].name` and the test
+#     spec's `expectedTopic`, which reach Salesforce through the metadata path
+#     (`sf agent generate`/publish), NOT through the script compiler. That path's
+#     name limit has not been measured. Widening the shared cap on the strength of
+#     compiler evidence would extend a result to a channel it was not gathered on.
+#
+# Cost of keeping 74: derived names truncate ~6 chars earlier than strictly
+# necessary. That is a fidelity loss in an edge case, not a correctness bug.
+MAX_NAME_LENGTH = 74
 
 # Emitted when an intent carries no usable word characters at all. Deliberately
 # not a plausible-looking name: an unnamed topic should be obvious in review.
@@ -177,10 +203,10 @@ def topic_api_name(intent: str) -> str:
     Used for the spec YAML ``topics[].name`` **and** the test spec's
     ``expectedTopic``. Those two are a reference pair; call this for both.
 
-    **Length budget:** `MAX_NAME_LENGTH` is set to 74 (not 80) to leave room for
-    the `go_to_` prefix in the router action name. This ensures that
-    `len(f"go_to_{subagent_name(intent)}")` never exceeds 80 chars, the assumed
-    Salesforce API name cap.
+    **Length budget:** capped at `MAX_NAME_LENGTH` (74), which sits inside the
+    measured compiler limit of `COMPILER_VERIFIED_NAME_LIMIT` (80). The compiler
+    enforces 80 on this name; the extra 6 chars of headroom are retained for the
+    reasons given at the top of this module, not because the compiler demands them.
     """
     tokens = tokenize(intent)
     if not tokens:
@@ -226,8 +252,11 @@ def subagent_name(intent: str) -> str:
 
     Deliberately routed through :func:`topic_api_name` so the subagent name is
     always the lowercase form of the topic that exists, never an independent
-    guess. With `MAX_NAME_LENGTH = 74`, the subagent name is guaranteed to fit
-    within the router action budget (`go_to_` + 74 chars = 80 chars total).
+    guess.
+
+    This is the name the compiler length-checks: an 81-char subagent name is
+    rejected with "Too big: expected string to have <=80 characters". The 74-char
+    cap keeps it comfortably inside that.
     """
     return snake_case(topic_api_name(intent))
 
@@ -238,16 +267,17 @@ def router_action_name(intent: str) -> str:
     ``start_agent agent_router`` needs one ``go_to_<subagent>`` action per
     subagent. Deriving it here keeps the router and the subagent block in step.
 
-    **Length constraint:** With `MAX_NAME_LENGTH = 74`, the subagent name is
-    guaranteed to be <= 74 chars, so `f"go_to_{subagent_name(intent)}"` is
-    guaranteed to be <= 80 chars (6 + 74 = 80). This budgets the prefix INSIDE
-    the overall 80-char cap while preserving cross-artifact linkage:
-    `router_action_name(i) == f"go_to_{subagent_name(i)}"` always holds, and
-    `names_agree(topic_api_name(i), subagent_name(i))` always holds.
+    **Length:** the compiler does NOT length-check this identifier. Measured on
+    AFT3: a deliberately-built 100-char router action referencing a short subagent
+    compiled successfully (exit 0), and an 80-char subagent name produced an
+    86-char action that also compiled. Only the subagent name is held to <=80.
 
-    The alternative (truncating the router action independently) would risk
-    collision: two distinct 74-char subagent names that differ only in their
-    final tokens could map to the same router action, which is a silent mis-route.
+    The action is still never truncated independently of the subagent name,
+    because that would risk collision: two distinct subagent names differing only
+    in their final tokens could map to the same action, a silent mis-route. Keeping
+    it a pure `go_to_` + name concatenation preserves the invariants
+    `router_action_name(i) == f"go_to_{subagent_name(i)}"` and
+    `names_agree(topic_api_name(i), subagent_name(i))`.
     """
     return f"go_to_{subagent_name(intent)}"
 
