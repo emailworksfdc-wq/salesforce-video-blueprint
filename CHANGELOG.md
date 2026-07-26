@@ -9,7 +9,53 @@ While the major version is `0`, the public API may change in any minor release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed — the score gate was scoring the wrong things
+
+The gate is the component that decides whether a derived spec is fit to become an
+agent, so a defect here is worse than a defect anywhere else: it grants
+permission. Six of them were found by attacking it rather than testing it.
+
+- **Filler content scored 100/100.** A spec whose entities were `["aa", "bb",
+  "ee"]` scored higher than the real spec derived from the bundled example
+  capture (84/100). Four further ways to reach a perfect score with nothing behind
+  them are fixed in the same change.
+- **Deleting an observed entity paid +15.** Removing evidence *raised* the score,
+  which is the one gradient a refinement loop must never be able to learn — and
+  `_score_evidence_grounding`'s own docstring claimed it could not happen.
+  Deletion can no longer profit; a guard test asserts it per dimension.
+- **The gate accused its own builder of padding on a real capture.** On a real
+  recorded Salesforce session, 128 of 130 observed inputs were Lightning UI
+  elements whose object/field could not be resolved, so every one collapsed into
+  a single `None.None` bucket that looked like the same field repeated. That cut
+  `evidence_grounding` to 5/30 and fired a false threshold-surfing block. The
+  padding heuristic fired *only* on honest output — synthetic filler sailed past
+  it. Unresolved targets are no longer collated as one field.
+- **`honesty` was unfalsifiable.** It returned 20/20 on every spec that reached
+  it, including the filler ones, so a fifth of the total was a constant. It now
+  measures something a dishonest spec can fail.
+- **A blocked run displayed a near-passing number.** `ci_smoke_check.py` printed
+  `85/100` three lines above its own `BLOCKED:` line. `SpecScore` now carries
+  both `total` (the raw dimension sum, unchanged, so `iterate.py` keeps a usable
+  gradient across blocked rounds) and `display_total` (capped below the moderate
+  band whenever a blocking issue is present). `summary()` reports the capped
+  figure and discloses the raw one — e.g.
+  `FAIL: 59/100 (low band), 1 blocking issue(s) [blocked: capped from raw 85]`.
+- Three dimensions measured something other than what their names and docstrings
+  claimed. They now measure the stated property.
+
+`PASS_THRESHOLD` is unchanged at 75 and `markers.py` is untouched — no fix here
+works by lowering a bar. `tests/test_gaming_resistance.py` and the new
+`tests/test_score_calibration.py` fail if any of these regress.
+
+### Known gap
+
+`test_c11_on_lane_02_real_capture_when_available` is skipped: the real capture
+that exposed the `None.None` collapse cannot be committed as a fixture yet
+because ingest still rejects 171 of its 175 events (`selectors.role_name.role` is
+null for LWC elements with no implicit ARIA role). The property is asserted on a
+synthetic reconstruction in the meantime. Fail-closed rejection is the correct
+behaviour, but it means this defect's own regression test does not yet run
+against the artifact that found it.
 
 ## [0.1.1] — 2026-07-26
 
