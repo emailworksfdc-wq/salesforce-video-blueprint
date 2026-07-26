@@ -23,7 +23,10 @@ import pytest
 
 pytest.importorskip("mcp", reason="the optional [mcp] extra is not installed")
 
-from sf_video_blueprint import mcp_server  # noqa: E402
+# Imported below the importorskip on purpose: mcp_server imports `mcp` at module
+# scope, so a top-of-file import here would raise ModuleNotFoundError during
+# collection instead of skipping cleanly when the extra is absent.
+from sf_video_blueprint import mcp_server
 
 EXAMPLE = Path(__file__).parent.parent / "examples" / "case_triage.dom_capture.jsonl"
 
