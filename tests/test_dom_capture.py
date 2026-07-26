@@ -2081,3 +2081,199 @@ def test_example_capture_manifest_is_wired(tmp_path: Path) -> None:
     assert trace.manifest is not None, "example capture's manifest was not wired in"
     assert trace.manifest.event_count == len(trace.events) == 8
     assert not [f for f in validate_trace(trace) if "Manifest reports" in f]
+
+
+# ============================================================================
+# 16. DEFECT L4-6 — the leak detector inspected only element.name
+# ============================================================================
+#
+# `validate_trace` and `redaction_audit` both did:
+#
+#     field_name_lower = (event.element.name or "").lower()
+#
+# one of the field-identity signals the recorder captures. Measured across
+# twelve signals carrying a sensitive field identity next to an unredacted
+# value, validate_trace caught 1 and missed 11 — including
+# `element.type == "password"`, which is the single most reliable signal there
+# is, and `selectors.sf_field == "Credit_Card_Number__c"`, which is how a
+# Salesforce field announces itself.
+#
+# TEST DISCIPLINE, enforced by test_no_finding_ever_echoes_the_value below:
+# these tests assert the FACT of a leak, never its content. The canary value
+# must appear in no finding, no log and no assertion message — a test failure
+# that prints the secret is itself the leak.
+
+#: A recognisable value that must never appear in any finding text.
+_CANARY = "4111111111111111"
+
+
+@pytest.mark.parametrize(
+    "label,patch",
+    [
+        ("element.name", {"element": {"tag": "input", "name": "password"}}),
+        ("element.id", {"element": {"tag": "input", "id": "user-password"}}),
+        ("element.aria_label", {"element": {"tag": "input", "aria_label": "Password"}}),
+        ("element.classes", {"element": {"tag": "input", "classes": ["form-password-field"]}}),
+        ("element.type", {"element": {"tag": "input", "type": "password"}}),
+        ("element.text", {"element": {"tag": "input", "text": "Social Security Number"}}),
+        ("selectors.sf_field", {"selectors": {"sf_field": "Credit_Card_Number__c"}}),
+        ("selectors.label_for", {"selectors": {"label_for": "label[for=ssn]"}}),
+        ("selectors.aria", {"selectors": {"aria": "[aria-label='CVV']"}}),
+        ("selectors.test_id", {"selectors": {"test_id": "card-number-input"}}),
+        (
+            "selectors.role_name",
+            {"selectors": {"role_name": {"role": "textbox", "name": "Password"}}},
+        ),
+        ("selectors.css_path", {"selectors": {"css_path": "input#ssn"}}),
+    ],
+)
+def test_leak_detected_across_every_field_identity_signal(label: str, patch: dict) -> None:
+    """DEFECT L4-6: a sensitive field identity on ANY signal must be caught.
+
+    Before the fix, 11 of these 12 were missed.
+    """
+    event: dict = {"value": _CANARY, "value_redacted": False}
+    event.update(patch)
+    trace = synthesize_trace([event])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings, f"leak on {label} was not detected"
+    # And the audit path must agree with the validator.
+    _, leaks = redaction_audit(trace)
+    assert leaks, f"redaction_audit missed the leak on {label}"
+
+
+def test_no_finding_ever_echoes_the_value() -> None:
+    """THE RULE FOR THIS WHOLE SECTION: report the fact, never the content.
+
+    Findings are printed to terminals and written into reports. A detector that
+    echoes the secret it found has leaked it a second time, into a file that
+    outlives the capture.
+    """
+    trace = synthesize_trace([
+        {
+            "value": _CANARY,
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "password", "name": "password", "id": "pw"},
+            "selectors": {"sf_field": "Credit_Card_Number__c", "css_path": "input#ssn"},
+        },
+        # The other leak class: flag set, value still present.
+        {
+            "value": _CANARY,
+            "value_redacted": True,
+            "element": {"tag": "input", "name": "cvv"},
+        },
+    ])
+
+    findings = validate_trace(trace)
+    _, leaks = redaction_audit(trace)
+
+    assert findings and leaks, "fixture must actually produce findings"
+    for text in [*findings, *leaks]:
+        assert _CANARY not in text, "a finding echoed the leaked value"
+        assert "4111" not in text, "a finding echoed part of the leaked value"
+
+
+def test_flag_set_but_value_present_is_still_caught() -> None:
+    """The A1 leak class must survive the widening: value_redacted=True with a
+    value still attached, regardless of field identity."""
+    trace = synthesize_trace([
+        {"value": _CANARY, "value_redacted": True, "element": {"tag": "input", "name": "notes"}}
+    ])
+
+    findings = validate_trace(trace)
+
+    assert any(f.startswith("SECURITY CRITICAL:") for f in findings)
+
+
+def test_password_type_is_caught_even_with_innocuous_name() -> None:
+    """`type="password"` is the strongest signal available and was ignored.
+
+    A field named `j_idt42` (real-world generated markup) with
+    type="password" leaked with no finding at all.
+    """
+    trace = synthesize_trace([
+        {
+            "value": _CANARY,
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "password", "name": "j_idt42"},
+        }
+    ])
+
+    assert [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+
+def test_ordinary_fields_do_not_produce_findings() -> None:
+    """The widening must not cry wolf. A detector that flags everything gets
+    ignored, which is the same as not having one."""
+    trace = synthesize_trace([
+        {
+            "value": "Broken air conditioner",
+            "value_redacted": False,
+            "element": {
+                "tag": "textarea",
+                "name": "Description",
+                "id": "case-description",
+                "classes": ["slds-textarea"],
+                "text": "Description",
+            },
+            "selectors": {"sf_field": "Description", "css_path": "textarea.slds-textarea"},
+        },
+        {
+            "value": "High",
+            "value_redacted": False,
+            "element": {"tag": "select", "name": "Priority", "id": "case-priority"},
+            "selectors": {"sf_field": "Priority", "label_for": "label[for=priority]"},
+        },
+        {
+            "value": "New",
+            "value_redacted": False,
+            "element": {"tag": "select", "name": "Status"},
+            "selectors": {"sf_field": "Status", "test_id": "status-picklist"},
+        },
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings == [], f"false positives on ordinary Case fields: {findings}"
+
+
+def test_pin_substring_does_not_false_positive() -> None:
+    """"pin" is a sensitive pattern but also a substring of ordinary words.
+
+    `Shipping__c`, `Opt_In_Preference__c` and a `spinner` class must not trip
+    the detector.
+    """
+    trace = synthesize_trace([
+        {
+            "value": "Express",
+            "value_redacted": False,
+            "element": {"tag": "select", "name": "Shipping", "classes": ["spinner-host"]},
+            "selectors": {"sf_field": "Shipping_Method__c"},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings == [], f"'pin' substring produced a false positive: {findings}"
+
+
+def test_leak_finding_names_the_signal_that_matched() -> None:
+    """An operator has to be able to act on the finding, so it must say WHICH
+    signal matched — without quoting the value."""
+    trace = synthesize_trace([
+        {
+            "value": _CANARY,
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "password", "name": "j_idt42"},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("SECURITY")]
+
+    assert findings
+    assert any("type" in f for f in findings), (
+        f"finding should identify the matching signal: {findings}"
+    )
+    assert all(_CANARY not in f for f in findings)
