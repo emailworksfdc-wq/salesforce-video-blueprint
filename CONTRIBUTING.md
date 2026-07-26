@@ -17,19 +17,24 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-You should see `953 passed, 1 skipped` (the count grows as fixes land). No
+You should see `988 passed, 2 skipped` (the count grows as fixes land). No
 Salesforce org, network access, or credentials are needed — every test is
 hermetic and offline.
 
-Omit the `mcp` extra and you get `916 passed, 2 skipped` instead: the MCP server
+Omit the `mcp` extra and you get `950 passed, 3 skipped` instead: the MCP server
 tests `importorskip` the optional dependency. **Keep it that way** — a plain
 `pip install -e ".[dev]"` must not produce a red suite. CI runs both
 configurations for exactly this reason.
 
-The always-present skip is `test_real_e2e_artifacts_validate_against_new_schemas`,
-which validates artifacts from a real pipeline run against the JSON schemas. Point
-`SF_BLUEPRINT_E2E_DIR` at a directory containing a `dom_capture.jsonl` and
-`blueprint.agent-spec.json` to enable it.
+Two skips are expected on a green run.
+`test_real_e2e_artifacts_validate_against_new_schemas` validates artifacts from a
+real pipeline run against the JSON schemas; point `SF_BLUEPRINT_E2E_DIR` at a
+directory containing a `dom_capture.jsonl` and `blueprint.agent-spec.json` to
+enable it. `test_c11_on_lane_02_real_capture_when_available` asserts the score gate
+does not accuse its own builder of padding on a *real* recorded capture; it stays
+skipped until such a capture is committed to `examples/` and survives ingest.
+Both are skips by design, not gaps to paper over — if you make either pass by
+weakening what it asserts, you have removed a check rather than satisfied it.
 
 ### Working on the MCP server
 
