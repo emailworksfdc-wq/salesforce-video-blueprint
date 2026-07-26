@@ -23,7 +23,7 @@ assertion message.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sf_video_blueprint.correlation import correlate_all
 from sf_video_blueprint.replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata
@@ -71,7 +71,7 @@ class _StubCollector(TelemetryCollector):
 
 def _key() -> CorrelationKey:
     return CorrelationKey(
-        run_id="run-test", step_id="step-001", event_time=datetime.now(timezone.utc)
+        run_id="run-test", step_id="step-001", event_time=datetime.now(UTC)
     )
 
 
@@ -180,7 +180,7 @@ def test_secret_does_not_reach_the_derived_spec(tmp_path) -> None:
     replay_events = ReplayEngine(adapter=NoopUIAdapter()).replay(metadata, bundle.actions)
 
     action = bundle.actions[0]
-    at = datetime.fromtimestamp(action.timestamp_ms / 1000, tz=timezone.utc)
+    at = datetime.fromtimestamp(action.timestamp_ms / 1000, tz=UTC)
     snapshot = ObjectSnapshot(
         correlation=CorrelationKey(run_id="run-test", step_id=action.step_id, event_time=at),
         object_api_name="Case",
