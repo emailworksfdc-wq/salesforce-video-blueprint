@@ -9,6 +9,48 @@ While the major version is `0`, the public API may change in any minor release.
 
 ## [Unreleased]
 
+### Added
+
+- **MCP server** (`src/sf_video_blueprint/mcp_server.py`), installed as
+  `sf-blueprint-mcp` via a new `[mcp]` optional extra. Speaks stdio, so it works
+  with Claude Code, Claude Desktop, Cursor, Windsurf, Continue, or any other
+  MCP-capable harness. Seven tools: `health`, `validate_capture`, `derive_spec`,
+  `score_spec`, `emit_agent_bundle`, `emit_test_spec`, `preview_api_names`.
+  Every tool is offline and read-only — none contacts a Salesforce org or launches
+  a browser, so an agent driving this server cannot mutate an org through it.
+- `pipeline.py` — the shared in-process API (`run_pipeline`, `PipelineResult`,
+  `CaptureRejected`) that the CLI, library, and MCP server all call. Previously
+  assembling the pipeline took seven imports and a dozen lines of glue, which
+  coupled every consumer to internal module layout.
+- A real public API in `__init__.py`. `from sf_video_blueprint import run_pipeline`
+  now works; before, the package exported nothing and `dir()` returned `[]`.
+- `scripts/mcp_stdio_check.py` — CI gate that launches the installed executable
+  and drives it over real stdio JSON-RPC, asserting over the wire that a spec
+  built from mock telemetry is still refused by the score gate.
+- `docs/mcp-install.md` — install and per-harness configuration.
+- A "Use it in your project" README section covering all three consumption modes.
+- CI: a `mcp-server` job, plus a second `pytest` run **without** the `mcp` extra to
+  prove the new tests skip rather than fail when the optional dependency is absent.
+
+### Changed
+
+- `NoopUIAdapter` moved from `cli.py` to `replay.py`, and `MockTelemetryCollector`
+  from `cli.py` to `telemetry.py`. Importing them from `cli.py` dragged in `typer`,
+  which made the pipeline unimportable in a minimal environment. Both now carry
+  docstrings explaining that they fabricate their output and why the score gate
+  therefore refuses runs that use them.
+- `eval_spec.render_test_spec()` added so YAML can be produced in-process;
+  `write_test_spec()` now delegates to it. Previously the only way to see the YAML
+  was to write a file.
+- `docs/mcp-product-spec.md` and `docs/mcp-release-checklist.md` no longer claim
+  "NOT IMPLEMENTED". Each section now carries its own status, and the reasons the
+  shipped server deviates from the `workflow.*` design are recorded in both.
+
+### Fixed
+
+- `SyntaxWarning: invalid escape sequence '\d'` from two docstrings in
+  `selectors.py`, which will become a `SyntaxError` in a future Python.
+
 ### Planned
 
 - Validate an emitted bundle with `sf agent validate authoring-bundle` against a
@@ -16,8 +58,9 @@ While the major version is `0`, the public API may change in any minor release.
 - Fix the four ingest defects that allow a capture to be silently truncated
   while still being stamped as real evidence (see `docs/DEFECT_LEDGER.md`).
 - Wire `sf agent test create/run/results` so stage 5 (iterate) exists.
-- Give the stage 6 emitters a production call site.
 - Call `redaction.py` from the pipeline instead of leaving it unreferenced.
+- Cut `v0.1.1` so the latest tag installs: `v0.1.0` predates the dependency fix
+  and fails to build `greenlet` on Python 3.12+.
 
 ## [0.1.0] — 2026-07-26
 
@@ -126,7 +169,8 @@ Carried forward deliberately, not overlooked:
   single run.
 - Video extraction is a stub: `HeuristicVideoExtractor` never decodes video and
   returns one placeholder step for any input. Use `--capture`.
-- No MCP server exists, despite `docs/mcp-product-spec.md`.
+- No MCP server exists, despite `docs/mcp-product-spec.md`. *(Added in
+  Unreleased.)*
 - HTML output embeds record IDs and field values verbatim. Treat every artifact
   in `outputs/` as sensitive.
 

@@ -38,10 +38,15 @@ deploy as an Agentforce agent* — the honest grade is roughly **55%**:
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
 | 5 · Iterate | 🔴 Absent | `sf agent test create/run/results` appear **nowhere** in this repo. The offline loop scores 79/79/79 and reports `converged=true` — a loop that cannot change its input is not a loop. |
-| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested. **None has a production call site**, and no org has ever validated the output. |
+| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and now reachable from the MCP server. **No org has ever validated the output** — `sf agent validate authoring-bundle` has never run. |
 
 The two stages nearest to zero are the two the end goal names explicitly. This
 table is the most important thing in this README.
+
+The pipeline is reachable three ways — an [MCP server](#1--mcp-server--use-it-from-any-ai-tool)
+for any AI harness, a [Python API](#2--python-library), and a [CLI](#3--command-line).
+That is packaging, not progress against the table above: all three run the same
+offline pipeline and none of them has seen a real org.
 
 ---
 
@@ -55,13 +60,16 @@ git clone https://github.com/emailworksfdc-wq/salesforce-video-blueprint.git
 cd salesforce-video-blueprint
 
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/python -m pytest -q          # 763 passed, 1 skipped
+.venv/bin/pip install -e ".[dev,mcp]"
+.venv/bin/python -m pytest -q          # 828 passed, 1 skipped
 ```
 
-The one skip is an opt-in check that validates artifacts from a real end-to-end
-run; set `SF_BLUEPRINT_E2E_DIR` to enable it. Everything else is hermetic — no
-org, no network, no credentials.
+Without the `mcp` extra you get `792 passed, 2 skipped` — the MCP server tests
+skip rather than fail when the optional dependency is absent.
+
+One skip is always present: an opt-in check that validates artifacts from a real
+end-to-end run; set `SF_BLUEPRINT_E2E_DIR` to enable it. Everything else is
+hermetic — no org, no network, no credentials.
 
 Then run the pipeline on the bundled example capture — **no Salesforce org, no
 network, no credentials required**:
@@ -114,6 +122,82 @@ blocked because the telemetry was mock. `testability` is 0 because the recording
 contained no failure path. That is the gate working exactly as intended: the
 only way to raise this score is to capture better evidence, never to soften the
 gate.
+
+---
+
+## Use it in your project
+
+Three ways, all installable from the repo. Install from `@main` rather than
+`@v0.1.0` — that tag predates a dependency fix and does not install on Python
+3.12+ ([known defect](#known-defects)).
+
+### 1 · MCP server — use it from any AI tool
+
+Exposes the pipeline to Claude Code, Claude Desktop, Cursor, Windsurf, Continue,
+or any other MCP-capable harness. Every tool is offline and read-only: none
+contacts a Salesforce org or launches a browser.
+
+```bash
+pipx install "sf-video-blueprint[mcp] @ git+https://github.com/emailworksfdc-wq/salesforce-video-blueprint.git@main"
+```
+
+```json
+{
+  "mcpServers": {
+    "sf-blueprint": {
+      "command": "sf-blueprint-mcp"
+    }
+  }
+}
+```
+
+Seven tools: `health`, `validate_capture`, `derive_spec`, `score_spec`,
+`emit_agent_bundle`, `emit_test_spec`, `preview_api_names`. Then just ask:
+
+> Derive an agent spec from `~/recordings/case_triage.dom_capture.jsonl` and tell
+> me what is blocking it from passing the quality gate.
+
+Full setup for each harness, the response envelope, and troubleshooting:
+**[docs/mcp-install.md](docs/mcp-install.md)**.
+
+### 2 · Python library
+
+```bash
+pip install "sf-video-blueprint @ git+https://github.com/emailworksfdc-wq/salesforce-video-blueprint.git@main"
+```
+
+```python
+from sf_video_blueprint import run_pipeline
+
+result = run_pipeline(
+    "dom_capture.jsonl",
+    org_url="https://your-sandbox.sandbox.my.salesforce.com",
+)
+
+print(result.spec.intent)        # Update Case (Status)
+print(result.score.total)        # 79
+print(result.score.passed)       # False — mock telemetry
+print(result.score.blocking_issues)
+```
+
+Check `result.score.passed` before trusting anything downstream, and
+`result.evidence_is_real` to know whether the run observed a real org at all. An
+in-process run uses mock telemetry, so it will not pass — by design.
+
+`run_pipeline` is offline and writes nothing to disk. It raises `CaptureRejected`
+when a capture leaks a secret or loses ≥50% of its events, rather than deriving a
+spec from a damaged recording.
+
+### 3 · Command line
+
+```bash
+sf-blueprint --capture dom_capture.jsonl \
+  --org-url "https://your-sandbox.sandbox.my.salesforce.com" \
+  --output-path outputs/blueprint.html
+```
+
+Writes an HTML blueprint plus `<output>.agent-spec.json`. Works from any
+directory once installed.
 
 ---
 
@@ -175,6 +259,8 @@ including where the gaps are. It is self-contained; no server needed.
 | `agentforce_spec.py` | Agentforce agent-spec YAML emitter |
 | `eval_spec.py` | `AiEvaluationDefinition` / `AiTestingDefinition` test-spec emitters |
 | `iterate.py` | Versioned offline refinement loop |
+| `pipeline.py` | Shared in-process API (`run_pipeline`) the CLI, library, and MCP server all call |
+| `mcp_server.py` | MCP server (`sf-blueprint-mcp`) — 7 offline, read-only tools over stdio |
 | `redaction.py` | Secret/PII redaction primitives (**no production callers yet**) |
 | `markers.py` | Provenance vocabulary — which sources count as real evidence |
 
@@ -253,7 +339,7 @@ This project keeps an honest ledger rather than a feature list. Full detail in
 | `redaction.py` has zero production callers | The redaction primitives exist and are tested, but nothing in the pipeline calls them. |
 | `scripts/agentforce_roundtrip.sh` uses three different agent names in one run | A test run would target an agent that does not exist. Fix before spending an org run. |
 | Correlation is temporal, not causal | The join proves telemetry was *fetched during* a step, not *caused by* it. |
-| No MCP server | `docs/mcp-product-spec.md` describes an unbuilt package. Aspirational. |
+| The `v0.1.0` tag does not install | It predates the dependency fix, so `pip install …@v0.1.0` fails to build `greenlet` on Python 3.12+. Install from `@main`. |
 | Video extraction is a stub | `HeuristicVideoExtractor` never decodes video; any video yields one placeholder step. **Use `--capture`.** |
 
 `pyproject.toml` declares `pyyaml` and `jsonschema` as dev extras. Until you
@@ -266,6 +352,7 @@ JSON-Schema-subset validator. Both are tested; neither is a full implementation.
 
 **Accurate** — describes code that exists:
 
+- [`docs/mcp-install.md`](docs/mcp-install.md) — MCP server install and per-harness config
 - [`docs/USER_JOURNEY_Story.html`](docs/USER_JOURNEY_Story.html) — animated consumer walkthrough
 - [`docs/DEFECT_LEDGER.md`](docs/DEFECT_LEDGER.md) — every known defect, with file and line
 - [`docs/INTERFACE_CONTRACT.md`](docs/INTERFACE_CONTRACT.md) — the recorder↔parser wire format
@@ -273,10 +360,17 @@ JSON-Schema-subset validator. Both are tested; neither is a full implementation.
 - `docs/master_blueprint_spec.md`, `docs/replay-hardening.md`, `docs/execution-tracing-model.md`
 - `docs/topic-action-authoring-standard.md`, `docs/omnistudio-to-agentforce-playbook.md`
 
+**Partly implemented** — read the status banner at the top of each:
+
+- `docs/mcp-product-spec.md` — the original `workflow.*` design. The server that
+  shipped exposes the pipeline's real capabilities instead; the envelope and error
+  taxonomy were adopted. Deviations are recorded in both documents.
+- `docs/mcp-release-checklist.md` — written for a public npm/PyPI release that has
+  not happened.
+
 **Aspirational** — design intent for capabilities that do **not** exist in code.
 Do not read these as status:
 
-- `docs/mcp-product-spec.md`, `docs/mcp-release-checklist.md`
 - `docs/governance-compliance.md`, `docs/threat-model.md`
 - `docs/agent-testing-framework.md`, `docs/release-readiness-scorecard.md`
 - `docs/agentforce-guardrail-checklist.md`

@@ -13,18 +13,36 @@ git clone https://github.com/emailworksfdc-wq/salesforce-video-blueprint.git
 cd salesforce-video-blueprint
 
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev,mcp]"
 .venv/bin/python -m pytest -q
 ```
 
-You should see `763 passed, 1 skipped` (the count grows as fixes land). No
+You should see `828 passed, 1 skipped` (the count grows as fixes land). No
 Salesforce org, network access, or credentials are needed — every test is
 hermetic and offline.
 
-The skip is `test_real_e2e_artifacts_validate_against_new_schemas`, which
-validates artifacts from a real pipeline run against the JSON schemas. Point
+Omit the `mcp` extra and you get `792 passed, 2 skipped` instead: the MCP server
+tests `importorskip` the optional dependency. **Keep it that way** — a plain
+`pip install -e ".[dev]"` must not produce a red suite. CI runs both
+configurations for exactly this reason.
+
+The always-present skip is `test_real_e2e_artifacts_validate_against_new_schemas`,
+which validates artifacts from a real pipeline run against the JSON schemas. Point
 `SF_BLUEPRINT_E2E_DIR` at a directory containing a `dom_capture.jsonl` and
 `blueprint.agent-spec.json` to enable it.
+
+### Working on the MCP server
+
+The unit tests call the tool functions directly. That proves the logic but not
+that the server installs and speaks the protocol, so run the stdio check too:
+
+```bash
+.venv/bin/python scripts/mcp_stdio_check.py examples/case_triage.dom_capture.jsonl
+```
+
+It launches the installed `sf-blueprint-mcp` executable as a subprocess and drives
+it over real JSON-RPC. It is what catches a broken entry point, a stray `print()`
+on stdout (which corrupts the transport), or a non-serializable tool return.
 
 ## Ground rules
 
