@@ -20,6 +20,21 @@ references. The only safe actions are ``@utils.transition to @subagent.X`` and
 ``@utils.escalate``. If the recording observed a Flow/Apex invocation, emit a
 clearly-marked instruction line noting that, not a fake action reference.
 
+That constraint is now **compiler-verified**, not merely cautious. Measured on
+org AFT3 (2026-07-26) with ``sf agent validate authoring-bundle``, the invocation
+namespace is a closed set and ``apex``/``flow`` are not in it::
+
+    @flow.SFVB_TEST_Nonexistent_Flow -> exit 1
+        "Cannot invoke '@flow.…' — 'flow' is not a valid invocation target."
+    @apex.SFVB_TEST_NoClass -> exit 1
+        "Cannot invoke '@apex.…' — 'apex' is not a valid invocation target."
+    @utils.no_such_util -> exit 1  "'no_such_util' is not defined in utils"
+
+Note the two distinct shapes: an unknown *namespace* is "not a valid invocation
+target", while an unknown *member* of a known namespace is "not defined in
+<ns>". So emitting ``@flow.X`` would produce a bundle that cannot compile at
+all — see ``test_emitter_never_uses_a_compiler_rejected_namespace``.
+
 NOTE: Agent Script comment syntax (if any) is unverified. The template generator
 does not emit comments in the .agent file body, so this module follows suit.
 """
@@ -542,8 +557,16 @@ def build_bundle_meta_xml() -> str:
 
     This is the minimal valid structure. No other fields are present in the
     installed plugin's template. The bundleType is hardcoded to AGENT (the only
-    type emitted by `sf agent generate authoring-bundle` as of CLI 2.143.6 with
-    @salesforce/agents 1.10.2).
+    type emitted by `sf agent generate authoring-bundle` as of CLI 2.143.6).
+
+    Version note: two `sf` installs exist on the machine this was verified on, and
+    they carry different @salesforce/agents versions. The one on PATH
+    (`/usr/local/lib/sf`) has **1.6.6**; `~/.local/share/sf/client` has 1.10.2.
+    The `.bundle-meta.xml` template above is byte-identical in both, so this
+    function matches either. Confirmed empirically as well: a bundle carrying this
+    exact XML deployed to org AFT3 and round-tripped through
+    `sf project retrieve` with the `.agent` file byte-identical. The org
+    re-serialises the XML with a 4-space indent instead of 2; both are accepted.
 
     CONSTRAINT: This function does not accept any parameters because the template
     does not parameterise anything. The bundleType is fixed, and no agent-specific
