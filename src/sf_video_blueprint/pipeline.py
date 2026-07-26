@@ -155,14 +155,15 @@ def run_pipeline(
     username: str = "analyst@example.com",
     profile_name: str = "System Administrator",
     run_id: str | None = None,
+    telemetry_collector: Any | None = None,
 ) -> PipelineResult:
     """Parse a capture, derive an agent spec from it, and score the result.
 
-    Offline and side-effect free: no org is contacted, no browser is launched,
-    nothing is written to disk. Telemetry is mocked, which means the result is
-    always stamped `telemetry_source: "mock"` and will not pass the score gate.
-    That is correct — a spec cannot be called evidence-backed without observed
-    server-side behaviour.
+    Offline and side-effect free **by default**: no org is contacted, no browser
+    is launched, nothing is written to disk. Default telemetry is mocked, which
+    means the result is stamped `telemetry_source: "mock"` and will not pass the
+    score gate. That is correct — a spec cannot be called evidence-backed without
+    observed server-side behaviour.
 
     Args:
         capture_path: A `dom_capture.jsonl` trace from the recorder.
@@ -170,6 +171,16 @@ def run_pipeline(
         username: Replay metadata for the audit trail.
         profile_name: Replay metadata for the audit trail.
         run_id: Optional stable run id. Generated when omitted.
+        telemetry_collector: Optional collector implementing
+            :class:`~sf_video_blueprint.telemetry.TelemetryCollector`. Pass a
+            :class:`~sf_video_blueprint.live_telemetry.LiveOrgTelemetryCollector`
+            to observe a real org; omit for the offline mock path.
+
+            The resulting `telemetry_source` is derived from what the collector
+            actually observed, never from the caller's intent. A live collector
+            that came back empty is stamped `"unavailable"`, not `"live-org"` —
+            passing a live collector is a request to observe, not a licence to
+            claim observation. See :func:`_resolve_telemetry_source`.
 
     Raises:
         FileNotFoundError: The capture file does not exist.
@@ -203,7 +214,15 @@ def run_pipeline(
 
     replay_events = ReplayEngine(adapter=NoopUIAdapter()).replay(metadata, extraction.actions)
 
-    registry = _collect_mock_telemetry(extraction.actions, metadata.run_id)
+    if telemetry_collector is None:
+        registry = _collect_mock_telemetry(extraction.actions, metadata.run_id)
+        telemetry_source = "mock"
+    else:
+        registry = _collect_telemetry(
+            telemetry_collector, extraction.actions, metadata.run_id
+        )
+        telemetry_source = _resolve_telemetry_source(registry)
+
     analyses = correlate_all(
         extraction.actions, replay_events, registry.events, registry.snapshots
     )
@@ -211,7 +230,7 @@ def run_pipeline(
     spec = build_agent_spec(extraction.actions, analyses)
     provenance = {
         "extraction_source": "dom-capture",
-        "telemetry_source": "mock",
+        "telemetry_source": telemetry_source,
         "replay_source": "noop",
         "agent_spec_source": "derived",
         "run_id": metadata.run_id,
@@ -236,8 +255,33 @@ def _collect_mock_telemetry(actions: list[Any], run_id: str) -> TelemetryRegistr
     Every event this produces is invented. See `MockTelemetryCollector` — the run
     is stamped `telemetry_source: "mock"` so the score gate refuses it.
     """
+    return _collect_telemetry(MockTelemetryCollector(), actions, run_id)
+
+
+def _collect_telemetry(
+    collector: Any, actions: list[Any], run_id: str
+) -> TelemetryRegistry:
+    """Drive any `TelemetryCollector` over every extracted action."""
     registry = TelemetryRegistry()
-    collector = MockTelemetryCollector()
     for action in actions:
         registry.collect_step(collector, run_id, action.step_id)
     return registry
+
+
+def _resolve_telemetry_source(registry: TelemetryRegistry) -> str:
+    """Derive the provenance stamp from what a collector actually returned.
+
+    A caller supplying a live collector is asking for observation, not asserting
+    it happened. An org that returned nothing — wrong window, no tracked record,
+    expired session, unlicensed surface — yields an empty registry, and an empty
+    registry is stamped `"unavailable"`, which is absent from
+    `markers.REAL_TELEMETRY_SOURCES` and so blocks at the score gate.
+
+    Deliberately derived from the collected rows rather than from the collector's
+    type: a `LiveOrgTelemetryCollector` pointed at an org with no matching history
+    is indistinguishable, evidence-wise, from no org at all, and must be reported
+    the same way.
+    """
+    if registry.events or registry.snapshots:
+        return "live-org"
+    return "unavailable"
