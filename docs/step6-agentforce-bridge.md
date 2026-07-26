@@ -27,8 +27,9 @@ Live agent
 
 1. `sf agent generate authoring-bundle` REQUIRES an org because it calls the org's LLM to expand topics. No local-only path exists.
 2. `sf agent create --spec` also exists but Salesforce does NOT recommend it. Non-Agent-Script agents are less flexible and harder to maintain. Always use the authoring-bundle route.
-3. `sf agent validate authoring-bundle` is the ONLY authority on whether an `.agent` file is syntactically correct. Local structural checks in `agent_script.validate_locally()` catch obvious errors (tabs, unclosed quotes, missing blocks) but are NOT a substitute for CLI validation.
-4. The CLI writes Agent Script files in a specific key order and with specific indentation (4 spaces, load-bearing). A single wrong indent level produces a compile error or semantically different behavior.
+3. `sf agent validate authoring-bundle` is the ONLY authority on whether an `.agent` file is syntactically correct. Local structural checks in `agent_script.validate_locally()` catch obvious errors (tabs, unclosed quotes, missing blocks) but are NOT a substitute for CLI validation — measured: it reported zero findings on a file the compiler rejected with 24 errors.
+4. **`validate` does NOT require a deployed bundle, or `generate` to have run.** It is `requiresProject = true`: it resolves `--api-name` against a local SFDX package directory and POSTs the file content to the compile API, using the org for auth only. Naming a bundle that is not on local disk yields `AABNotFound: … Searched in: <project>/force-app/`, never an org lookup. So the chain above can be entered at `.agent` — you can emit locally and validate, with no deploy and no org metadata created.
+5. The CLI writes Agent Script files in a specific key order and with specific indentation (4 spaces, load-bearing). A single wrong indent level produces a compile error or semantically different behavior.
 
 ---
 
@@ -222,71 +223,105 @@ A gate that always returns 100/100 trains the loop to fabricate data. The scorer
 
 ## 6. Running the Round-Trip
 
-`scripts/agentforce_roundtrip.sh` (B9) drives the full CLI chain and reports honestly at every stage.
+`scripts/agentforce_roundtrip.sh` (B9) drives capture → derive → score → emit → validate → report, and reports honestly at every stage. It runs **fully offline by default**; the one org-dependent stage is opt-in behind `--org`.
 
 ### Usage
 
 ```bash
-bash scripts/agentforce_roundtrip.sh <org-alias> <derived-spec.json> [out-dir]
+bash scripts/agentforce_roundtrip.sh [--capture <file>] [--spec <file>] [--org <alias>]
+                                     [--out <dir>] [--keep-going]
 ```
 
-**Arguments:**
+**Options:**
 
-- `org-alias`: Sandbox, scratch, or `.develop.my.salesforce.com` dev org alias. PPCDM and PPCaccenture are permanently blocked.
-- `derived-spec.json`: Path to `DerivedAgentSpec` JSON (from `spec_builder.py`)
-- `out-dir`: Optional output directory (default: `./outputs/roundtrip`)
+- `--capture <file>`: DOM capture JSONL to derive a spec from. Defaults to `examples/case_triage.dom_capture.jsonl`, so the script runs with no arguments at all.
+- `--spec <file>`: Start from an existing `DerivedAgentSpec` JSON instead of capturing. Mutually exclusive with `--capture`.
+- `--org <alias>`: Run S5 (`sf agent validate authoring-bundle`) against this alias. Sandbox, scratch, or `.develop.my.salesforce.com` only. PPCDM and PPCaccenture are hard-blocked by alias with no override. **Omit it and S5 reports `SKIPPED` — the script never claims validation it did not perform.**
+- `--out <dir>`: Output directory (default `./outputs/roundtrip`).
+- `--keep-going`: Do not stop at the first failed stage. Still exits non-zero.
 
 **Environment:**
 
-- `DRY_RUN=1`: Run only local stages (S1/S2), skip org-dependent CLI stages
-- `PY_BIN`: Python interpreter to use (auto-detected if unset)
+- `PY_BIN`: Python interpreter (≥ 3.11). Auto-detected if unset.
+
+There is no `DRY_RUN`. Offline is the default, so the old inversion — where org calls happened unless you opted out, and you had to pass a dummy alias to stay local — is gone.
 
 ### Stages (S1–S6)
 
-| Stage | Description | Org Required | Exit Codes |
-|-------|-------------|--------------|------------|
-| S1 | Emit `agentSpec.yaml` from derived JSON (B1) | No | 0=pass, 1=fail, 5=insufficient evidence |
-| S2 | Emit `.agent` and run local structural checks (B2) | No | 0=pass, 1=fail, 5=insufficient evidence |
-| S3 | `sf agent generate authoring-bundle` (REAL CLI) | Yes | 0=pass, 1=fail |
-| S4 | `sf agent validate authoring-bundle` (AUTHORITATIVE) | Yes | 0=pass, 1=compile error, 2=404, 3=500 |
-| S5 | Generate test spec (both dialects, B3) | No | 0=pass, 1=fail |
-| S6 | Machine-readable summary JSON | No | Always succeeds |
+| Stage | Description | Org required |
+|-------|-------------|--------------|
+| `s1_derive_spec` | Run the pipeline on the capture to produce the derived spec JSON. `SKIPPED` when `--spec` is given. | No |
+| `s2_derive_names` | Derive every API name from `naming.py` via `roundtrip_lib.py identity` and assert all cross-artifact linkages agree. | No |
+| `s3_score_gate` | Report the `spec_score` verdict. The verdict is **reported, never enforced down**: a mock-telemetry run is *supposed* to fail the gate. | No |
+| `s4_emit_artifacts` | Emit `agentSpec.yaml`, the authoring bundle inside a real SFDX project, and both test-spec dialects — then re-read the written bytes and verify every derived name appears in them. | No |
+| `s5_org_validate` | `sf agent validate authoring-bundle` — the only authority on `.agent` grammar. `SKIPPED` unless `--org` is given. | Yes |
+| `s6_summary` | Write `roundtrip_summary.json` and print a verdict that names every skipped stage. | No |
 
-**Exit code table (script overall):**
+`sf agent validate authoring-bundle` is `requiresProject = true`: it resolves the bundle from a **local** SFDX package directory and POSTs the file content to the compile API, using the org for auth only. **No deploy is required**, which is why S4 writes a real `sfdx-project.json` and why this script creates no metadata in the org. (The earlier claim that validation requires an already-deployed bundle is wrong; see `_shared/findings/lane-01.md` and lane 07's report.)
+
+**Exit code table:**
 
 | Code | Meaning |
 |------|---------|
-| 0 | All executed stages passed |
+| 0 | Every stage that **ran** passed. Skipped stages are reported, not counted as passes. |
 | 1 | At least one stage failed |
-| 2 | Invalid arguments |
-| 3 | Org safety guard triggered |
-| 4 | CLI preflight failed |
-| 5 | InsufficientEvidenceError (recording inadequate — legitimate failure) |
+| 2 | Bad arguments, or preflight failure (no usable Python, missing `sf`) |
+| 3 | Org safety guard tripped |
+| 5 | `InsufficientEvidenceError` — the recording is inadequate (a real finding, not a bug) |
 
-### DRY_RUN Mode (Local-Only Path)
-
-```bash
-DRY_RUN=1 bash scripts/agentforce_roundtrip.sh dummy-org-alias ./derived-spec.json
-```
-
-Runs S1, S2, S5, S6 only (no org calls). Use for local development or when no org is available. The `dummy-org-alias` argument is ignored.
-
-### Real Example
+### Offline run (no org, no credentials)
 
 ```bash
-export SF_ACCESS_TOKEN="$(cat ~/.sf_token)"  # never pass tokens as argv
-bash scripts/agentforce_roundtrip.sh my-sandbox ./outputs/master_blueprint.agent-spec.json ./outputs/roundtrip
+bash scripts/agentforce_roundtrip.sh --out ./outputs/roundtrip
 ```
 
-Outputs:
+Runs S1–S4 and S6, reports S5 as `SKIPPED`, and ends with:
 
-- `./outputs/roundtrip/agentSpec.yaml`
-- `./outputs/roundtrip/AgentScript.agent`
-- `./outputs/roundtrip/authoring_bundle/` (from S3)
-- `./outputs/roundtrip/testSpec-legacy.yaml`
-- `./outputs/roundtrip/testSpec-ngt.yaml`
-- `./outputs/roundtrip/roundtrip_summary.json` (pass/fail for each stage)
-- `./outputs/roundtrip/logs/` (stdout/stderr for each stage)
+```
+LOCAL ROUND TRIP COMPLETE — NOTHING WAS VALIDATED BY SALESFORCE.
+```
+
+`roundtrip_summary.json` carries `"salesforce_validated": false` and `"org_alias": null`. There is deliberately **no single `"pass"` boolean** in the summary: the previous version wrote `{"pass": true}` while both org stages were skipped, and a downstream reader could not tell the difference between "validated" and "not attempted".
+
+### With an org
+
+```bash
+bash scripts/agentforce_roundtrip.sh --org my-sandbox --out ./outputs/roundtrip
+```
+
+Adds S5. As of the last measured run this **fails**, and that is the current honest state of the repo: the real Agent Script compiler rejects the emitted `.agent` with 24 `CompilationError`s starting at the derived subagent's `instructions` block, while `validate_locally()` reports zero findings on the same file. See [Known defects](../README.md#known-defects).
+
+### Outputs
+
+```
+<out>/roundtrip.agent-spec.json     derived spec (S1)
+<out>/roundtrip.html                HTML blueprint (S1)
+<out>/score.json                    gate verdict, dimensions, blocking issues (S3)
+<out>/agentSpec.yaml                Agentforce spec YAML (S4)
+<out>/sfdx/sfdx-project.json        so `sf agent validate` can resolve the bundle
+<out>/sfdx/force-app/main/default/aiAuthoringBundles/<ApiName>/<ApiName>.agent
+<out>/sfdx/force-app/main/default/aiAuthoringBundles/<ApiName>/<ApiName>.bundle-meta.xml
+<out>/testSpec-legacy.yaml          AiEvaluationDefinition dialect (S4)
+<out>/testSpec-ngt.yaml             AiTestingDefinition dialect (S4)
+<out>/emit_manifest.json            derived names + every emitted path (S4)
+<out>/roundtrip_summary.json        per-stage status, derived names, what was skipped (S6)
+<out>/logs/                         stdout/stderr per stage, plus s5_validate.json
+```
+
+`<ApiName>` is derived, not fixed — it is `naming.topic_api_name("SFVB TEST " + intent)`, e.g. `SFVB_TEST_Update_Case_Status` for the bundled example capture. The `SFVB_TEST_` prefix exists so anything that does reach an org is findable and deletable.
+
+### One name, derived once
+
+The script does not spell a single API name. `scripts/roundtrip_lib.py identity` derives all of them from `naming.py` and refuses to continue unless two linkages hold:
+
+- **agent identity** — bundle API name ≡ `.agent` file stem ≡ `config: developer_name` ≡ test spec `subjectName`
+- **topic identity** — spec YAML `topics[].name` ≡ `subagent <x>:` ≡ router `go_to_<x>` ≡ test spec `expectedTopic`
+
+`naming.names_agree()` is the canonical check for both dialect pairs. This is enforced twice: once on the derived names before anything is written, and again on the written bytes afterwards (`verify_emitted_artifacts`), because the original bug was an emitter being handed one name while the CLI was handed another. `tests/test_roundtrip_lib.py` pins it, including a regression guard that rejects the exact three-name triple this script used to carry.
+
+### In CI
+
+Because S1–S4 and S6 need no org, the whole offline chain runs on every push. The `roundtrip` job runs the script with no `--org` and then hands the summary to `scripts/roundtrip_check.py`, which reads the **summary rather than the exit code** and fails if the run claims validation it skipped or if any artifact names a different agent. S5 is never run in CI — CI has no org, and the job asserts that it is reported as `skipped` rather than assumed to have passed.
 
 ---
 
@@ -422,19 +457,13 @@ pass
 
 **Reality:** When `use_cli=True`, the loop calls `sf agent generate agent-spec --spec <prev>.yaml --role "<refined>"` and writes `<next>.yaml`, but it does NOT parse the new YAML back into a `DerivedAgentSpec`. The loop continues to score and refine based on the original derived spec. The CLI-generated YAML is written to disk but not ingested back into the iteration.
 
-### Nothing Validated Against a Real Org Yet
+### The Emitted `.agent` Does Not Compile
 
 From `agent_script.py` (B2) line 12:
 
 > CRITICAL: This module emits actual code in a grammar owned by Salesforce. The ONLY authoritative reference for Agent Script syntax is: `@salesforce/agents/lib/templates/agentScriptTemplate.js`. Do not invent syntax.
 
-And from `agentforce_roundtrip.sh` (B9) line 238:
-
-```bash
-# Every generated .agent is UNVERIFIED until sf agent validate authoring-bundle says otherwise.
-```
-
-**Reality:** Every generated `.agent` file is UNVERIFIED until `sf agent validate authoring-bundle` (S4) says otherwise. Local structural checks in `agent_script.validate_locally()` catch obvious errors (tabs, unclosed quotes, missing blocks) but are NOT a substitute for CLI validation.
+**Reality (updated — this has now been measured):** validation has run. `sf agent validate authoring-bundle -o AFT3` on an emitted bundle exits 1 with 24 `CompilationError`s, the first being ``Syntax error: unexpected `->` [Ln 108, Col 8]`` in the derived subagent's `instructions` block. `validate_locally()` reports **zero** findings on that same file, so local structural checks are not merely "not a substitute" for CLI validation — they are demonstrably blind to this entire class of error. Reproduce with `bash scripts/agentforce_roundtrip.sh --org <alias>` (S5).
 
 ### Three Emitters Derive Topic API Names Independently (Coupling Risk)
 
@@ -456,7 +485,9 @@ def _to_api_name(text: str) -> str:
     """
 ```
 
-**Reality:** `agentforce_spec.py` (B1), `agent_script.py` (B2), and `eval_spec.py` (B3) each implement their own topic-name normalization function (`_to_api_name()`, `to_snake_case()`, `_to_api_name()`). They MUST agree or the test suite will reference topics that don't exist in the agent. This is a known coupling risk. If these diverge, tests will break silently.
+**Reality (updated — this has been fixed):** the duplication is gone. All three emitters now delegate to `naming.py`: `agentforce_spec._to_api_name` and `eval_spec._to_api_name` are aliases of `naming.topic_api_name`, and `agent_script` imports `topic_api_name` / `subagent_name` / `router_action_name` / `snake_case` directly (`to_snake_case` survives only as a back-compat shim). The docstring above is a historical note.
+
+The *consumer* side is where divergence could still be reintroduced, because a caller can hand different names to different emitters — which is exactly the bug `agentforce_roundtrip.sh` shipped with. `scripts/roundtrip_lib.py` closes that: one `AgentIdentity`, derived once, asserted coherent before emission and re-verified against the written bytes afterwards. See §6.
 
 ---
 
@@ -484,7 +515,7 @@ from sf_video_blueprint.agentforce_spec import build_agent_spec_yaml, write_agen
 from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
 
 data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
-# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S1 for full parser)
+# Parse JSON to DerivedAgentSpec (roundtrip_lib.load_derived_spec is the one parser)
 spec_yaml = build_agent_spec_yaml(
     derived_spec,
     company_name='Acme Corp',
@@ -530,7 +561,7 @@ from sf_video_blueprint.eval_spec import build_legacy_test_spec, write_test_spec
 from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
 
 data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
-# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S5 for full parser)
+# Parse JSON to DerivedAgentSpec (roundtrip_lib.load_derived_spec is the one parser)
 test_spec, derivations = build_legacy_test_spec(
     derived_spec,
     name='CaseUpdater_Tests',
@@ -577,7 +608,7 @@ from sf_video_blueprint.spec_score import score_spec_file
 import json, pathlib
 
 data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
-# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S1 for full parser)
+# Parse JSON to DerivedAgentSpec (roundtrip_lib.load_derived_spec is the one parser)
 
 result = refine(
     derived_spec,
@@ -600,10 +631,13 @@ Outputs: `./outputs/iterations/v1/`, `v2/`, ..., each with `agent-spec.json`, `a
 ### Validate End-to-End (All Stages)
 
 ```bash
-bash scripts/agentforce_roundtrip.sh my-sandbox ./outputs/derived_spec.json ./outputs/roundtrip
+bash scripts/agentforce_roundtrip.sh \
+  --spec ./outputs/derived_spec.json \
+  --org my-sandbox \
+  --out ./outputs/roundtrip
 ```
 
-Runs S1–S6 and reports pass/fail for each stage.
+Runs S1–S6 and reports each stage as `pass`, `FAIL`, or `SKIPPED`. Drop `--org` to run everything except S5 offline; the final line then says explicitly that nothing was validated by Salesforce.
 
 ---
 

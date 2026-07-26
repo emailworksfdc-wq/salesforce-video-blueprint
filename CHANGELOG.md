@@ -28,9 +28,20 @@ While the major version is `0`, the public API may change in any minor release.
   and drives it over real stdio JSON-RPC, asserting over the wire that a spec
   built from mock telemetry is still refused by the score gate.
 - `docs/mcp-install.md` — install and per-harness configuration.
+- `scripts/roundtrip_lib.py` — single source of every name the round trip uses,
+  derived from `naming.py`. Also the single `DerivedAgentSpec` JSON parser, which
+  `agentforce_roundtrip.sh` previously carried three copies of in shell heredocs.
+- `tests/test_roundtrip_lib.py` — 25 tests, including regression guards that
+  reject the exact three-name triple the round-trip script used to carry and an
+  end-to-end check that an offline run refuses to claim org validation.
+- `scripts/roundtrip_check.py` — CI gate that runs the round trip with no org and
+  then reads the *summary* rather than the exit code, asserting that the skipped
+  org stage is reported as skipped and that every artifact still names one agent.
 - A "Use it in your project" README section covering all three consumption modes.
 - CI: a `mcp-server` job, plus a second `pytest` run **without** the `mcp` extra to
   prove the new tests skip rather than fail when the optional dependency is absent.
+- CI: a `roundtrip` job that runs `scripts/agentforce_roundtrip.sh` end to end with
+  no org. It can only be a CI job now that the script's org calls are opt-in.
 
 ### Changed
 
@@ -50,11 +61,24 @@ While the major version is `0`, the public API may change in any minor release.
 
 - `SyntaxWarning: invalid escape sequence '\d'` from two docstrings in
   `selectors.py`, which will become a `SyntaxError` in a future Python.
+- **`scripts/agentforce_roundtrip.sh` referred to three different agent names in a
+  single run** (`test_agent` in the `.agent` config, `RoundtripTestAgent` in the
+  CLI flags, `TestAgent` in both test specs), so the emitted test suite targeted an
+  agent no stage had produced and the round trip could never have completed. Every
+  name is now derived from `naming.py`; the script spells none itself.
+- The same script printed `All executed stages PASSED` and wrote
+  `{"pass": true}` while both org-dependent stages were skipped. Skipped stages are
+  now reported as `SKIPPED`, the summary records `salesforce_validated`, and the
+  single ambiguous `pass` boolean is gone.
+- The script's org stages were controlled by `DRY_RUN=1`, i.e. org calls were the
+  default and required a positional org alias to run at all. It now runs offline by
+  default and org work is opt-in behind `--org <alias>`.
 
 ### Planned
 
-- Validate an emitted bundle with `sf agent validate authoring-bundle` against a
-  dev org. Until this runs, `.agent` grammar correctness is unverified.
+- Fix the `.agent` grammar defect that the first real validation exposed: the
+  derived subagent's `instructions` block emits a bare `->` opener, which the
+  compiler rejects. `validate_locally()` does not catch it.
 - Fix the four ingest defects that allow a capture to be silently truncated
   while still being stamped as real evidence (see `docs/DEFECT_LEDGER.md`).
 - Wire `sf agent test create/run/results` so stage 5 (iterate) exists.
@@ -165,8 +189,10 @@ Carried forward deliberately, not overlooked:
   cross-check is disabled, and a UTF-8 BOM eats the first event.
 - The leak detector inspects only one of the eight field-identity signals the
   recorder captures.
-- `scripts/agentforce_roundtrip.sh` refers to three different agent names in a
-  single run.
+- The emitted `.agent` file does not compile. `sf agent validate
+  authoring-bundle` against a real org rejects the derived subagent's
+  `instructions` block with 24 syntax errors, and `validate_locally()` sees none
+  of them. `scripts/agentforce_roundtrip.sh --org <alias>` reproduces it.
 - Video extraction is a stub: `HeuristicVideoExtractor` never decodes video and
   returns one placeholder step for any input. Use `--capture`.
 - No MCP server exists, despite `docs/mcp-product-spec.md`. *(Added in

@@ -338,7 +338,7 @@ previous version destroys the audit trail that makes the loop meaningful.
 | B6 | `tests/test_agentforce_spec.py` |
 | B7 | `tests/test_agent_script.py` |
 | B8 | `tests/test_eval_spec.py` + `tests/test_spec_score.py` |
-| B9 | `scripts/agentforce_roundtrip.sh` (CLI round-trip: spec -> bundle -> validate) |
+| B9 | `scripts/agentforce_roundtrip.sh` + `scripts/roundtrip_lib.py` (round trip: capture -> derive -> score -> emit -> validate) |
 | B10 | `docs/step6-agentforce-bridge.md` (runbook + the iteration loop) |
 
 ### Orchestrator-only (no agent touches these)
