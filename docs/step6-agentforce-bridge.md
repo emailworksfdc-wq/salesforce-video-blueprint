@@ -405,7 +405,37 @@ From `agent_script.py` (B2) line 19:
 
 **Reality:** Generated `.agent` files contain only routing actions (`go_to_<topic>`) and transitions (`@utils.transition to @subagent.<name>`). No Flow or Apex actions are emitted. If the recording observed a Flow execution (via telemetry), it appears as a prose note in the subagent's instructions, not as a wired action.
 
-A human MUST manually add the `@flow.FlowName` or `@apex.ClassName.methodName` action reference after reviewing the telemetry and confirming the Flow/Apex exists in the target org.
+⚠️ **CORRECTED 2026-07-26 — do not hand-add `@flow.`/`@apex.` to a `.agent` file.**
+This section previously said a human MUST manually add the `@flow.FlowName` or
+`@apex.ClassName.methodName` action reference. **The Agent Script compiler rejects
+both namespaces outright.** Measured against org AFT3 with
+`sf agent validate authoring-bundle --json`, by appending a single `actions:`
+entry to an otherwise-compiling bundle:
+
+```
+@flow.SFVB_TEST_Nonexistent_Flow -> exit 1
+    CompilationError: Cannot invoke '@flow.SFVB_TEST_Nonexistent_Flow' —
+    'flow' is not a valid invocation target.
+@apex.SFVB_TEST_NoClass -> exit 1
+    CompilationError: Cannot invoke '@apex.SFVB_TEST_NoClass' —
+    'apex' is not a valid invocation target.
+```
+
+The invocation namespace is a **closed set**, and unknown namespaces fail
+differently from unknown members of a known namespace:
+
+```
+@nonsense_ns.Foo    -> "'nonsense_ns' is not a valid invocation target."
+@utils.no_such_util -> "'no_such_util' is not defined in utils"
+```
+
+So the failure is not "the Flow doesn't exist yet" — the dialect does not accept
+`flow`/`apex` as invocation targets at all. Wiring a real Flow into an agent is
+therefore **not** an edit to the `.agent` file; it happens through a different
+surface (the metadata/publish path), which this project has not measured. Until
+someone measures it, treat the prose note in the instructions as the end of what
+this project can produce. The emitter's refusal is now guarded by
+`test_emitter_never_uses_a_compiler_rejected_namespace`.
 
 ### expectedActions Is Intentionally Empty
 
@@ -658,7 +688,7 @@ A checklist for reviewers:
 | Guardrails present | `.agent` instructions | Agentforce spec YAML has no guardrail field; they're embedded in topic descriptions and can be lost |
 | No `[NEEDS EVIDENCE` markers | `.agent`, YAML, test specs | Markers indicate `allow_incomplete=True` was used; these are gaps, not finished work |
 | Topic names consistent | YAML, `.agent`, test specs | Three emitters derive names independently; if they diverge, tests reference topics that don't exist |
-| Actions wired | `.agent` subagent actions | No Flow/Apex actions are auto-generated; a human must add `@flow.FlowName` or `@apex.ClassName.methodName` |
+| Actions wired | `.agent` subagent actions | No Flow/Apex actions are auto-generated. **Do not hand-add `@flow.X`/`@apex.X` either — the compiler rejects those namespaces ("not a valid invocation target", measured on AFT3 2026-07-26).** Only `@utils.transition`/`@utils.escalate`/`@subagent.X` compile |
 | Failure paths recorded | Derived spec JSON | If `failure_handling` says "UNTESTED", no failure test cases exist. Record a failing run to observe error paths. |
 | Provenance is real | Derived spec JSON | Check `provenance.extraction_source` and `provenance.telemetry_source`. If either is `stub` or `mock`, the spec is fabricated. |
 | CLI validation passed | S4 output logs | Local structural checks are NOT authoritative. Only `sf agent validate authoring-bundle` confirms grammar correctness. |

@@ -45,11 +45,14 @@ compiles: exit 0, `{"success": true}`, and it then **deployed** to the org as
 (`Update Case (Status)`), one org, one CLI version (`@salesforce/cli 2.143.6`,
 `@salesforce/agents 1.6.6`). The `.agent` **grammar** for a topic-router agent is
 confirmed, as is the 80-character subagent-name limit (measured: 80 passes, 81
-fails with `Too big: expected string to have <=80 characters`). Not validated:
-any spec shape other than the single-topic router, any bundle carrying
-`@apex.*`/`@flow.*` actions (the emitter never emits them), and anything about
-whether the compiled agent *behaves* correctly — compilation is syntax, not
-semantics. No agent has been published.
+fails with `Too big: expected string to have <=80 characters`). Also measured:
+**`@apex.*` and `@flow.*` do not compile at all** — the invocation namespace is a
+closed set, and both are rejected with `'flow' is not a valid invocation target`.
+The emitter's long-standing refusal to fabricate them turns out to be load-bearing,
+not merely cautious. Not validated: any spec shape other than the single-topic
+router, how a real Flow *is* wired to an agent (not through the `.agent` file), and
+anything about whether the compiled agent *behaves* correctly — compilation is
+syntax, not semantics. No agent has been published.
 
 The critical lesson stands regardless: **`validate_locally()` reported zero
 findings on the file Salesforce rejected.** Local validation is this repo's own
@@ -459,12 +462,13 @@ Ordered by what unblocks the most:
    emitted bundle.~~ Done for one case, and it found a real emitter bug on the
    first attempt (see [Status](#status-v010--working-pipeline-output-now-compiles-in-one-measured-case)).
    The grammar for a single-topic router agent is confirmed and the subagent-name
-   cap is measured at 80. What remains speculative: multi-topic specs, bundles
-   with `@apex.*`/`@flow.*` actions, the name limit on the *metadata* path
-   (spec YAML `topics[].name` and `expectedTopic`, which the compiler never sees),
-   and whether a published agent behaves as the spec describes. Validation should
-   also become a step this repo can run itself, rather than a manual CLI
-   invocation alongside it.
+   cap is measured at 80, and `@apex.*`/`@flow.*` are measured as **hard compile
+   errors** rather than merely unverified. What remains speculative: multi-topic
+   specs, how a Flow/Apex action is *actually* attached to an agent (it is not via
+   the `.agent` file), the name limit on the *metadata* path (spec YAML
+   `topics[].name` and `expectedTopic`, which the compiler never sees), and whether
+   a published agent behaves as the spec describes. Validation should also become a
+   step this repo can run itself, rather than a manual CLI invocation alongside it.
 2. **Fix the ingest losses** (the first four rows above) so a capture cannot be
    silently truncated while still being stamped as real evidence.
 3. **Close stage 5.** Wire `sf agent test create/run/results` so a spec can
