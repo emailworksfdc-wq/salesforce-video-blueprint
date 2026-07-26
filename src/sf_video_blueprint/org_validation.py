@@ -5,7 +5,7 @@ shell prompt. Nothing in the codebase called the compiler, so no code path could
 answer the only question that matters about an emitted bundle: does Salesforce
 accept it? :func:`agent_script.validate_locally` is this project's own opinion
 about its own output, and it was measurably wrong once already — it reported zero
-findings on a file the compiler rejected with 13 ``CompilationError``s.
+findings on a file the compiler rejected with 24 ``CompilationError``s.
 
 This module is the call site for the real verdict.
 
