@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -100,17 +101,14 @@ Two things to carry into how you report results:
    the expected outcome, not a failure to work around. Do not describe such a spec
    as validated, verified, or production-ready.
 
-2. `locallyValid: true` means the bundle passed this project's own structural
-   checks, not Salesforce's. Treat the two as independent: on 2026-07-26 a bundle
-   from this project was validated against a real org for the first time, and the
-   Salesforce compiler rejected it with 24 errors in the derived `reasoning:`
-   block while `validate_locally` reported zero findings on that same file. That
-   emitter bug is fixed and the same bundle now compiles, but the lesson holds —
-   local validation was measurably blind to a whole error class. Always tell the
-   user to run `sf agent validate authoring-bundle` before trusting a bundle. It
-   is the only authority, it needs no deploy, and here it disagreed. Note also
-   that compiling proves syntax only: no agent has been published and nothing has
-   checked whether a compiled agent behaves as its spec describes.
+2. `locallyValid: true` means a bundle passed this project's own structural
+   checks, not Salesforce's — and those checks were measurably wrong once, on a
+   file the compiler rejected with 24 errors while `validate_locally` reported
+   zero findings on it. Salesforce's verdict comes only from `emit_agent_bundle`
+   with an `org_alias`, reported under `orgValidation`. Treat
+   `outcome: "skipped"` as "not asked", never as a pass. Note also that compiling
+   proves syntax only: no agent has been published and nothing has checked
+   whether a compiled agent behaves as its spec describes.
 
 When a spec scores low, the fix is to capture better evidence — a recording that
 exercises a failure path, or a live-mode run with real telemetry. Never suggest
@@ -255,9 +253,13 @@ def health() -> dict[str, Any]:
             "preview_api_names",
         ],
         capabilities={
-            "offline": True,
+            # Offline by default. `emit_agent_bundle` contacts an org only when
+            # given an org_alias, and even then it compiles rather than deploys:
+            # the file's contents are POSTed to the compile endpoint and no
+            # metadata is created. Every other tool is offline unconditionally.
+            "offline": "by default; emit_agent_bundle(org_alias=...) compiles against an org",
             "readOnly": True,
-            "contactsSalesforceOrg": False,
+            "contactsSalesforceOrg": "only when emit_agent_bundle is given an org_alias",
             "launchesBrowser": False,
             "telemetry": "mock-only — collecting real telemetry needs a live org",
         },
@@ -272,8 +274,10 @@ def health() -> dict[str, Any]:
                 "SFVB_TEST_Case_Triage, exit 0), for one intent shape on one org "
                 "and CLI version. It passed only after an emitter fix: the "
                 "compiler rejected the pre-fix bundle with 24 CompilationErrors. "
-                "Any other spec shape is unvalidated — run the CLI, it needs no "
-                "deploy."
+                "Any other spec shape is unvalidated. A bundle is only known "
+                "to compile when emit_agent_bundle is called with an org_alias "
+                "and reports orgValidation.compiled true; without one, nothing "
+                "here has Salesforce's verdict. Run the CLI — it needs no deploy."
             ),
             (
                 "`locallyValid: true` is not org validation. validate_locally() "
@@ -515,21 +519,27 @@ def emit_agent_bundle(
     developer_name: str,
     agent_label: str,
     output_dir: str | None = None,
+    org_alias: str | None = None,
 ) -> dict[str, Any]:
     """Emit an Agentforce Agent Script (.agent) bundle from a recorded process.
 
     Produces the .agent source and its .bundle-meta.xml, plus the findings from
     local validation. The emitted agent is deliberately a topic router with no
-    @apex.* or @flow.* actions: referencing an action that may not exist in the
-    target org yields a bundle that fails to deploy for reasons the operator
-    cannot see.
+    @apex.* or @flow.* actions: those namespaces do not exist. The compiler
+    rejects `@apex.Foo` with "'apex' is not a valid invocation target" — Apex and
+    Flow are reached through a subagent-level `actions:` block whose `target:` is
+    `apex://Cls` or `flow://Name`.
+
+    Pass `org_alias` to have Salesforce itself compile the bundle via
+    `sf agent validate authoring-bundle`. Without it, `orgValidation.outcome` is
+    `skipped`, which is never reported as a pass.
 
     IMPORTANT: local validation is this project's own opinion, not Salesforce's.
     Measured on 2026-07-26: the Salesforce compiler rejected an emitted bundle with
     24 errors in the derived `reasoning:` block while `validate_locally` reported
     zero findings on that same file. That bug is fixed, but the independence is the
-    point — a clean local pass is not evidence. Validate with the Salesforce CLI
-    before trusting the result; it needs no deploy.
+    point — a clean local pass is not evidence. Compile with `org_alias` (or the
+    CLI directly) before trusting the result; it needs no deploy.
 
     Args:
         capture_path: Path to a dom_capture.jsonl trace.
@@ -537,6 +547,8 @@ def emit_agent_bundle(
         agent_label: Human-readable label, e.g. `Case Triage Agent`.
         output_dir: Optional directory to write the bundle into. Returned inline
             when omitted.
+        org_alias: Optional org alias to compile against. Read-only: the command
+            POSTs the file to the compile endpoint and deploys nothing.
     """
     request_id = uuid4().hex[:12]
     started = time.monotonic()
@@ -545,6 +557,20 @@ def emit_agent_bundle(
     path = _resolve(capture_path)
     if not path.is_file():
         return _err(tool, request_id, started, ERROR_NOT_FOUND, f"No file at {path}")
+
+    # Refused here, before the pipeline runs, so an out-of-scope alias cannot
+    # reach the network by any path through this tool.
+    from .org_validation import org_is_forbidden
+
+    if org_alias and org_is_forbidden(org_alias):
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"Org alias {org_alias!r} is out of scope for this project and was refused.",
+            remedy="Use a Developer Edition or sandbox org you own.",
+        )
 
     try:
         result = run_pipeline(path, org_url="https://example.my.salesforce.com")
@@ -597,6 +623,44 @@ def emit_agent_bundle(
                 tool, request_id, started, ERROR_DEPENDENCY, f"Could not write bundle: {exc}"
             )
 
+    # Ask Salesforce. Uses a throwaway project under the system temp dir because
+    # the command requires a project root and resolves the bundle by API name.
+    from .org_validation import CompileOutcome, validate_bundle_with_org
+
+    with tempfile.TemporaryDirectory(prefix="sfvb-validate-") as scratch:
+        compile_result = validate_bundle_with_org(
+            script,
+            developer_name=developer_name,
+            org_alias=org_alias,
+            project_dir=Path(scratch),
+        )
+
+    org_validation = {
+        "outcome": compile_result.outcome.value,
+        "compiled": compile_result.compiled,
+        "detail": compile_result.detail,
+        "errors": list(compile_result.errors),
+        "command": compile_result.command or None,
+    }
+
+    if compile_result.outcome is CompileOutcome.COMPILED:
+        next_step = (
+            "Salesforce compiled this bundle (exit 0, success true). Compilation is "
+            "syntax only — nothing here shows the agent behaves correctly."
+        )
+    elif compile_result.outcome is CompileOutcome.REJECTED:
+        next_step = (
+            "Salesforce REJECTED this bundle. Fix the emitter against the verbatim "
+            "errors in orgValidation.errors; do not hand-edit the output."
+        )
+    else:
+        next_step = (
+            "Salesforce was not asked whether this compiles "
+            f"({compile_result.outcome.value}). `locallyValid` is this project's own "
+            "opinion and has been wrong before. Re-run with org_alias set, or run "
+            "`sf agent validate authoring-bundle` yourself."
+        )
+
     return _ok(
         tool,
         request_id,
@@ -607,16 +671,10 @@ def emit_agent_bundle(
         bundleMetaXml=meta,
         localValidationFindings=list(findings),
         locallyValid=not findings,
+        orgValidation=org_validation,
         writtenTo=written or None,
         provenance=dict(result.provenance),
-        nextStep=(
-            "Validate with the Salesforce CLI before trusting this: "
-            "`sf agent validate authoring-bundle`. It resolves the bundle from the "
-            "local SFDX project and compiles the file content server-side, so no "
-            "deploy is needed and nothing in the org is mutated. The one time it "
-            "was run against this project (2026-07-26) it caught a real emitter "
-            "bug that local validation missed entirely — so run it, do not assume."
-        ),
+        nextStep=next_step,
     )
 
 

@@ -334,11 +334,12 @@ including where the gaps are. It is self-contained; no server needed.
 | `spec_score.py` | The falsifiable quality gate (7 weighted dimensions, threshold 75) |
 | `naming.py` | Single source of truth for API names across every artifact |
 | `agent_script.py` | `.agent` (Agent Script) + `.bundle-meta.xml` emitters |
+| `org_validation.py` | Calls Salesforce's Agent Script compiler; skips cleanly with no org |
 | `agentforce_spec.py` | Agentforce agent-spec YAML emitter |
 | `eval_spec.py` | `AiEvaluationDefinition` / `AiTestingDefinition` test-spec emitters |
 | `iterate.py` | Versioned offline refinement loop |
 | `pipeline.py` | Shared in-process API (`run_pipeline`) the CLI, library, and MCP server all call |
-| `mcp_server.py` | MCP server (`sf-blueprint-mcp`) — 7 offline, read-only tools over stdio |
+| `mcp_server.py` | MCP server (`sf-blueprint-mcp`) — 7 read-only tools over stdio; offline unless `emit_agent_bundle` is given an `org_alias` |
 | `redaction.py` | Secret/PII redaction primitives (**no production callers yet**) |
 | `markers.py` | Provenance vocabulary — which sources count as real evidence |
 
@@ -467,13 +468,21 @@ Ordered by what unblocks the most:
    specs, how a Flow/Apex action is *actually* attached to an agent (it is not via
    the `.agent` file), the name limit on the *metadata* path (spec YAML
    `topics[].name` and `expectedTopic`, which the compiler never sees), and whether
-   a published agent behaves as the spec describes. Validation should also become a
-   step this repo can run itself, rather than a manual CLI invocation alongside it.
+   a published agent behaves as the spec describes. ~~Validation should also become
+   a step this repo can run itself, rather than a manual CLI invocation alongside
+   it.~~ Done: `org_validation.py` invokes the compiler, and `emit_agent_bundle`
+   calls it when given an `org_alias`. Also measured while wiring it: the action
+   `target:` scheme is one of 24 the compiler enumerates, scheme casing is **not**
+   enforced (`apexrest://` and `APEX://` both compile), and `@variables.*` /
+   `@outputs.*` are **not** valid invocation namespaces — only `actions`, `utils`,
+   `subagent` and `topic` are.
 2. **Fix the ingest losses** (the first four rows above) so a capture cannot be
    silently truncated while still being stamped as real evidence.
 3. **Close stage 5.** Wire `sf agent test create/run/results` so a spec can
    actually be run, scored against org behaviour, and improved.
-4. **Give stage 6 a call site.** The emitters work; nothing calls them.
+4. **Give stage 6 a call site.** Partly done: `emit_agent_bundle` now emits *and*
+   compiler-validates through `org_validation.py`. The `sf-blueprint` CLI still has
+   no emit command, so the only call site is the MCP server.
 5. **Call `redaction.py` from the pipeline** before any real recording is made.
 6. **Make correlation causal** by threading request/transaction IDs from the UI
    through to backend logs.
