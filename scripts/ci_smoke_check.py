@@ -70,10 +70,13 @@ def main() -> int:
 
     # --- Contract 2: the gate refuses mock telemetry -------------------------
     result = score_spec_file(spec_path)
-    print(
-        f"score: {result.total}/{result.max_total}  band={result.band}  "
-        f"passed={result.passed}  (threshold {PASS_THRESHOLD})"
-    )
+    # `display_total` rather than `total` on purpose. This script's whole point is
+    # that a mock-telemetry run must not look successful, and the raw sum on the CI
+    # example is 85 — a number that reads as "nearly passing" three lines above the
+    # BLOCKED line that says the opposite. `display_total` is capped into the low
+    # band whenever a blocker is present; `summary()` appends the raw total so
+    # nothing is hidden from someone comparing refinement rounds.
+    print(f"score: {result.summary()}")
     for name, dimension in result.dimensions.items():
         print(f"  {name:24} {dimension.score:>3}/{dimension.max_score}")
     for issue in result.blocking_issues:
