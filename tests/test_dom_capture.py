@@ -1365,3 +1365,188 @@ def test_deeply_nested_frame_path_does_not_crash(tmp_path: Path) -> None:
 
     assert len(trace.events) == 1
     assert len(trace.events[0].frame_path) == 20
+
+
+# ============================================================================
+# 12. DEFECT L4-1 — role/name were REQUIRED, so real DOM events were dropped
+# ============================================================================
+#
+# `RawRoleName` declared `role: str` and `name: str`, both mandatory. The
+# recorder this project ships does not honour that contract:
+#
+#   capture/recorder.js:161   return { role, name: null };
+#
+# is the terminal branch of `getRoleAndName` — an element with no aria-label,
+# no aria-labelledby, no text, no title and no alt gets `name: null`. And
+# `role` is `explicitRole || implicitRole` (recorder.js:136), which is `null`
+# for any tag outside the implicit-role map — `div` and `span`, i.e. most of
+# Lightning. So the parser rejected its own recorder's documented output and
+# the event vanished into `skipped_lines`.
+
+
+def _role_name_event(seq: int, role_name: object) -> dict:
+    """A minimal, otherwise-valid click event carrying the given role_name."""
+    return {
+        "v": 1,
+        "seq": seq,
+        "t": 1774000000000 + seq,
+        "type": "click",
+        "url": "https://test.my.salesforce.com/lightning/o/Case/list",
+        "frame_path": [],
+        "selectors": {
+            "test_id": None,
+            "aria": None,
+            "role_name": role_name,
+            "label_for": None,
+            "sf_field": None,
+            "css_path": "button.slds-x",
+            "text": "New",
+            "xpath": None,
+        },
+        "element": {"tag": "button", "classes": [], "shadow_depth": 0, "text": "New"},
+        "value": None,
+        "value_redacted": False,
+        "sf": {},
+        "_ingest_seq": seq,
+    }
+
+
+def test_role_without_accessible_name_is_not_dropped(tmp_path: Path) -> None:
+    """DEFECT L4-1: an icon-only button yields {role: "button", name: null}.
+
+    That is `capture/recorder.js:161` verbatim. Before the fix this event was
+    rejected with "selectors.role_name.name / Input should be a valid string"
+    and silently discarded.
+    """
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        json.dumps(_role_name_event(1, {"role": "button", "name": None})) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.skipped_lines == [], f"legitimate event was dropped: {trace.skipped_lines}"
+    assert len(trace.events) == 1
+    assert trace.events[0].selectors.role_name is not None
+    assert trace.events[0].selectors.role_name.role == "button"
+    assert trace.events[0].selectors.role_name.name is None
+
+
+def test_accessible_name_without_role_is_not_dropped(tmp_path: Path) -> None:
+    """DEFECT L4-1: a `div` with text yields {role: null, name: "Save"}.
+
+    `role` is `explicitRole || implicitRole` and `div` is not in the recorder's
+    implicit-role map, so `role` is null for most Lightning markup.
+    """
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        json.dumps(_role_name_event(1, {"role": None, "name": "Save"})) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.skipped_lines == [], f"legitimate event was dropped: {trace.skipped_lines}"
+    assert len(trace.events) == 1
+    assert trace.events[0].selectors.role_name.role is None
+    assert trace.events[0].selectors.role_name.name == "Save"
+
+
+def test_role_name_both_absent_is_not_dropped(tmp_path: Path) -> None:
+    """DEFECT L4-1: a bare `<span>` click yields {role: null, name: null}.
+
+    The event still carries a css_path and a text selector, so it is useful
+    evidence. Dropping the whole event because one of eight selector
+    strategies is empty is the data loss this lane exists to stop.
+    """
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        json.dumps(_role_name_event(1, {"role": None, "name": None})) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.skipped_lines == [], f"legitimate event was dropped: {trace.skipped_lines}"
+    assert len(trace.events) == 1
+    assert trace.events[0].selectors.css_path == "button.slds-x"
+
+
+def test_real_dom_shaped_capture_loses_no_events(tmp_path: Path) -> None:
+    """DEFECT L4-1, end to end: four events in the recorder's real output
+    shapes must produce four events, not one.
+
+    Measured before the fix: 4 lines in, 1 event out, 3 skipped, and
+    `validate_trace` reported 75% DATA LOSS on a capture in which every line
+    was legitimate.
+    """
+    rows = [
+        _role_name_event(1, {"role": "button", "name": "New"}),
+        _role_name_event(2, {"role": "button", "name": None}),
+        _role_name_event(3, {"role": None, "name": "Save"}),
+        _role_name_event(4, {"role": None, "name": None}),
+    ]
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 4, f"skipped: {trace.skipped_lines}"
+    assert trace.skipped_lines == []
+    assert not [f for f in validate_trace(trace) if f.startswith("DATA LOSS:")]
+
+
+def test_role_name_still_rejects_wrong_types(tmp_path: Path) -> None:
+    """The fix must loosen NULLABILITY, not TYPE.
+
+    Making the fields optional must not turn the model into a dict sponge.
+    A role that is a number, a list, or a nested object is malformed recorder
+    output and must still land in skipped_lines — the point of defect L4-1 is
+    to stop dropping *legitimate* events, not to start accepting garbage.
+    """
+    garbage = [
+        {"role": 123, "name": "Save"},
+        {"role": ["button"], "name": "Save"},
+        {"role": {"nested": "object"}, "name": "Save"},
+        {"role": "button", "name": 4.5},
+    ]
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        "\n".join(json.dumps(_role_name_event(i + 1, g)) for i, g in enumerate(garbage))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert trace.events == [], "malformed role_name types must not be accepted"
+    assert len(trace.skipped_lines) == 4
+
+
+def test_role_name_optional_fields_produce_no_role_selector() -> None:
+    """Downstream contract: a role_name with no role must yield no role
+    selector, rather than an unusable `role=None[...]` string.
+
+    This is the validation the required-fields constraint was really buying.
+    It belongs in the selector builder, which already handles it — so the
+    parser does not need to drop the event to protect this invariant.
+    """
+    from sf_video_blueprint.selectors import rank_selectors
+
+    trace = synthesize_trace([
+        {
+            "selectors": {
+                "role_name": {"role": None, "name": "Save"},
+                "css_path": "button.slds-x",
+            }
+        }
+    ])
+    ranked = rank_selectors(trace.events[0].selectors)
+
+    assert all(r.kind != "role_name" for r in ranked), (
+        f"a role_name without a role must not produce a role selector: {ranked}"
+    )
+    assert any(r.kind == "css" for r in ranked), "the css fallback must survive"
