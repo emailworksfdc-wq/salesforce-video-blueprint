@@ -123,9 +123,10 @@ class TelemetryRegistry:
         directly into entity evidence details — and from there into the spec JSON
         and the HTML report.
 
-        Scrubbing here rather than at each write site because this is the single
-        funnel: `cli.py` and `pipeline.py` both collect exclusively through this
-        method, and nothing else in the tree appends to `.events` or `.snapshots`.
+        Scrubbing here rather than at each write site because this is where org
+        data enters the registry: `cli.py` and `pipeline.py` both collect
+        exclusively through this method. `append_manual_event` is the other way in,
+        and it scrubs too — see there.
 
         Uses `pipeline_policy()`, so record ids, field API names, and numeric
         values are retained — see that function for why redacting them would
@@ -154,6 +155,19 @@ class TelemetryRegistry:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        """Append a caller-supplied event, scrubbed on the same terms as `collect_step`.
+
+        No in-tree caller uses this today, but it is public and it appends straight
+        to `self.events`, so without this pass it is a hole in the choke point: a
+        payload handed in here would reach the spec and the report unredacted while
+        collected telemetry was clean. Redacting both entry points means the
+        guarantee is "everything in this registry has been scrubbed" rather than
+        "everything that happened to arrive by the expected route".
+        """
+        scrubbed = payload or {}
+        if scrubbed:
+            scrubbed, _ = redact_mapping(scrubbed, pipeline_policy())
+
         self.events.append(
             TelemetryEvent(
                 correlation=CorrelationKey(
@@ -164,7 +178,7 @@ class TelemetryRegistry:
                 layer=layer,
                 event_name=event_name,
                 status=status,
-                payload=payload or {},
+                payload=scrubbed,
             )
         )
 
