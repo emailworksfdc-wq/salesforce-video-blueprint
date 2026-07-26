@@ -224,7 +224,10 @@ def run_pipeline(
         telemetry_source = _resolve_telemetry_source(registry)
 
     analyses = correlate_all(
-        extraction.actions, replay_events, registry.events, registry.snapshots
+        _actions_on_wall_clock(extraction.actions, extraction.evidence),
+        replay_events,
+        registry.events,
+        registry.snapshots,
     )
 
     spec = build_agent_spec(extraction.actions, analyses)
@@ -249,6 +252,56 @@ def run_pipeline(
     )
 
 
+def _actions_on_wall_clock(actions: list[Any], evidence: list[Any]) -> list[Any]:
+    """Restate action timestamps as absolute epoch ms, for correlation only.
+
+    Two modules disagree about what `ExtractedAction.timestamp_ms` means, and each
+    has passing tests asserting its own reading:
+
+    - `dom_extractor` sets `event.t - base_time` and
+      `tests/test_dom_extractor.py::test_timestamp_ms_relative_to_first_event`
+      states the contract as "relative to the first event (starts at 0)". The model
+      agrees: `timestamp_ms: int = Field(ge=0)`.
+    - `correlation` reads it as absolute epoch ms:
+      `datetime.fromtimestamp(step.timestamp_ms / 1000.0, tz=timezone.utc)`.
+
+    Under the relative reading a capture's first action is at 1970-01-01, so no
+    real org timestamp can ever fall inside its `[T, T+5s]` window. Temporal
+    correlation has therefore never matched a real observation. It went unnoticed
+    because `MockTelemetryCollector` stamps `datetime.now()` and the step_id it was
+    handed, so it always correlated via the caller-asserted step_id instead — as
+    ASSERTED, with the "clock skew suspected" note reporting 1,785,100,742s of
+    skew. The tautological join was masking the broken clock, and real telemetry,
+    which carries no step_id, has nothing to fall back on.
+
+    Neither module is lane 05's to change (see ORCHESTRATOR-BULLETIN-02), and
+    picking a winner unilaterally would break whichever suite asserts the other
+    reading. So the frame is corrected here, at the join site, where the conflict
+    actually bites: `EvidenceArtifact.captured_at` already carries each action's
+    absolute wall-clock instant, so no new information is needed and nothing is
+    inferred. The actions handed to `build_agent_spec` are the originals — only
+    correlation's copies are restated.
+
+    The contract conflict is written up in `_shared/findings/lane-05.md` for
+    adjudication; this is a local correction, not a resolution.
+    """
+    captured_at = {artifact.artifact_id: artifact.captured_at for artifact in evidence}
+
+    restated: list[Any] = []
+    for action in actions:
+        instant = next(
+            (captured_at[eid] for eid in action.evidence_ids if eid in captured_at),
+            None,
+        )
+        if instant is None:
+            restated.append(action)
+            continue
+        restated.append(
+            action.model_copy(update={"timestamp_ms": int(instant.timestamp() * 1000)})
+        )
+    return restated
+
+
 def _collect_mock_telemetry(actions: list[Any], run_id: str) -> TelemetryRegistry:
     """Populate a telemetry registry with fabricated data for each step.
 
@@ -261,8 +314,37 @@ def _collect_mock_telemetry(actions: list[Any], run_id: str) -> TelemetryRegistr
 def _collect_telemetry(
     collector: Any, actions: list[Any], run_id: str
 ) -> TelemetryRegistry:
-    """Drive any `TelemetryCollector` over every extracted action."""
+    """Drive a `TelemetryCollector`, per-run when it can be and per-step otherwise.
+
+    `TelemetryCollector` is a per-step interface, which suits a collector that
+    fabricates a fresh event on demand: ask it 9 times, get 9 distinct events. An
+    org is not like that. What happened in the org happened once, and asking
+    "what did you see for step 4?" has no answer a history table can give — the
+    rows carry no step_id. A collector reading real telemetry can only return the
+    same observation window every time it is asked.
+
+    Driving such a collector once per action therefore multiplies each real row by
+    the step count. That is not merely wasteful, it corrupts the evidence: with one
+    genuine `Case.Status` change and 9 actions, correlation saw 9 identical
+    snapshots, found several in every step's window, and demoted every one of them
+    to AMBIGUOUS ("multiple snapshots of Case:500... in window"). One real,
+    unambiguous change was reported as an ambiguous mess, and `spec_builder` scored
+    the observed field as `inference` rather than `data-delta`.
+
+    So collectors that expose a run-scoped `observe(run_id)` are called exactly
+    once, and correlation does the step attribution temporally — which is the only
+    honest direction for that inference to run. Per-step collectors keep the old
+    path unchanged.
+    """
     registry = TelemetryRegistry()
+
+    observe = getattr(collector, "observe", None)
+    if callable(observe):
+        result = observe(run_id)
+        registry.events.extend(result.events)
+        registry.snapshots.extend(result.snapshots)
+        return registry
+
     for action in actions:
         registry.collect_step(collector, run_id, action.step_id)
     return registry
