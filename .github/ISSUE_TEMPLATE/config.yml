@@ -1,0 +1,10 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/security/advisories/new
+    about: >
+      Report privately — never in a public issue — anything that could expose org
+      data, credentials, tokens, or PII.
+  - name: Known defects
+    url: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/blob/main/docs/DEFECT_LEDGER.md
+    about: Check the honest defect ledger before filing; it may already be listed.

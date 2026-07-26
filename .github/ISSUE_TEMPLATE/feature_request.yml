@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose a capability, or close one of the known gaps
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The README status table and `CHANGELOG.md` roadmap already name the
+        largest gaps (stage 5 does not exist, stage 6 has no call site, nothing
+        has been org-validated). If your idea is one of those, say so — it helps
+        to know someone wants it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: Describe the situation you're stuck in, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Optional. If you have a design in mind, sketch it.
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Which stage would this affect
+      options:
+        - "1 · Record"
+        - "2 · Ingest"
+        - "3 · Extract / Derive"
+        - "4 · Score"
+        - "5 · Iterate (currently absent)"
+        - "6 · Emit / Deploy"
+        - "Cross-cutting (docs, CI, tooling)"
+        - "New capability, none of the above"
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How would this stay grounded in evidence?
+      description: |
+        This project's core rule is that a spec must only claim what a recording
+        proved. If your proposal would derive, infer, or default any value, explain
+        how it avoids asserting something unobserved — or say "not applicable".
+      placeholder: |
+        e.g. "Only emits an @flow.X reference when the flow's API name was
+        observed in FlowInterview telemetry for that step; otherwise stays
+        silent."
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Confirmations
+      options:
+        - label: This does not require weakening a quality gate to be useful
+          required: true

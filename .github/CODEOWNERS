@@ -1,0 +1,18 @@
+# Code owners are requested for review automatically on every PR.
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+* @emailworksfdc-wq
+
+# Security- and honesty-critical surfaces. These deserve an explicit second look
+# even when the rest of a PR is routine, because a weakening change here is easy
+# to miss in review and hard to detect afterwards.
+
+/src/sf_video_blueprint/spec_score.py    @emailworksfdc-wq
+/src/sf_video_blueprint/markers.py       @emailworksfdc-wq
+/src/sf_video_blueprint/redaction.py     @emailworksfdc-wq
+/src/sf_video_blueprint/replay_browser.py @emailworksfdc-wq
+/src/sf_video_blueprint/telemetry.py     @emailworksfdc-wq
+/scripts/score_run.py                    @emailworksfdc-wq
+/scripts/ci_smoke_check.py               @emailworksfdc-wq
+/tests/test_gaming_resistance.py         @emailworksfdc-wq
+/.github/                                @emailworksfdc-wq

@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref — a stale result is noise.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: nothing here needs write access.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor: the code uses PEP 604 unions evaluated at runtime.
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run tests
+        # The suite is hermetic: no org, no network, no credentials.
+        run: python -m pytest -q --durations=10
+
+  pipeline-smoke:
+    name: end-to-end smoke (no org)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run the pipeline on the example capture
+        run: |
+          python -m sf_video_blueprint.cli \
+            --capture examples/case_triage.dom_capture.jsonl \
+            --org-url "https://example-dev.develop.my.salesforce.com" \
+            --output-path outputs/ci_smoke.html
+
+      - name: Check the pipeline contract
+        # Asserts the spec was derived, provenance says "mock" (CI has no org),
+        # and the score gate REFUSES a mock-telemetry run. See the script's
+        # docstring for why each property matters.
+        run: python scripts/ci_smoke_check.py outputs/ci_smoke.agent-spec.json
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-smoke-output
+          path: outputs/
+          retention-days: 7
+
+  lint:
+    name: ruff (advisory)
+    runs-on: ubuntu-latest
+    # Advisory only: the existing code has not been linted end to end, and a red
+    # badge from pre-existing style would train people to ignore CI. Tighten to
+    # blocking once the backlog is clear.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check src/ tests/ scripts/ capture/ --output-format=github

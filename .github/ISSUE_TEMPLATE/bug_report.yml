@@ -1,0 +1,98 @@
+name: Bug report
+description: Something behaves incorrectly, or the pipeline claims more than the evidence supports
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you file:** please check
+        [`docs/DEFECT_LEDGER.md`](../blob/main/docs/DEFECT_LEDGER.md) — this
+        project keeps an honest list of what is already known to be broken.
+
+        > ⚠️ **Do not attach a real capture file.** Captures embed record IDs,
+        > field values, and potentially PII from your org. Reduce to a synthetic
+        > minimum first — see `examples/case_triage.dom_capture.jsonl` for the
+        > shape.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The exact command, plus the smallest **synthetic** capture that triggers
+        it. Redact org URLs to `https://example-dev.develop.my.salesforce.com`.
+      placeholder: |
+        1. python -m sf_video_blueprint.cli --capture <trace> --org-url <url>
+        2. ...
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Which stage
+      description: Best guess is fine.
+      options:
+        - "1 · Record (capture/recorder.js, capture/inject.py)"
+        - "2 · Ingest (dom_capture.py)"
+        - "3 · Extract / Derive (dom_extractor.py, spec_builder.py, correlation.py)"
+        - "4 · Score (spec_score.py, scripts/score_run.py)"
+        - "5 · Iterate (iterate.py)"
+        - "6 · Emit / Deploy (agent_script.py, agentforce_spec.py, eval_spec.py)"
+        - "Replay (replay_browser.py)"
+        - "Telemetry (telemetry.py, salesforce_collectors.py)"
+        - "Reporting (html_report.py)"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python -V` (must be 3.11+)
+      placeholder: "3.13.14"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Traceback, warnings, or the score breakdown. **Redact any token, session ID, or org URL.**
+      render: shell
+
+  - type: checkboxes
+    id: severity
+    attributes:
+      label: Does this involve either of these?
+      description: These two categories are treated as higher priority than ordinary bugs.
+      options:
+        - label: "**Silent data loss** — the pipeline discarded input without saying so"
+        - label: "**Overclaiming** — a spec asserts something the recording did not prove, or a stub run was stamped as real evidence"
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Confirmations
+      options:
+        - label: I checked `docs/DEFECT_LEDGER.md` and this is not already listed
+          required: true
+        - label: I attached no real capture data, and redacted all tokens, session IDs, record IDs, and org URLs
+          required: true

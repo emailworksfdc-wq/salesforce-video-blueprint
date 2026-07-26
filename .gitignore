@@ -19,6 +19,31 @@ env/
 outputs/
 inputs/
 
+# Capture files and derived artifacts outside declared directories (may contain recorded field values)
+# Tracked JSONL fixtures under tests/ are allowed; stray captures are not.
+# examples/ holds SYNTHETIC captures only — fabricated IDs and values, safe to
+# publish. Never move a real capture there.
+/*.jsonl
+/**/*.jsonl
+!tests/**/*.jsonl
+!examples/*.jsonl
+
+# HTML reports outside outputs/ (may embed real record IDs and field values).
+# docs/ is hand-authored documentation, not generated output — allowed.
+/*.html
+/**/*.html
+!docs/**/*.html
+
+# Agent bundles and spec YAML outside outputs/ (derived artifacts that should be in outputs/)
+/*.agent
+/**/*.agent
+/*.yaml
+/**/*.yaml
+# But allow committed config and workflow YAML:
+!pyproject.toml
+!.github/**/*.yml
+!.github/**/*.yaml
+
 # Secrets / local config
 .env
 .env.*
