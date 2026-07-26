@@ -57,6 +57,7 @@ from sf_video_blueprint.eval_spec import (
 )
 from sf_video_blueprint.naming import (
     names_agree,
+    prefixed_api_name,
     router_action_name,
     snake_case,
     subagent_name,
@@ -155,7 +156,13 @@ def derive_identity(intent: str, *, prefix: str = ORG_ARTIFACT_PREFIX) -> AgentI
     if not intent or not intent.strip():
         raise RoundtripError("derived spec has no intent; nothing can be named from it")
 
-    agent_api_name = topic_api_name(f"{prefix} {intent}" if prefix else intent)
+    # `prefixed_api_name` rather than `topic_api_name(f"{prefix} {intent}")`: the
+    # latter makes the prefix compete with the intent for the same length budget
+    # and win, so a long or word-less intent derives the bare name `SFVB_TEST` and
+    # two unrelated recordings collide on one agent. Measured before the fix:
+    # both `"A" * 90` and `"!!!"` produced `SFVB_TEST` — and `assert_coherent`
+    # passed, because every dialect agreed on a name identifying no recording.
+    agent_api_name = prefixed_api_name(prefix, intent) if prefix else topic_api_name(intent)
     topic_name = topic_api_name(intent)
 
     identity = AgentIdentity(

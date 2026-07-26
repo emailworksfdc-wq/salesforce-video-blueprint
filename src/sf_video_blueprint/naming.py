@@ -147,16 +147,20 @@ def tokenize(raw: str) -> list[str]:
     return tokens
 
 
-def _truncate_tokens(tokens: list[str], joiner: str) -> list[str]:
+def _truncate_tokens(tokens: list[str], joiner: str, limit: int = MAX_NAME_LENGTH) -> list[str]:
     """Drop trailing tokens until the joined name fits, keeping at least one.
 
     Truncating on a token boundary rather than mid-word keeps the name readable
     and keeps the two dialects in agreement, since both truncate the same list.
+
+    ``limit`` defaults to `MAX_NAME_LENGTH`. :func:`prefixed_api_name` lowers it,
+    because a fixed prefix has to fit inside the same cap as the tokens it
+    precedes.
     """
     kept: list[str] = []
     for token in tokens:
         candidate = kept + [token]
-        if len(joiner.join(candidate)) > MAX_NAME_LENGTH:
+        if len(joiner.join(candidate)) > limit:
             # Stop before exceeding the cap. On the very first token this leaves
             # `kept` empty, which the hard-cut below handles — an earlier version
             # guarded this branch with `if kept and ...`, which skipped the check
@@ -167,7 +171,7 @@ def _truncate_tokens(tokens: list[str], joiner: str) -> list[str]:
     if not kept:
         # A single token longer than the cap: hard-cut it. Rare, but a truncated
         # name is more useful than an exception here.
-        return [tokens[0][:MAX_NAME_LENGTH]]
+        return [tokens[0][:limit]]
     return kept
 
 
@@ -363,3 +367,54 @@ def names_agree(topic_name: str, subagent: str) -> bool:
     of re-deriving it and hoping the derivations match.
     """
     return snake_case(topic_name) == subagent
+
+
+def prefixed_api_name(prefix: str, intent: str) -> str:
+    """Derive an API name that carries a fixed ``prefix``: ``SFVB_TEST_Update_Case``.
+
+    Callers that need a marked name — anything creating findable, deletable
+    artifacts in a real org — must use this rather than gluing a prefix onto
+    :func:`topic_api_name`, and rather than folding the prefix into the intent.
+
+    **Why this exists.** Both shortcuts silently lose the intent. Measured, with
+    the prefix ``"SFVB TEST"``::
+
+        topic_api_name("SFVB TEST " + "A" * 90)  -> "SFVB_TEST"
+        topic_api_name("SFVB TEST " + "!!!")     -> "SFVB_TEST"
+
+    The prefix competes with the intent for the same `MAX_NAME_LENGTH` budget and
+    wins, because it comes first. Two unrelated recordings then derive the *same*
+    agent name, and it names nothing but the prefix. Worse, the result still looks
+    correct to a cross-artifact check: every dialect agrees, because they all agree
+    on a name that identifies no recording.
+
+    Holding the prefix out of the truncation budget keeps the intent's leading
+    tokens, which are the ones that distinguish one recording from another.
+    """
+    prefix_tokens = tokenize(prefix)
+    if not prefix_tokens:
+        return topic_api_name(intent)
+
+    shaped_prefix = [t[:1].upper() + t[1:] for t in prefix_tokens]
+    head = "_".join(shaped_prefix)
+
+    # -1 for the "_" joining the prefix to the first intent token.
+    budget = MAX_NAME_LENGTH - len(head) - 1
+    if budget <= 0:
+        # A prefix that consumes the whole cap on its own. Nothing about the
+        # intent can survive, so say so rather than returning a bare prefix that
+        # would collide with every other intent.
+        raise ValueError(
+            f"prefix {prefix!r} is {len(head)} chars, leaving no room for an intent "
+            f"inside the {MAX_NAME_LENGTH}-char cap"
+        )
+
+    tokens = _escape_reserved(tokenize(intent))
+    if not tokens:
+        # No usable words in the intent. Fall back to the same visible marker
+        # `topic_api_name` uses, so an unnamed recording stays obvious in review
+        # instead of being indistinguishable from a truncated one.
+        tokens = tokenize(FALLBACK_TOPIC_NAME)
+
+    shaped = [t[:1].upper() + t[1:] for t in _truncate_tokens(tokens, "_", budget)]
+    return "_".join([head, *shaped])

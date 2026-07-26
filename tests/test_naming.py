@@ -9,6 +9,8 @@ These tests verify that:
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from sf_video_blueprint.naming import (
@@ -21,6 +23,7 @@ from sf_video_blueprint.naming import (
     names_agree,
     is_reserved,
     dedupe_names,
+    prefixed_api_name,
     tokenize,
     snake_case,
 )
@@ -740,3 +743,94 @@ def test_router_action_name_never_empty():
         assert router, f"router_action_name returned empty for {intent!r}"
         assert len(router) > 0
         assert router.startswith("go_to_")
+
+
+# === PREFIXED NAMES: a marked name must still identify its recording ===
+#
+# `prefixed_api_name` exists because the obvious spelling loses the intent.
+# Folding the prefix into the intent makes the two compete for one length budget,
+# and the prefix wins because it comes first:
+#
+#     topic_api_name("SFVB TEST " + "A" * 90)  -> "SFVB_TEST"
+#     topic_api_name("SFVB TEST " + "!!!")     -> "SFVB_TEST"
+#
+# Both derive the same name, and that name identifies nothing but the prefix. The
+# failure is invisible to a cross-artifact check: every dialect agrees, because
+# they agree on a name that names no recording. That is the same class of defect
+# as the original three-name divergence, one level up.
+
+ORG_PREFIX = "SFVB TEST"
+
+PREFIX_INTENTS = [
+    "Update Case (Status)",
+    "Create Contact",
+    "escalation",  # reserved: must still be escaped under a prefix
+    "2024 Renewal Process",  # must not start with a digit
+    "A" * 90,  # one token, longer than the whole cap
+    "!!!",  # no word characters at all
+    "Update Case " + ("Extremely Verbose Business Process Name " * 4),
+]
+
+
+@pytest.mark.parametrize("intent", PREFIX_INTENTS)
+def test_prefixed_api_name_respects_the_length_cap(intent):
+    """The prefix must be budgeted inside the cap, not added on top of it."""
+    name = prefixed_api_name(ORG_PREFIX, intent)
+    assert len(name) <= MAX_NAME_LENGTH, f"{name!r} is {len(name)} chars, cap is {MAX_NAME_LENGTH}"
+
+
+@pytest.mark.parametrize("intent", PREFIX_INTENTS)
+def test_prefixed_api_name_keeps_some_of_the_intent(intent):
+    """A prefixed name must never collapse to the bare prefix.
+
+    This is the regression guard. A name that is only the prefix cannot
+    distinguish one recording from another, so it is worse than a truncated one.
+    """
+    name = prefixed_api_name(ORG_PREFIX, intent)
+    head = "_".join(t[:1].upper() + t[1:] for t in tokenize(ORG_PREFIX))
+    assert name != head, f"{intent[:30]!r} derived the bare prefix {name!r}, identifying nothing"
+    assert name.startswith(head + "_")
+    assert len(name) > len(head) + 1
+
+
+def test_prefixed_api_name_does_not_collide_across_distinct_intents():
+    """The exact defect: two unrelated intents deriving one agent name.
+
+    Measured before the fix — `"A" * 90` and `"!!!"` both produced `SFVB_TEST`.
+    """
+    names = [prefixed_api_name(ORG_PREFIX, intent) for intent in PREFIX_INTENTS]
+    assert len(set(names)) == len(names), f"collision among {names}"
+
+    # And specifically the pair that used to collide.
+    assert prefixed_api_name(ORG_PREFIX, "A" * 90) != prefixed_api_name(ORG_PREFIX, "!!!")
+
+
+@pytest.mark.parametrize("intent", PREFIX_INTENTS)
+def test_prefixed_api_name_keeps_both_dialects_in_agreement(intent):
+    """The snake_case form must still be the same name, or `@subagent.X` dangles."""
+    name = prefixed_api_name(ORG_PREFIX, intent)
+    assert names_agree(name, snake_case(name))
+
+
+@pytest.mark.parametrize("intent", PREFIX_INTENTS)
+def test_prefixed_api_name_is_a_valid_api_name(intent):
+    """Salesforce API names: word characters only, never leading with a digit."""
+    name = prefixed_api_name(ORG_PREFIX, intent)
+    assert re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name), f"{name!r} is not a valid API name"
+
+
+def test_prefixed_api_name_marks_a_wordless_intent_visibly():
+    """No usable words must yield the visible marker, not a plausible-looking name."""
+    name = prefixed_api_name(ORG_PREFIX, "!!!")
+    assert FALLBACK_TOPIC_NAME.split("_")[0] in name
+
+
+def test_prefixed_api_name_refuses_a_prefix_that_eats_the_whole_cap():
+    """Better to fail loudly than to return a name that cannot identify anything."""
+    with pytest.raises(ValueError, match="no room for an intent"):
+        prefixed_api_name("X" * MAX_NAME_LENGTH, "Update Case")
+
+
+def test_prefixed_api_name_with_no_prefix_is_just_the_topic_name():
+    """An empty prefix must not invent a separator or change the derivation."""
+    assert prefixed_api_name("", "Update Case (Status)") == topic_api_name("Update Case (Status)")
