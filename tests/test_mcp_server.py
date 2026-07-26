@@ -187,6 +187,29 @@ def test_score_spec_agrees_with_derive_spec(tmp_path: Path) -> None:
     assert scored["passed"] == derived["passed"] is False
 
 
+def test_score_spec_reports_a_capped_display_total_when_blocked(tmp_path: Path) -> None:
+    """A blocked spec must not hand an agent a number that reads as near-success.
+
+    The example capture scores a raw 85 while blocked on mock telemetry. An agent (or
+    a human reading the tool output) that sees only "85/100" draws the opposite
+    conclusion from the one the blocking issues support, so the tool reports
+    `displayTotal` capped into the low band alongside the raw `total`.
+    """
+    spec_path = tmp_path / "spec.json"
+    mcp_server.derive_spec(str(EXAMPLE), output_path=str(spec_path))
+    scored = mcp_server.score_spec(str(spec_path))
+
+    assert scored["ok"] is True
+    assert scored["passed"] is False
+    assert scored["blockingIssues"], "Expected the mock-telemetry blocker."
+    assert scored["displayTotal"] < 60, (
+        f"Blocked spec reported displayTotal={scored['displayTotal']}, which reads as a "
+        "moderate score."
+    )
+    # The raw total is still exposed for callers comparing refinement rounds.
+    assert scored["total"] >= scored["displayTotal"]
+
+
 def test_score_gate_threshold_is_not_weakened() -> None:
     """Guard the contract: the pass threshold is 75 and tools must report it."""
     from sf_video_blueprint.spec_score import PASS_THRESHOLD

@@ -41,7 +41,17 @@ GOOD_SPEC = {
     ],
     "failure_handling": ["Observed validation failure during recording: StageName must be one of approved values"],
     "unknowns": [],
-    "evidence": [],
+    # The top-level evidence trail, as build_agent_spec actually emits it. This
+    # fixture used to carry `"evidence": []`, which no real run can produce — the
+    # builder unconditionally appends the "N action(s) in recording" entry — so the
+    # fixture was claiming to represent a clean derived run while omitting the one
+    # field that records the run. The gate now reads this trail, so the fixture has
+    # to be faithful to the builder.
+    "evidence": [
+        {"source": "telemetry", "detail": "backend layers observed: validation, workflow"},
+        {"source": "extraction", "detail": "5 action(s) in recording"},
+        {"source": "data-delta", "detail": "objects mutated: Opportunity"},
+    ],
     # Both provenance axes must claim real sources. The gate checks
     # extraction_source structurally (see markers.py) rather than sniffing step
     # text for stub-looking strings, so a spec that does not say where its steps
@@ -375,7 +385,11 @@ def test_honesty_invariant_unknowns_not_penalized():
             "guardrails": ["Enforce FLS on Case"],
             "failure_handling": ["Observed validation failure during recording: Status must be valid"],
             "unknowns": ["Whether workflow rules fire after this write is not observed"],
-            "evidence": [],
+            # Faithful to build_agent_spec, which always records the run itself.
+            "evidence": [
+                {"source": "extraction", "detail": "4 action(s) in recording"},
+                {"source": "data-delta", "detail": "objects mutated: Case"},
+            ],
             "provenance": {"telemetry_source": "live-org", "extraction_source": "dom-capture"},
         }
 
