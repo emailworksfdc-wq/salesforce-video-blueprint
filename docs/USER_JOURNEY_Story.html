@@ -1,0 +1,891 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recording → Agentforce agent — how you actually use this (story-mode user journey)</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #0f172a;
+    --muted: #64748b;
+    --line: #e5e7eb;
+    --accent: #0176d3;
+    --accent-soft: #eaf3fb;
+    --card: #fafbfc;
+
+    --s-auto:    #16a34a;   /* fully automated */
+    --s-manual:  #f97316;   /* you do this by hand */
+    --s-missing: #dc2626;   /* not built yet */
+    --s-scope:   #2563eb;
+
+    --c-you:     #db2777;
+    --c-frame:   #321d71;
+    --c-org:     #032d60;
+    --c-artifact:#0f766e;
+    --c-platform:#0176d3;
+    --c-trust:   #b45309;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .wrap { max-width: 1720px; margin: 0 auto; padding: 24px 24px 96px; }
+
+  header { border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 20px; }
+  header h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.01em; }
+  header .sub { color: var(--muted); font-size: 13.5px; }
+  .badges { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .badge { display: inline-block; padding: 3px 10px; font-size: 11.5px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); border: 1px solid #cfe3f5; }
+  .badge.ok   { background:#d1fae5; color:#0f766e; border-color:#a7f3d0; }
+  .badge.warn { background:#fef3c7; color:#b45309; border-color:#fcd34d; }
+  .badge.bad  { background:#fee2e2; color:#b91c1c; border-color:#fecaca; }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
+         background:#f6f8fa; padding:1px 6px; border-radius:4px; }
+
+  h2 { font-size: 20px; margin: 34px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 15px; margin: 20px 0 6px; }
+
+  /* --- Controls --- */
+  .controls {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    background: #ffffff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 14px; margin: 8px 0 14px;
+    position: sticky; top: 0; z-index: 10;
+    box-shadow: 0 6px 16px rgba(15,23,42,.05);
+  }
+  .btn {
+    background:#fff; border:1px solid #cbd5e1; border-radius:8px;
+    padding: 6px 12px; font-size: 13px; font-weight:600; color:#0f172a; cursor:pointer;
+    transition: transform .05s ease, background .1s ease;
+  }
+  .btn:hover { background:#f1f5f9; }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: var(--accent); color:#fff; border-color: var(--accent); }
+  .btn.primary:hover { background:#0369a1; }
+  .chan-chips { display:flex; gap:6px; flex-wrap: wrap; margin-left: 8px; }
+  .chip {
+    padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight:600;
+    border:1px solid var(--line); background:#fff; cursor:pointer; color: var(--muted);
+    display:inline-flex; align-items:center; gap:6px;
+  }
+  .chip:hover { background:#f8fafc; }
+  .chip .dot { width:8px; height:8px; border-radius:999px; background: var(--muted); }
+  .chip[data-ch="a1"] .dot { background:#db2777; }
+  .chip[data-ch="a2"] .dot { background:#0176d3; }
+  .chip[data-ch="a3"] .dot { background:#321d71; }
+  .chip[data-ch="a4"] .dot { background:#0f766e; }
+  .chip[data-ch="a5"] .dot { background:#f59e0b; }
+  .chip[data-ch="a6"] .dot { background:#dc2626; }
+  .chip.active { background:#0f172a; color:#fff; border-color:#0f172a;
+    box-shadow: 0 4px 12px rgba(15,23,42,.15); }
+  .chip.active .dot { box-shadow: 0 0 0 3px rgba(255,255,255,.6); }
+  .clock { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 600;
+           font-family: ui-monospace, Menlo, monospace; }
+
+  /* --- Stage / SVG canvas --- */
+  .stage {
+    background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+    border:1px solid var(--line); border-radius:14px; padding: 16px;
+    overflow-x:auto;
+  }
+  .stage svg { display:block; width:100%; min-width: 1400px; height: auto; }
+
+  /* Nodes */
+  .n { filter: drop-shadow(0 2px 6px rgba(15,23,42,.09)); transition: opacity .3s ease; }
+  .n rect { stroke-width: 1.6; }
+  .n .lbl  { font: 700 12.5px -apple-system, "Segoe UI", sans-serif; fill:#0f172a; text-anchor: middle; }
+  .n .sub  { font: 10.5px -apple-system, "Segoe UI", sans-serif; fill:#475569; text-anchor: middle; }
+  .n .tiny { font: 9.5px -apple-system, "Segoe UI", sans-serif; fill:#64748b; text-anchor: middle; }
+  .n .mono { font: 9.5px ui-monospace, Menlo, monospace; fill:#334155; text-anchor: middle; }
+  .n .icn  { font: 22px -apple-system, "Segoe UI Symbol", "Apple Color Emoji", sans-serif;
+             text-anchor: middle; dominant-baseline: central; }
+
+  /* Actor / role theme colours */
+  .n.you      rect { fill:#fdf2f8; stroke: var(--c-you); }
+  .n.frame    rect { fill:#f5f3ff; stroke: var(--c-frame); }
+  .n.gate     rect { fill:#fffbea; stroke: var(--c-trust); }
+  .n.org      rect { fill:#f0f6ff; stroke: var(--c-org); }
+  .n.artifact rect { fill:#f0fdf4; stroke: var(--c-artifact); }
+  .n.gap      rect { fill:#fef2f2; stroke: var(--s-missing); stroke-dasharray: 5 4; stroke-width: 2; }
+  .n.manual   rect { fill:#fff7ed; stroke: var(--s-manual); stroke-dasharray: 6 3; }
+
+  /* Swimlanes + containers */
+  .lane-bg { rx:8; }
+  .lane-lbl { font: 800 11px -apple-system, "Segoe UI", sans-serif; letter-spacing: 1; }
+  .act-lbl  { font: 800 12px -apple-system, "Segoe UI", sans-serif; fill:#0f172a; text-anchor: middle; }
+  .act-sub  { font: 10px -apple-system, "Segoe UI", sans-serif; fill:#64748b; text-anchor: middle; }
+  .container-offline { fill:none; stroke: var(--s-scope); stroke-width:1.6; stroke-dasharray: 3 6; }
+
+  /* Flows */
+  .flow { fill:none; stroke-width:2.2; stroke-linecap:round; stroke-linejoin:round; opacity:.85;
+          transition: opacity .3s ease; }
+  .flow.record   { stroke: var(--c-you);      stroke-dasharray: 6 5; }
+  .flow.ingest   { stroke: var(--c-platform); stroke-dasharray: 4 4; }
+  .flow.derive   { stroke: var(--c-frame); }
+  .flow.emit     { stroke: var(--c-artifact); stroke-dasharray: 3 3; }
+  .flow.review   { stroke: #06b6d4;           stroke-dasharray: 4 4; }
+  .flow.loop     { stroke: #f59e0b;           stroke-dasharray: 5 5; }
+  .flow.handwork { stroke: var(--s-manual);   stroke-dasharray: 8 4; }
+  .flow.broken   { stroke: var(--s-missing);  stroke-dasharray: 2 7; opacity:.6; }
+  .flow.dimmed, .n.dimmed { opacity: 0.13; }
+
+  /* Particles */
+  .particle { fill:#fff; stroke-width:1.6; }
+  .p-record   { stroke: var(--c-you); }
+  .p-ingest   { stroke: var(--c-platform); }
+  .p-derive   { stroke: var(--c-frame); }
+  .p-emit     { stroke: var(--c-artifact); }
+  .p-review   { stroke: #06b6d4; }
+  .p-loop     { stroke: #f59e0b; }
+  .p-handwork { stroke: var(--s-manual); }
+
+  /* Legend */
+  .legend { display:flex; flex-wrap:wrap; gap:14px; justify-content:center;
+    margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--line);
+    font-size: 12px; color:#334155; }
+  .legend .swatch { display:inline-block; width:22px; height:3px; margin-right:6px;
+    vertical-align:middle; border-radius:2px; }
+  .swatch.s-record   { background: var(--c-you); }
+  .swatch.s-ingest   { background: var(--c-platform); }
+  .swatch.s-derive   { background: var(--c-frame); }
+  .swatch.s-emit     { background: var(--c-artifact); }
+  .swatch.s-review   { background: #06b6d4; }
+  .swatch.s-loop     { background: #f59e0b; }
+  .swatch.s-handwork { background: var(--s-manual); }
+  .swatch.s-broken   { background: var(--s-missing); }
+
+  /* Step narrative panel */
+  .steps { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; margin: 12px 0 4px; }
+  .step { background:#fff; border:1px solid var(--line); border-left:4px solid var(--muted);
+    border-radius:8px; padding:10px 12px; font-size:12.5px;
+    transition: transform .15s ease, box-shadow .15s ease, border-color .3s ease; }
+  .step .n { display:inline-block; min-width:22px; height:22px; line-height:22px; border-radius:6px;
+    background:#0f172a; color:#fff; font-weight:700; text-align:center; margin-right:6px;
+    font-size:11.5px; font-family: ui-monospace, Menlo, monospace; padding:0 5px; }
+  .step h4 { margin: 2px 0 4px; font-size:13px; color:#0f172a; }
+  .step p  { margin: 2px 0; color:#334155; }
+  .step .tech { color: var(--muted); font-size:11.5px; margin-top:4px;
+                font-family: ui-monospace, Menlo, monospace; }
+  .step.active { border-left-color: var(--accent); box-shadow: 0 6px 18px rgba(1,118,211,.15);
+                 transform: translateY(-2px); }
+  .step.caveat { border-left-color: var(--s-missing); }
+  .step.caveat h4 { color:#b91c1c; }
+
+  /* Summary cards */
+  .channel-summary { display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin: 14px 0; }
+  .cs-card { background:#fff; border:1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .cs-card h4 { margin:0 0 6px; font-size: 13.5px; color:#0f172a; }
+  .cs-card ul { margin: 4px 0 4px 18px; padding: 0; font-size: 12.5px; }
+  .cs-card li { margin: 2px 0; }
+  .cs-card .k { color: var(--muted); }
+  .cs-card code { font-size: 11.5px; }
+
+  .actor-chip { display:inline-flex; align-items:center; gap:6px;
+    padding: 3px 10px; border-radius:20px; font-size: 12px; font-weight:600; border:1px solid; }
+  .actor-chip.auto    { background:#f0fdf4; color:#16a34a; border-color:#86efac; }
+  .actor-chip.manual  { background:#fff7ed; color:#c2410c; border-color:#fdba74; }
+  .actor-chip.missing { background:#fef2f2; color:#b91c1c; border-color:#fecaca; }
+
+  .callout { background: var(--card); border:1px solid var(--line); border-left:4px solid var(--accent);
+             border-radius:8px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
+  .callout.warn { border-left-color: var(--s-missing); }
+
+  table.grade { border-collapse: collapse; width:100%; font-size:12.5px; margin: 10px 0; }
+  table.grade th, table.grade td { border:1px solid var(--line); padding:7px 9px; text-align:left;
+    vertical-align:top; }
+  table.grade th { background:#f8fafc; font-size:12px; }
+  table.grade code { font-size:11.5px; }
+
+  .doc-link { color: var(--accent); text-decoration: none; font-weight: 600; }
+  .doc-link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>From a Salesforce screen-recording to an Agentforce agent — the journey you actually walk</h1>
+  <div class="sub">
+    Story-mode walkthrough of <b>how a consumer uses this framework</b>. Press <b>Play</b> to move through
+    six acts: you click a process in your own org, hand the capture to one command, the framework derives
+    and scores a conversational agent spec, you review it, iterate it, and take the bundle to a dev org.
+    Each act is marked for who does the work — <span class="actor-chip auto">automated</span>
+    <span class="actor-chip manual">you, by hand</span>
+    <span class="actor-chip missing">not built yet</span> — so nobody plans around a step that does not exist.
+  </div>
+  <div class="badges">
+    <span class="badge ok">Acts 2–5 run fully offline · no org connection needed</span>
+    <span class="badge ok">Every derived field carries the evidence it came from</span>
+    <span class="badge">764 tests passing, 0 failing (measured 2026-07-25)</span>
+    <span class="badge warn">Act 2 can silently discard up to half a recording</span>
+    <span class="badge warn">Act 6 deploy is manual and has never been validated against an org</span>
+    <span class="badge bad">Act 5 loop is OPEN — no test results feed back in yet</span>
+  </div>
+</header>
+
+<!-- ============ CONTROLS ============ -->
+<div class="controls">
+  <button class="btn primary" id="btnPlay">▶ Play</button>
+  <button class="btn" id="btnPause">⏸ Pause</button>
+  <button class="btn" id="btnPrev">◀ Prev</button>
+  <button class="btn" id="btnNext">Next ▶</button>
+  <button class="btn" id="btnAll">Show all</button>
+
+  <div class="chan-chips" id="chanChips">
+    <span class="chip" data-ch="a1"><span class="dot"></span>1. Record (🖱️)</span>
+    <span class="chip" data-ch="a2"><span class="dot"></span>2. Hand off (⌨️)</span>
+    <span class="chip" data-ch="a3"><span class="dot"></span>3. Derive (🧠)</span>
+    <span class="chip" data-ch="a4"><span class="dot"></span>4. Review (👀)</span>
+    <span class="chip" data-ch="a5"><span class="dot"></span>5. Iterate (🔁)</span>
+    <span class="chip" data-ch="a6"><span class="dot"></span>6. Deploy (🚀)</span>
+  </div>
+  <div class="clock" id="clock">SCENE — whole journey</div>
+</div>
+
+<!-- ============ SINGLE UNIFIED JOURNEY CANVAS ============ -->
+<div class="stage">
+<svg viewBox="0 0 1640 1010" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="jTitle">
+  <title id="jTitle">User journey: recording a Salesforce process through to an Agentforce agent bundle</title>
+
+  <defs>
+    <marker id="m-pink" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker>
+    <marker id="m-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0176d3"/></marker>
+    <marker id="m-indigo" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#321d71"/></marker>
+    <marker id="m-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#0f766e"/></marker>
+    <marker id="m-cyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#06b6d4"/></marker>
+    <marker id="m-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f59e0b"/></marker>
+    <marker id="m-orange" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f97316"/></marker>
+    <marker id="m-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#dc2626"/></marker>
+
+    <!-- ACT 1 — you drive the browser, the browser writes the trace -->
+    <path id="j1a" d="M 150 232 L 150 516"/>
+    <path id="j1b" d="M 190 582 L 190 706"/>
+    <!-- ACT 2 — the trace becomes the CLI's input, and hits the safety gate first -->
+    <path id="j2a" d="M 290 737 C 360 737, 350 420, 326 361"/>
+    <path id="j2b" d="M 430 232 L 430 326"/>
+    <path id="j2c" d="M 530 361 L 566 361"/>
+    <!-- ACT 3 — extract, correlate, derive -->
+    <path id="j3a" d="M 670 392 L 670 408"/>
+    <path id="j3b" d="M 670 470 L 670 486"/>
+    <path id="j3c" d="M 670 548 L 670 702"/>
+    <path id="j3d" d="M 770 517 C 860 517, 850 660, 890 702"/>
+    <path id="j3e" d="M 770 500 C 800 500, 812 420, 812 357"/>
+    <!-- ACT 4 — the score comes back to you -->
+    <path id="j4a" d="M 910 326 L 910 238"/>
+    <!-- ACT 5 — you ask for another round; the round re-scores itself -->
+    <path id="j5a" d="M 1010 200 C 1090 200, 1100 300, 1146 326"/>
+    <path id="j5b" d="M 1150 396 L 1150 404 L 816 404 L 816 396"/>
+    <path id="j5c" d="M 1290 620 C 1180 620, 1150 540, 1150 478"/>
+    <!-- ACT 6 — emit the bundle, then carry it to the org by hand -->
+    <path id="j6a" d="M 1250 361 L 1286 361"/>
+    <path id="j6b" d="M 1420 474 L 1420 702"/>
+    <path id="j6c" d="M 1470 702 L 1470 668"/>
+  </defs>
+
+  <!-- ============ ACT COLUMN HEADERS ============ -->
+  <g id="acts">
+    <g class="s-a1">
+      <rect x="70" y="70" width="240" height="44" rx="8" fill="#fdf2f8" stroke="#f9a8d4"/>
+      <text class="act-lbl" x="190" y="90">ACT 1 · RECORD</text>
+      <text class="act-sub" x="190" y="105">you click the process once, for real</text>
+    </g>
+    <g class="s-a2">
+      <rect x="320" y="70" width="220" height="44" rx="8" fill="#eaf3fb" stroke="#93c5fd"/>
+      <text class="act-lbl" x="430" y="90">ACT 2 · HAND OFF</text>
+      <text class="act-sub" x="430" y="105">one command, one safety gate</text>
+    </g>
+    <g class="s-a3">
+      <rect x="550" y="70" width="240" height="44" rx="8" fill="#f5f3ff" stroke="#c4b5fd"/>
+      <text class="act-lbl" x="670" y="90">ACT 3 · DERIVE</text>
+      <text class="act-sub" x="670" y="105">clicks become a spec with evidence</text>
+    </g>
+    <g class="s-a4">
+      <rect x="800" y="70" width="220" height="44" rx="8" fill="#f0fdf4" stroke="#86efac"/>
+      <text class="act-lbl" x="910" y="90">ACT 4 · REVIEW</text>
+      <text class="act-sub" x="910" y="105">you read the score and the gaps</text>
+    </g>
+    <g class="s-a5">
+      <rect x="1030" y="70" width="240" height="44" rx="8" fill="#fffbea" stroke="#fcd34d"/>
+      <text class="act-lbl" x="1150" y="90">ACT 5 · ITERATE</text>
+      <text class="act-sub" x="1150" y="105">run it again to improve the spec</text>
+    </g>
+    <g class="s-a6">
+      <rect x="1280" y="70" width="290" height="44" rx="8" fill="#fef2f2" stroke="#fecaca"/>
+      <text class="act-lbl" x="1425" y="90">ACT 6 · DEPLOY</text>
+      <text class="act-sub" x="1425" y="105">build it as a real Agentforce agent</text>
+    </g>
+  </g>
+
+  <!-- ============ SWIMLANES ============ -->
+  <!-- Lane 1: YOU -->
+  <rect class="lane-bg" x="40" y="140" width="1560" height="120" fill="#fdf2f8" opacity=".30"/>
+  <text class="lane-lbl" x="52" y="158" fill="#db2777">YOU · the operator (a Salesforce admin, BA, or FDE)</text>
+
+  <!-- Lane 2: FRAMEWORK -->
+  <rect class="lane-bg" x="40" y="280" width="1560" height="290" fill="#f5f3ff" opacity=".34"/>
+  <text class="lane-lbl" x="52" y="298" fill="#321d71">THE FRAMEWORK · one Python package, runs on your laptop</text>
+
+  <!-- Lane 3: BROWSER + ORG -->
+  <rect class="lane-bg" x="40" y="590" width="1560" height="120" fill="#f0f6ff" opacity=".40"/>
+  <text class="lane-lbl" x="52" y="608" fill="#032d60">YOUR BROWSER &amp; YOUR DEV SANDBOX ORG · never production</text>
+
+  <!-- Lane 4: ARTIFACTS -->
+  <rect class="lane-bg" x="40" y="730" width="1560" height="120" fill="#f0fdf4" opacity=".40"/>
+  <text class="lane-lbl" x="52" y="748" fill="#0f766e">WHAT YOU ARE HOLDING · files on disk you can diff, read, and re-run</text>
+
+  <!-- Offline container spanning acts 2..5 -->
+  <rect class="container-offline s-a2 s-a3 s-a4 s-a5" x="320" y="286" width="950" height="280" rx="14"/>
+  <text class="s-a2 s-a3 s-a4 s-a5" x="795" y="562" font-size="10.5" font-weight="700"
+        fill="#2563eb" text-anchor="middle">ACTS 2–5 NEED NO ORG · no token, no network, no deploy — safe to run on any laptop</text>
+
+  <!-- ============ FLOWS ============ -->
+  <g id="flows">
+    <use class="flow record   s-a1" href="#j1a" marker-end="url(#m-pink)"/>
+    <use class="flow record   s-a1" href="#j1b" marker-end="url(#m-pink)"/>
+    <use class="flow ingest   s-a2" href="#j2a" marker-end="url(#m-blue)"/>
+    <use class="flow ingest   s-a2" href="#j2b" marker-end="url(#m-blue)"/>
+    <use class="flow ingest   s-a2" href="#j2c" marker-end="url(#m-blue)"/>
+    <use class="flow derive   s-a3" href="#j3a" marker-end="url(#m-indigo)"/>
+    <use class="flow derive   s-a3" href="#j3b" marker-end="url(#m-indigo)"/>
+    <use class="flow emit     s-a3" href="#j3c" marker-end="url(#m-teal)"/>
+    <use class="flow emit     s-a3" href="#j3d" marker-end="url(#m-teal)"/>
+    <use class="flow derive   s-a3 s-a4" href="#j3e" marker-end="url(#m-indigo)"/>
+    <use class="flow review   s-a4" href="#j4a" marker-end="url(#m-cyan)"/>
+    <use class="flow loop     s-a5" href="#j5a" marker-end="url(#m-amber)"/>
+    <use class="flow loop     s-a5" href="#j5b" marker-end="url(#m-amber)"/>
+    <use class="flow broken   s-a5 s-a6" href="#j5c" marker-end="url(#m-red)"/>
+    <use class="flow derive   s-a6" href="#j6a" marker-end="url(#m-indigo)"/>
+    <use class="flow handwork s-a6" href="#j6b" marker-end="url(#m-orange)"/>
+    <use class="flow handwork s-a6" href="#j6c" marker-end="url(#m-orange)"/>
+  </g>
+
+  <!-- ============ PARTICLES ============ -->
+  <g id="particles">
+    <circle r="4"   class="particle p-record   s-a1"><animateMotion dur="2.4s" repeatCount="indefinite"><mpath href="#j1a"/></animateMotion></circle>
+    <circle r="4"   class="particle p-record   s-a1"><animateMotion dur="2s"   repeatCount="indefinite" begin="1.2s"><mpath href="#j1b"/></animateMotion></circle>
+    <circle r="4"   class="particle p-ingest   s-a2"><animateMotion dur="3s"   repeatCount="indefinite"><mpath href="#j2a"/></animateMotion></circle>
+    <circle r="4"   class="particle p-ingest   s-a2"><animateMotion dur="2s"   repeatCount="indefinite" begin=".8s"><mpath href="#j2b"/></animateMotion></circle>
+    <circle r="4"   class="particle p-ingest   s-a2"><animateMotion dur="1.4s" repeatCount="indefinite" begin="1.4s"><mpath href="#j2c"/></animateMotion></circle>
+    <circle r="3.6" class="particle p-derive   s-a3"><animateMotion dur="1.2s" repeatCount="indefinite"><mpath href="#j3a"/></animateMotion></circle>
+    <circle r="3.6" class="particle p-derive   s-a3"><animateMotion dur="1.2s" repeatCount="indefinite" begin=".6s"><mpath href="#j3b"/></animateMotion></circle>
+    <circle r="4"   class="particle p-emit     s-a3"><animateMotion dur="2.6s" repeatCount="indefinite" begin=".4s"><mpath href="#j3c"/></animateMotion></circle>
+    <circle r="4"   class="particle p-emit     s-a3"><animateMotion dur="3s"   repeatCount="indefinite" begin="1.1s"><mpath href="#j3d"/></animateMotion></circle>
+    <circle r="3.6" class="particle p-derive   s-a3 s-a4"><animateMotion dur="2.2s" repeatCount="indefinite" begin=".3s"><mpath href="#j3e"/></animateMotion></circle>
+    <circle r="4"   class="particle p-review   s-a4"><animateMotion dur="2s"   repeatCount="indefinite"><mpath href="#j4a"/></animateMotion></circle>
+    <circle r="4"   class="particle p-loop     s-a5"><animateMotion dur="2.6s" repeatCount="indefinite"><mpath href="#j5a"/></animateMotion></circle>
+    <circle r="4"   class="particle p-loop     s-a5"><animateMotion dur="3.4s" repeatCount="indefinite" begin="1s"><mpath href="#j5b"/></animateMotion></circle>
+    <circle r="3.6" class="particle p-derive   s-a6"><animateMotion dur="1.4s" repeatCount="indefinite"><mpath href="#j6a"/></animateMotion></circle>
+    <circle r="4"   class="particle p-handwork s-a6"><animateMotion dur="3s"   repeatCount="indefinite" begin=".5s"><mpath href="#j6b"/></animateMotion></circle>
+    <circle r="4"   class="particle p-handwork s-a6"><animateMotion dur="1.6s" repeatCount="indefinite" begin="1.6s"><mpath href="#j6c"/></animateMotion></circle>
+  </g>
+
+  <!-- ============ LANE 1 · YOU ============ -->
+  <g class="n you s-a1" transform="translate(90 170)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="26" y="31">🖱️</text>
+    <text class="lbl" x="112" y="22">Click the process once</text>
+    <text class="tiny" x="112" y="37">Update a Case exactly as a human would</text>
+    <text class="tiny" x="112" y="50">No script to write. No annotation.</text>
+  </g>
+
+  <g class="n you s-a2" transform="translate(330 170)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="26" y="31">⌨️</text>
+    <text class="lbl" x="115" y="20">Run one command</text>
+    <text class="mono" x="115" y="34">sf-blueprint run</text>
+    <text class="mono" x="115" y="46">--capture dom_capture.jsonl</text>
+    <text class="mono" x="115" y="58">--org-url … --mode mock</text>
+  </g>
+
+  <g class="n you s-a4" transform="translate(810 170)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="26" y="31">👀</text>
+    <text class="lbl" x="115" y="22">Open the blueprint</text>
+    <text class="tiny" x="115" y="37">Read the score, the evidence per field,</text>
+    <text class="tiny" x="115" y="50">and the list of declared unknowns</text>
+  </g>
+
+  <g class="n you manual s-a6" transform="translate(1290 160)">
+    <rect x="0" y="0" width="260" height="72" rx="10"/>
+    <text class="icn" x="28" y="36">🚀</text>
+    <text class="lbl" x="150" y="20">Carry it to the org yourself</text>
+    <text class="tiny" x="150" y="34">Today you assemble the bundle directory and</text>
+    <text class="tiny" x="150" y="46">run the sf commands by hand. There is no</text>
+    <text class="tiny" x="150" y="58">one-button deploy, and no CI path.</text>
+    <text class="tiny" x="150" y="68" fill="#c2410c" font-weight="700">MANUAL</text>
+  </g>
+
+  <!-- ============ LANE 2 · THE FRAMEWORK ============ -->
+  <!-- Act 1: framework deliberately not involved -->
+  <text class="s-a1" x="190" y="430" font-size="10.5" fill="#94a3b8" text-anchor="middle">the framework is not</text>
+  <text class="s-a1" x="190" y="444" font-size="10.5" fill="#94a3b8" text-anchor="middle">running yet — recording is</text>
+  <text class="s-a1" x="190" y="458" font-size="10.5" fill="#94a3b8" text-anchor="middle">a browser-side step</text>
+
+  <!-- Act 2: the gate -->
+  <g class="n gate s-a2" transform="translate(330 330)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🛡️</text>
+    <text class="lbl" x="115" y="20">Safety gate runs FIRST</text>
+    <text class="tiny" x="115" y="34">A redaction leak aborts the run and</text>
+    <text class="tiny" x="115" y="46">writes no spec. Event loss under 50%</text>
+    <text class="tiny" x="115" y="58" fill="#b91c1c" font-weight="700">passes SILENTLY — see caveat</text>
+  </g>
+
+  <!-- Act 3: the three derivation stages -->
+  <g class="n frame s-a3" transform="translate(570 330)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🧩</text>
+    <text class="lbl" x="115" y="20">Turn events into actions</text>
+    <text class="tiny" x="115" y="34">Coalesces keystrokes, ranks 8 tiers of</text>
+    <text class="tiny" x="115" y="46">selector, pierces shadow DOM</text>
+    <text class="tiny" x="115" y="58" fill="#16a34a" font-weight="700">deterministic · same input, same output</text>
+  </g>
+
+  <g class="n frame s-a3" transform="translate(570 408)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🔗</text>
+    <text class="lbl" x="115" y="20">Correlate to backend</text>
+    <text class="tiny" x="115" y="34">Matches each click to record changes in a</text>
+    <text class="tiny" x="115" y="46">5-second window and labels the certainty:</text>
+    <text class="tiny" x="115" y="58" fill="#321d71" font-weight="700">HIGH · TEMPORAL · ASSERTED · AMBIGUOUS</text>
+  </g>
+
+  <g class="n frame s-a3" transform="translate(570 486)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🧠</text>
+    <text class="lbl" x="115" y="20">Derive the agent spec</text>
+    <text class="tiny" x="115" y="34">Intent, entities, guardrails, failure paths —</text>
+    <text class="tiny" x="115" y="46">each one citing the click that produced it</text>
+    <text class="tiny" x="115" y="58" fill="#16a34a" font-weight="700">refuses to guess · says UNRESOLVED instead</text>
+  </g>
+
+  <!-- Act 4: the score -->
+  <g class="n frame s-a4" transform="translate(810 326)">
+    <rect x="0" y="0" width="200" height="70" rx="10"/>
+    <text class="icn" x="24" y="35">📊</text>
+    <text class="lbl" x="115" y="20">Score it out of 100</text>
+    <text class="tiny" x="115" y="34">7 weighted dimensions. Evidence is worth</text>
+    <text class="tiny" x="115" y="46">30, honesty 20. Deleting weak evidence</text>
+    <text class="tiny" x="115" y="58">can never raise your score.</text>
+    <text class="tiny" x="115" y="68" fill="#0f766e" font-weight="700">pass ≥ 75 · blocking issues override</text>
+  </g>
+
+  <!-- Act 5: refine + the missing signal -->
+  <g class="n frame s-a5" transform="translate(1050 330)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🔁</text>
+    <text class="lbl" x="115" y="20">Refine, round by round</text>
+    <text class="tiny" x="115" y="34">Emits v1, v2, v3 … each re-scored, so you</text>
+    <text class="tiny" x="115" y="46">can diff two versions of the same spec</text>
+    <text class="tiny" x="115" y="58" fill="#b45309" font-weight="700">improves wording, not behaviour</text>
+  </g>
+
+  <g class="n gap s-a5" transform="translate(1050 408)">
+    <rect x="0" y="0" width="200" height="70" rx="10"/>
+    <text class="icn" x="24" y="35">⛔</text>
+    <text class="lbl" x="118" y="20" fill="#b91c1c">THE LOOP IS OPEN</text>
+    <text class="tiny" x="118" y="34">Nothing runs your spec against a real agent,</text>
+    <text class="tiny" x="118" y="46">so no test result ever comes back. Rounds</text>
+    <text class="tiny" x="118" y="58">score identically and that reads as “converged”.</text>
+    <text class="tiny" x="118" y="68" fill="#b91c1c" font-weight="700">v1 79 · v2 79 · v3 79 → converged=true</text>
+  </g>
+
+  <!-- Act 6: emitters + the missing call site -->
+  <g class="n frame s-a6" transform="translate(1290 330)">
+    <rect x="0" y="0" width="260" height="62" rx="10"/>
+    <text class="icn" x="26" y="31">📝</text>
+    <text class="lbl" x="150" y="20">Emit the Agentforce artifacts</text>
+    <text class="tiny" x="150" y="34">Agent Script .agent · bundle-meta.xml · agentSpec.yaml</text>
+    <text class="tiny" x="150" y="46">· test suites in both dialects. One naming source, so</text>
+    <text class="tiny" x="150" y="58">topic, subagent and test names cannot drift apart.</text>
+  </g>
+
+  <g class="n gap s-a6" transform="translate(1290 408)">
+    <rect x="0" y="0" width="260" height="70" rx="10"/>
+    <text class="icn" x="26" y="35">🔌</text>
+    <text class="lbl" x="150" y="20" fill="#b91c1c">WRITTEN, BUT NOT WIRED</text>
+    <text class="tiny" x="150" y="34">The bundle writers exist and are tested, but no</text>
+    <text class="tiny" x="150" y="46">command calls them — so the plain run does not</text>
+    <text class="tiny" x="150" y="58">yet produce a .agent file. You invoke a script,</text>
+    <text class="tiny" x="150" y="68">or you assemble the directory by hand.</text>
+  </g>
+
+  <!-- ============ LANE 3 · BROWSER + ORG ============ -->
+  <g class="n org s-a1" transform="translate(90 620)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🌐</text>
+    <text class="lbl" x="115" y="20">Your org, in Chrome</text>
+    <text class="tiny" x="115" y="34">A recorder is injected into the page and</text>
+    <text class="tiny" x="115" y="46">listens on the capture phase</text>
+    <text class="tiny" x="115" y="58" fill="#032d60" font-weight="700">signed frontdoor login · never the login form</text>
+  </g>
+
+  <text class="s-a2 s-a3 s-a4 s-a5" x="795" y="650" font-size="11" font-weight="700"
+        fill="#94a3b8" text-anchor="middle">— your org is not touched again until Act 6 —</text>
+
+  <g class="n org manual s-a6" transform="translate(1290 596)">
+    <rect x="0" y="0" width="260" height="80" rx="10"/>
+    <text class="icn" x="26" y="40">🏢</text>
+    <text class="lbl" x="150" y="18">Dev sandbox org</text>
+    <text class="mono" x="150" y="32">sf project deploy start</text>
+    <text class="mono" x="150" y="44">sf agent validate authoring-bundle</text>
+    <text class="mono" x="150" y="56">sf agent publish authoring-bundle</text>
+    <text class="mono" x="150" y="68">sf agent test create · run · results</text>
+    <text class="tiny" x="150" y="78" fill="#b91c1c" font-weight="700">NEVER YET RUN — this is the unproven step</text>
+  </g>
+
+  <!-- ============ LANE 4 · ARTIFACTS ============ -->
+  <g class="n artifact s-a1 s-a2" transform="translate(90 706)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">📄</text>
+    <text class="lbl" x="115" y="20">dom_capture.jsonl</text>
+    <text class="tiny" x="115" y="34">One JSON line per real interaction:</text>
+    <text class="tiny" x="115" y="46">selectors, field API names, timings</text>
+    <text class="tiny" x="115" y="58" fill="#0f766e" font-weight="700">this is your evidence — keep it</text>
+  </g>
+
+  <g class="n artifact s-a3 s-a4" transform="translate(570 706)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🗂️</text>
+    <text class="lbl" x="115" y="20">blueprint.agent-spec.json</text>
+    <text class="tiny" x="115" y="34">The machine-readable spec. Diffable</text>
+    <text class="tiny" x="115" y="46">between runs, feeds every later step.</text>
+    <text class="tiny" x="115" y="58" fill="#0f766e" font-weight="700">the actual product of Acts 2–3</text>
+  </g>
+
+  <g class="n artifact s-a3 s-a4" transform="translate(810 706)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🖥️</text>
+    <text class="lbl" x="115" y="20">master_blueprint.html</text>
+    <text class="tiny" x="115" y="34">The human view: steps, correlation</text>
+    <text class="tiny" x="115" y="46">confidence, and a simulated-data banner</text>
+    <text class="tiny" x="115" y="58">if any part of the run was mocked</text>
+  </g>
+
+  <g class="n artifact s-a5" transform="translate(1050 706)">
+    <rect x="0" y="0" width="200" height="62" rx="10"/>
+    <text class="icn" x="24" y="31">🧾</text>
+    <text class="lbl" x="115" y="20">agentSpec.yaml · v1…vN</text>
+    <text class="tiny" x="115" y="34">One folder per round, each with its own</text>
+    <text class="tiny" x="115" y="46">score, so the history is auditable</text>
+    <text class="tiny" x="115" y="58" fill="#b45309" font-weight="700">today the rounds are near-identical</text>
+  </g>
+
+  <g class="n artifact manual s-a6" transform="translate(1290 706)">
+    <rect x="0" y="0" width="260" height="62" rx="10"/>
+    <text class="icn" x="26" y="31">📦</text>
+    <text class="lbl" x="150" y="20">aiAuthoringBundles/&lt;Name&gt;/</text>
+    <text class="tiny" x="150" y="34">&lt;Name&gt;.agent + &lt;Name&gt;.bundle-meta.xml</text>
+    <text class="tiny" x="150" y="46">The meta XML matches the first-party template</text>
+    <text class="tiny" x="150" y="58">byte-for-byte; the .agent grammar is unverified</text>
+  </g>
+
+  <!-- ============ HONEST FOOTER INSIDE CANVAS ============ -->
+  <rect x="40" y="878" width="1560" height="106" rx="12" fill="#fff" stroke="#e5e7eb"/>
+  <text x="60" y="902" font-size="12" font-weight="800" fill="#0f172a">WHERE THE JOURNEY STOPS BEING AUTOMATIC</text>
+  <circle cx="66" cy="925" r="5" fill="#16a34a"/>
+  <text x="80" y="929" font-size="11.5" fill="#334155">
+    <tspan font-weight="700">Acts 1–4 run end to end today</tspan> — a capture yields a scored, evidence-cited spec with no org connection. But fix the ingest losses first: a capture can lose 40% of its events and still be stamped as real evidence.
+  </text>
+  <circle cx="66" cy="947" r="5" fill="#f97316"/>
+  <text x="80" y="951" font-size="11.5" fill="#334155">
+    <tspan font-weight="700">Act 5 improves the words, not the behaviour.</tspan> The loop re-scores its own output. Until test results feed back, “converged” means “nothing changed”, not “good enough”.
+  </text>
+  <circle cx="66" cy="969" r="5" fill="#dc2626"/>
+  <text x="80" y="973" font-size="11.5" fill="#334155">
+    <tspan font-weight="700">Act 6 is manual and unproven.</tspan> Nothing here has met a real org. Only <tspan font-family="ui-monospace, Menlo, monospace">sf agent validate authoring-bundle</tspan> can tell you whether the emitted Agent Script actually compiles.
+  </text>
+</svg>
+
+<div class="legend">
+  <span><span class="swatch s-record"></span>You drive the browser</span>
+  <span><span class="swatch s-ingest"></span>Capture ingested &amp; safety-gated</span>
+  <span><span class="swatch s-derive"></span>Derivation inside the framework</span>
+  <span><span class="swatch s-emit"></span>Artifact written to disk</span>
+  <span><span class="swatch s-review"></span>Result comes back to you</span>
+  <span><span class="swatch s-loop"></span>Iteration round</span>
+  <span><span class="swatch s-handwork"></span>You do this by hand</span>
+  <span><span class="swatch s-broken"></span>Link that does not exist yet</span>
+</div>
+</div>
+
+<!-- ============ STEP NARRATIVE ============ -->
+<div class="steps" id="stepPanel"></div>
+
+<h2>What you get, act by act — and what is still on you</h2>
+
+<div class="channel-summary">
+  <div class="cs-card">
+    <h4>✅ Works today, no caveats worth hiding</h4>
+    <ul>
+      <li><span class="k">Record:</span> a browser recorder that pierces shadow DOM and captures Salesforce field API names, not just CSS paths.</li>
+      <li><span class="k">Safety first:</span> the capture is validated <em>before</em> anything is derived. A secret that was flagged sensitive but not actually redacted aborts the run with exit 1 and writes no spec. (Loss below 50% is <em>not</em> caught — see the caveats.)</li>
+      <li><span class="k">Derive:</span> intent, entities, orchestration, guardrails and failure handling — each carrying the click or record-change that justifies it.</li>
+      <li><span class="k">Honesty is scored:</span> saying “I don’t know” earns points; deleting weak evidence to look cleaner cannot raise your score.</li>
+      <li><span class="k">One name everywhere:</span> topic, subagent, router action and test target all derive from a single function, so generated tests can’t point at a topic that doesn’t exist.</li>
+      <li><span class="k">Repeatable:</span> same capture in, same artifacts out. 764 tests passing as of 2026-07-25.</li>
+    </ul>
+  </div>
+  <div class="cs-card">
+    <h4>⚠️ Still on you — plan for this</h4>
+    <ul>
+      <li><span class="k">Recording is a separate step.</span> There is no <code>record</code> subcommand; you launch the recorder yourself, then feed the JSONL to the CLI.</li>
+      <li><span class="k">The spec has no hands.</span> It’s a topic router with zero actions — no <code>@apex.*</code> or <code>@flow.*</code> references. That is deliberate (inventing an action reference would be a fabrication), but it means you wire the actions.</li>
+      <li><span class="k">Video input is a stub.</span> Pass a video file and you get one placeholder step regardless of content. Use <code>--capture</code>.</li>
+      <li><span class="k">The bundle isn’t emitted by the normal run.</span> The writers exist and are tested; the call site is missing.</li>
+      <li><span class="k">Deployment is fully manual</span> and has never been validated against an org.</li>
+      <li><span class="k">Two gates disagree:</span> the in-process scorer passes at 75, the CI script at 85. A spec scoring 79 passes one and fails the other.</li>
+      <li><span class="k">Fix ingest before you trust a run:</span> the parser drops events the recorder legitimately emits, sub-50% loss is never reported, and a UTF-8 BOM eats the first event. All small fixes — but until they land, treat a low action count as suspicious rather than as a short process.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="callout">
+  <b>Read the score, then read the provenance.</b> The same spec scores <b>79 (fail)</b> with mock telemetry and
+  <b>84 (pass)</b> with live-org telemetry — a five-point provenance dimension is the entire difference. Today
+  that dimension keys on a flag you pass on the command line, and the telemetry behind it is broadly-scoped
+  queries matched to clicks by a 5-second window. <b>Connecting an org makes the number go up without making
+  the spec more correct.</b> Treat 84 as “provenance was asserted”, not “behaviour was proven”.
+</div>
+
+<h2>Honest status of each link in the chain</h2>
+
+<table class="grade">
+  <thead>
+    <tr><th style="width:11%">Link</th><th style="width:9%">State</th><th>What that means for you</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>1 · Record</b></td>
+      <td><span class="actor-chip manual">partial</span></td>
+      <td>A real capture-phase recorder with shadow-DOM piercing and 8 selector tiers. It has never been run against a live Lightning org, and it is not a pipeline stage — you invoke it separately.</td>
+    </tr>
+    <tr>
+      <td><b>2 · Ingest</b></td>
+      <td><span class="actor-chip manual">partial</span></td>
+      <td>Raw events → coalesced, ordered, selector-ranked actions, byte-identical across repeat runs. But the parser rejects events the recorder legitimately emits, event loss below 50% is never reported, and a UTF-8 BOM silently drops the first event. Fixable, and worth fixing before any org run.</td>
+    </tr>
+    <tr>
+      <td><b>3 · Derive</b></td>
+      <td><span class="actor-chip auto">done</span></td>
+      <td>This is the strongest part of the system. Confidence is capped rather than inflated: a well-evidenced Case update derives at 0.70, never 1.0.</td>
+    </tr>
+    <tr>
+      <td><b>4 · Review &amp; score</b></td>
+      <td><span class="actor-chip auto">done</span></td>
+      <td>A falsifiable gate: bad specs measurably fail, and deliberate attempts to game it mostly fail too (10 of 12 known attack vectors are blocked; 2 still squeeze through near the threshold).</td>
+    </tr>
+    <tr>
+      <td><b>5 · Run the spec repeatedly</b></td>
+      <td><span class="actor-chip missing">absent</span></td>
+      <td>The half of your goal that says “run that spec over and over to improve it” does not exist yet. Nothing executes the spec, so no result returns. Needs a results parser and a real deploy-test-read cycle.</td>
+    </tr>
+    <tr>
+      <td><b>6 · Build as an Agentforce agent</b></td>
+      <td><span class="actor-chip manual">partial</span></td>
+      <td>Every emitter is written; the bundle metadata matches the first-party template byte-for-byte. But nothing calls them from the normal run, and no org has ever validated the output.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <b>The one thing to fix before trusting Act 6.</b> The single script that produces these artifacts end to end
+  currently labels the same agent three different ways in one run — the <code>.agent</code> file, the CLI
+  <code>--api-name</code>, and the test suite’s subject each get a different name. A test run against that output
+  would target an agent that does not exist. The library’s naming is correct and single-sourced; its one caller
+  is not. Fix the caller before spending an org run on it.
+</div>
+
+<script>
+(function(){
+  const ACTS = ['a1','a2','a3','a4','a5','a6'];
+  const ACT_LABELS = {
+    a1:'Act 1 — Record', a2:'Act 2 — Hand off', a3:'Act 3 — Derive',
+    a4:'Act 4 — Review', a5:'Act 5 — Iterate', a6:'Act 6 — Deploy'
+  };
+
+  // Four cards per act: what you do · what it does · what you get · the honest caveat.
+  const STORY = {
+    a1: [
+      {n:'You',  title:'Do the process once, for real',
+       body:'Open your own dev sandbox in Chrome with the recorder injected, and click through the process exactly as a user would — update the Case, pick a status, save.',
+       tech:'signed frontdoor URL · never the login form'},
+      {n:'It',   title:'Listens on the capture phase',
+       body:'Every click, input, select and navigation is recorded with a ranked set of selectors, the Salesforce field API name where it can find one, and a driver-stamped sequence number.',
+       tech:'composedPath() · shadow-DOM piercing · 8 selector tiers'},
+      {n:'Get',  title:'One JSONL file of evidence',
+       body:'dom_capture.jsonl — one line per interaction. This file is the ground truth for everything downstream, so keep it with the spec it produced.',
+       tech:'outputs/dom_capture.jsonl'},
+      {n:'⚠',   title:'Recorder and parser disagree on shape', cls:'caveat',
+       body:'There is no record subcommand — you launch the recorder yourself, and it has never met a live Lightning org. Worse: the recorder emits a null role for plain div/span clicks and a null name for bare inputs, but the parser requires both. Those events are dropped. A realistic 10-action session loses 4 of them — and the surviving spec is still stamped as real dom-capture evidence.',
+       tech:'one-line fix: role/name optional in dom_capture.py:51-55'},
+    ],
+    a2: [
+      {n:'You',  title:'Run one command',
+       body:'Point the CLI at the capture file. Nothing else is required — no annotation pass, no config file, no org token in mock mode.',
+       tech:'sf-blueprint run --capture dom_capture.jsonl --org-url …'},
+      {n:'It',   title:'Checks safety before it checks anything else',
+       body:'The trace is validated first. If a value was flagged sensitive but not actually redacted, or if most lines failed to parse, the run stops and no spec file is written at all.',
+       tech:'validate_trace() → exit 1 on SECURITY CRITICAL / DATA LOSS'},
+      {n:'Get',  title:'A loud refusal — but only past a threshold',
+       body:'A redaction leak or a capture that mostly failed to parse aborts hard. Below 50% loss, though, the run proceeds and says nothing: discarded lines are recorded internally but never printed, so a partial recording can look like a clean one.',
+       tech:'measured: 40% of events lost, zero warnings, exit 0'},
+      {n:'⚠',   title:'Two gaps to know about here', cls:'caveat',
+       body:'The field-name leak check inspects only element.name, so a password caught via type=password, aria-label, or the Salesforce field API name passes silently. And the capture manifest — which records how many events the recorder thought it wrote — is never loaded, so the one check that would catch any loss at any ratio never runs.',
+       tech:'dom_capture.py:414 · manifest=None at :276'},
+    ],
+    a3: [
+      {n:'You',  title:'Nothing — this part is yours to read, not to drive',
+       body:'Act 3 is entirely automatic and entirely offline. No token, no network. You can run it a hundred times on a laptop and get identical output.',
+       tech:'no org connection required'},
+      {n:'It',   title:'Clicks → actions → correlations → a spec',
+       body:'Keystrokes coalesce into single inputs; each action is matched to observed record changes within a 5-second window; then intent, entities, guardrails and failure paths are derived from what was actually seen.',
+       tech:'HIGH / TEMPORAL / ASSERTED / AMBIGUOUS confidence per field'},
+      {n:'Get',  title:'A spec where every line cites its source',
+       body:'“Update Case (Status, Priority)” at confidence 0.70, with entities status, priority, comments and recordId — each carrying the click or field delta that justifies it.',
+       tech:'blueprint.agent-spec.json + master_blueprint.html'},
+      {n:'⚠',   title:'It refuses to invent actions', cls:'caveat',
+       body:'The spec is a topic router with no @apex or @flow hands. Fabricating an action reference would be worse than omitting it, so wiring real actions stays your job.',
+       tech:'zero phantom action references by design'},
+    ],
+    a4: [
+      {n:'You',  title:'Open the HTML and read the score',
+       body:'The report shows each step, how confidently it was correlated, and a red banner if any part of the run was simulated rather than observed.',
+       tech:'outputs/master_blueprint.html'},
+      {n:'It',   title:'Scores 7 dimensions out of 100',
+       body:'Evidence grounding is worth 30 and honesty 20 — the two heaviest weights. Absent guardrails block outright regardless of total, and strengthening evidence can never lower the score.',
+       tech:'pass ≥ 75 · blocking issues override the total'},
+      {n:'Get',  title:'A number you can argue with',
+       body:'The gate is falsifiable: a deliberately bad spec measurably fails, and an ungrounded one scores 2 out of 30 on evidence. That is the point — a gate that always passes is not a gate.',
+       tech:'10 of 12 known gaming attacks blocked'},
+      {n:'⚠',   title:'Two thresholds disagree', cls:'caveat',
+       body:'The in-process scorer passes at 75; the CI script passes at 85. A spec scoring 79 passes locally and fails CI, which reads as flakiness rather than as the deliberate margin it is.',
+       tech:'spec_score 75 vs scripts/score_run.py 85'},
+    ],
+    a5: [
+      {n:'You',  title:'Ask for another round',
+       body:'Re-run the refinement to get v1, v2, v3 — each in its own folder with its own score, so you can diff two generations of the same spec and see exactly what moved.',
+       tech:'iterate/refine → iter_*/v1, v2, v3'},
+      {n:'It',   title:'Re-scores its own output',
+       body:'Each round applies offline improvements, re-scores, and stops when the score stops moving or the threshold is cleared. The bookkeeping is real and the history is auditable.',
+       tech:'stop reason recorded per round'},
+      {n:'Get',  title:'A version history — of wording',
+       body:'What improves today is clarity and completeness of the spec text. That is genuinely useful for review, but it is not the same as the agent behaving better.',
+       tech:'agentSpec.yaml per version'},
+      {n:'⚠',   title:'The loop is open — this is the biggest gap', cls:'caveat',
+       body:'Nothing runs your spec against a live agent, so no test result ever returns. Rounds score identically (79, 79, 79) and the loop reports that as convergence. Closing this needs a deploy → test → parse-results cycle and a results parser that distinguishes “test failed” from “test could not run”.',
+       tech:'sf agent test create / run / results — absent from the repo'},
+    ],
+    a6: [
+      {n:'You',  title:'Assemble and deploy by hand',
+       body:'Place the .agent and its bundle-meta.xml under aiAuthoringBundles/<Name>/, deploy, then validate, publish, and create the test suite — each an explicit sf command you run yourself.',
+       tech:'sf project deploy start → sf agent validate authoring-bundle'},
+      {n:'It',   title:'Writes first-party-shaped artifacts',
+       body:'Agent Script, bundle metadata, the spec YAML, and test suites in both the legacy and next-gen dialects — all named from one source so the test target always matches the topic.',
+       tech:'bundle-meta.xml matches the installed template byte-for-byte'},
+      {n:'Get',  title:'A bundle directory to deploy',
+       body:'What you carry to the org. The metadata shape is verified against the CLI’s own template; the Agent Script grammar is not verified by anything local.',
+       tech:'aiAuthoringBundles/<Name>/<Name>.agent'},
+      {n:'⚠',   title:'Unproven, and the one caller mislabels itself', cls:'caveat',
+       body:'No org has ever validated this output, so the Agent Script grammar and the real API-name cap are assumptions. Worse, the end-to-end script names the same agent three different ways in one run, so a test would target an agent that does not exist. Fix that before spending an org run.',
+       tech:'only sf agent validate authoring-bundle can settle it'},
+    ],
+  };
+
+  const OVERVIEW = [
+    {n:'A', title:'Six acts, one file in and one bundle out',
+     body:'You record a process once, hand the capture to a single command, and read back a scored agent spec. Press Play, or click an act chip above, to follow one act at a time.',
+     tech:'record → hand off → derive → review → iterate → deploy'},
+    {n:'B', title:'The middle four acts need no org',
+     body:'Everything between the capture file and the score runs on your laptop with no token and no network. That makes the whole derivation safe to re-run, diff, and put in CI.',
+     tech:'no token · no network · deterministic output'},
+    {n:'C', title:'Nothing is asserted without evidence',
+     body:'Every entity and guardrail cites the click or record change behind it, correlation certainty is labelled per field, and the scorer pays you for declaring unknowns instead of guessing.',
+     tech:'evidence 30 / honesty 20 of 100 points'},
+    {n:'D', title:'Two links are still open — shown in red', cls:'caveat',
+     body:'Act 5 cannot yet run your spec, so the improvement loop has no feedback signal. Act 6 is manual and has never been validated against a real org. Both are marked on the canvas rather than glossed over.',
+     tech:'graded ~55% complete against the full end-to-end goal'},
+  ];
+
+  const stepPanel = document.getElementById('stepPanel');
+  const clock     = document.getElementById('clock');
+  const chips     = document.querySelectorAll('#chanChips .chip');
+  const scenics   = document.querySelectorAll('.stage svg .n, .stage svg .flow, .stage svg .particle');
+  const tagged    = document.querySelectorAll('.stage svg [class*="s-a"]');
+
+  let currentIdx = -1;   // -1 = whole journey
+  let timer = null;
+
+  function card(s, active) {
+    return '<div class="step ' + (s.cls || '') + (active ? ' active' : '') + '">' +
+      '<span class="n">' + s.n + '</span>' +
+      '<h4>' + s.title + '</h4>' +
+      '<p>' + s.body + '</p>' +
+      '<div class="tech">' + s.tech + '</div></div>';
+  }
+
+  function renderSteps(act) {
+    const cards = act ? STORY[act] : OVERVIEW;
+    stepPanel.innerHTML = cards.map((s, i) => card(s, act ? i === 0 : false)).join('');
+  }
+
+  function applyFocus(act) {
+    tagged.forEach(el => {
+      const active = (act === null) || el.classList.contains('s-' + act);
+      if (el.classList.contains('particle')) {
+        el.style.opacity = active ? 1 : 0.08;
+      } else {
+        el.classList.toggle('dimmed', !active);
+      }
+    });
+    chips.forEach(c => c.classList.toggle('active', c.dataset.ch === act));
+    clock.textContent = act ? ('SCENE — ' + ACT_LABELS[act]) : 'SCENE — whole journey';
+    renderSteps(act);
+  }
+
+  function goTo(idx) {
+    if (idx < -1) idx = ACTS.length - 1;
+    if (idx >= ACTS.length) idx = -1;
+    currentIdx = idx;
+    applyFocus(idx === -1 ? null : ACTS[idx]);
+  }
+
+  function play() {
+    stop();
+    if (currentIdx === -1) currentIdx = 0;
+    applyFocus(ACTS[currentIdx]);
+    timer = setInterval(() => {
+      currentIdx = (currentIdx + 1) % ACTS.length;
+      applyFocus(ACTS[currentIdx]);
+    }, 7000);
+  }
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+  document.getElementById('btnPlay').addEventListener('click', play);
+  document.getElementById('btnPause').addEventListener('click', stop);
+  document.getElementById('btnPrev').addEventListener('click', () => { stop(); goTo(currentIdx - 1); });
+  document.getElementById('btnNext').addEventListener('click', () => { stop(); goTo(currentIdx + 1); });
+  document.getElementById('btnAll').addEventListener('click',  () => { stop(); goTo(-1); });
+
+  chips.forEach(chip => chip.addEventListener('click', () => {
+    stop();
+    currentIdx = ACTS.indexOf(chip.dataset.ch);
+    applyFocus(chip.dataset.ch);
+  }));
+
+  goTo(-1);
+})();
+</script>
+
+</div>
+</body>
+</html>
