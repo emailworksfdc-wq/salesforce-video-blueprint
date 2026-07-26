@@ -1,0 +1,694 @@
+# Step 6 Operator Runbook — Agentforce Bridge and Iteration Loop
+
+**Owner:** B10  
+**Purpose:** Bridge derived specs to Agentforce agents and run the iteration loop to improve them.
+
+This runbook documents the real CLI chain, the test-runner dialects, the iteration loop that is the user's stated end goal, and every gap that exists today. It matches the honest tone of the project README: no marketing, no capabilities that aren't wired.
+
+---
+
+## 1. The Real CLI Chain
+
+These facts are extracted from the installed Salesforce CLI (`sf 2.143.6`, `@salesforce/plugin-agent`, `@salesforce/agents`) and from `scripts/agentforce_roundtrip.sh` (B9), not from guesses:
+
+```
+DerivedAgentSpec (JSON)
+    ↓ agentforce_spec.py (B1)
+agentSpec.yaml
+    ↓ sf agent generate authoring-bundle --spec <yaml> --target-org <org>
+Agent Script (.agent)
+    ↓ sf agent validate authoring-bundle --api-name <name> --target-org <org>
+Validation result
+    ↓ sf agent publish (when ready)
+Live agent
+```
+
+**Key facts:**
+
+1. `sf agent generate authoring-bundle` REQUIRES an org because it calls the org's LLM to expand topics. No local-only path exists.
+2. `sf agent create --spec` also exists but Salesforce does NOT recommend it. Non-Agent-Script agents are less flexible and harder to maintain. Always use the authoring-bundle route.
+3. `sf agent validate authoring-bundle` is the ONLY authority on whether an `.agent` file is syntactically correct. Local structural checks in `agent_script.validate_locally()` catch obvious errors (tabs, unclosed quotes, missing blocks) but are NOT a substitute for CLI validation.
+4. The CLI writes Agent Script files in a specific key order and with specific indentation (4 spaces, load-bearing). A single wrong indent level produces a compile error or semantically different behavior.
+
+---
+
+## 2. The Two Test-Runner Dialects and Why Conflating Them Fails
+
+Salesforce has TWO test-runner systems for Agentforce agents, with incompatible YAML shapes:
+
+### Legacy: AiEvaluationDefinition (Testing Center)
+
+```yaml
+name: My_Tests
+subjectType: AGENT
+subjectName: My_Agent
+testCases:
+  - utterance: "Set case 500... to Working"
+    expectedTopic: Update_Case_Status
+    expectedActions: ["UpdateCaseStatus"]
+    expectedOutcome: "Confirms the case status is now Working"
+    metrics: [completeness, coherence, conciseness, output_latency_milliseconds]
+```
+
+**Valid metrics:** `completeness`, `coherence`, `conciseness`, `output_latency_milliseconds` (from `@salesforce/agents/lib/utils.js` line 66).
+
+Legacy expectation fields (`expectedTopic`, `expectedActions`, `expectedOutcome`) map to runtime assertion names: `topic_sequence_match`/`topic_assertion`, `action_sequence_match`/`actions_assertion`, `bot_response_rating`/`output_validation`.
+
+### NGT: AiTestingDefinition (Agentforce Studio)
+
+```yaml
+name: My_Tests
+subjectName: My_Agent
+testCases:
+  - inputs:
+      - utterance: "..."
+        conversationHistory: []
+    scorers:
+      - name: topic_match
+        expected: Update_Case_Status
+```
+
+**Scorers requiring `expected:`** (from `@salesforce/agents/lib/ngtScorerCatalog.js`):  
+`topic_sequence_match`, `action_sequence_match`, `agent_handoff_match`, `bot_response_rating`, `response_match`
+
+**Quality scorers (no `expected` needed):**  
+`coherence`, `conciseness`, `factuality`, `completeness`, `task_resolution`, `output_latency_milliseconds`
+
+**Critical differences:**
+
+- NGT uses `inputs` (list) + `scorers` (list), not flat expectation fields
+- NGT requires `conversationHistory: []` for the `task_resolution` scorer
+- Multi-agent subjects REQUIRE an `agent_handoff_match` scorer
+- Guessing which runner the org uses is unsafe — `sf agent generate test-spec` auto-detects from org metadata
+
+**Default to legacy/testing-center** unless you know the target org only supports `AiTestingDefinition`. When in doubt, let the CLI decide via `sf agent generate test-spec`.
+
+---
+
+## 3. The Iteration Loop — The User's Actual Goal
+
+The user's stated objective is: "run that spec over and over to improve the spec to finally build it as an Agentforce agent."
+
+`iterate.py` (B5) implements two paths:
+
+### Offline (default, `use_cli=False`)
+
+```
+derived spec (JSON)  →  agentforce_spec.yaml  →  score (offline, deterministic)
+                                                       ↓
+                                                refine role prompt
+                                                       ↓
+                                    apply_offline_improvements() [STUB — see §9]
+                                                       ↓
+                                                 next version
+```
+
+- **No org calls**, no LLM, fully deterministic
+- Cheap to iterate (< 1 second per round)
+- Improvements are local transformations: tightening prose, normalizing names, reordering steps
+- **CANNOT invent** entities, topics, or failure paths (no new evidence)
+- The OFFLINE score (from `spec_score.py`) is the arbiter of convergence
+
+### CLI mode (`use_cli=True`)
+
+```
+agentSpec.yaml (v1)
+    ↓ sf agent generate agent-spec --spec v1.yaml --role "<refined>" --target-org <org>
+agentSpec.yaml (v2, regenerated topics via org's LLM)
+    ↓ score both versions offline
+keep the higher score
+```
+
+- Shells to `sf agent generate agent-spec` which regenerates topics via the org's LLM
+- **Costs org calls** and is nondeterministic (LLM may change behavior)
+- The OFFLINE score remains the arbiter — even CLI-regenerated specs are scored deterministically
+- **LIMITATION:** The CLI round-trip does NOT re-parse generated YAML back into a `DerivedAgentSpec`. B5 currently applies offline improvements in the loop; CLI regeneration is wired but the resulting YAML is not ingested back into the loop (see §9).
+
+### Versioned Output (v1/, v2/, ...)
+
+Every iteration writes a new versioned directory (`v1/`, `v2/`, ...) containing:
+
+- `agent-spec.json` (the derived spec as JSON)
+- `agentSpec.yaml` (the Agentforce spec)
+- Score breakdown and notes
+
+Versions are **never overwritten**. The audit trail IS the product. Overwriting a version destroys provenance and is forbidden.
+
+### Stopping Conditions
+
+The loop stops when any of these is true:
+
+1. **Pass threshold reached:** `score.total >= PASS_THRESHOLD` (75) and no blocking issues
+2. **Regression:** Score dropped from the previous round (keep the better version and stop)
+3. **Convergence:** Improvement < `epsilon` (default 2 points) for 2 consecutive rounds
+4. **Max rounds:** Reached `max_rounds` (default 5)
+5. **InsufficientEvidenceError:** The RECORDING is inadequate and no amount of iteration can fix it — go re-record (exit code 5)
+
+Exit code 5 is an **informative, legitimate failure**, not a bug. It means the recording did not capture enough data to derive a meaningful spec. The correct resolution is to re-record the process with `--track-record ObjectApiName:RecordId` to capture field deltas.
+
+---
+
+## 4. The Anti-Gaming Guard and Why It Exists
+
+A loop that optimizes a score will find the cheapest path to a higher number. The cheapest path is deleting honest caveats — trimming `unknowns`, removing error-handling notes, or dropping low-confidence evidence.
+
+`iterate.py` includes an **anti-gaming guard** at line 176:
+
+```python
+if score.total > prev.score.total and curr_unknowns_count < prev_unknowns_count:
+    notes.append(
+        "WARNING: score improved but unknowns decreased — verify this is honest "
+        "refinement (filling gaps with evidence) and not gaming the metric by "
+        "deleting caveats."
+    )
+```
+
+This flags when a score improves WHILE `unknowns` shrink without new evidence. It's a signal that the loop may be hiding gaps rather than filling them.
+
+**Offline improvements may NEVER invent:**
+
+- Entities (no new fields)
+- Topics (no new conversation branches)
+- Failure paths (no fabricated error scenarios)
+
+Allowed improvements:
+
+- Tightening role prose (removing vague words)
+- Normalizing entity names (camelCase consistency)
+- Reordering orchestration steps (logical flow)
+- Expanding guardrail wording (but not inventing new guardrails)
+
+---
+
+## 5. How the Spec Is Scored Offline
+
+`spec_score.py` (B4) scores a `DerivedAgentSpec` deterministically, without an org, using seven dimensions:
+
+| Dimension | Weight | What It Measures |
+|-----------|--------|------------------|
+| `evidence_grounding` | 30 | Every entity/guardrail traceable to a `SpecEvidence` entry. Entities from `"data-delta"` score HIGHER than `"inference"`. This is the MOST IMPORTANT dimension. |
+| `completeness` | 15 | `objects_touched` non-empty, entities non-empty, orchestration steps non-trivial, guardrails present, failure_handling present. |
+| `honesty` | 20 | Unknowns are DECLARED rather than hidden. A spec with declared `unknowns` at low confidence scores BETTER than high confidence with hidden gaps. |
+| `specificity` | 10 | Intent is a concrete verb+object, not generic; no `UNRESOLVED`; topic/role text names real objects and fields. |
+| `testability` | 10 | Required entities explicit enough to write test utterances against; failure paths observed (not merely asserted). |
+| `placeholder_freedom` | 10 | Scans for markers like `Sample_Flow`, `button:Save`, `500xx0000012345AAA`, `UNRESOLVED:`, `TODO`, `FIXME`, `NEEDS EVIDENCE`, `Lorem`. |
+| `provenance_integrity` | 5 | If `extraction_source` is `"stub"` or `telemetry_source` is `"mock"`, the spec CANNOT reach the top band. Hard cap. |
+
+**Total:** 100 points  
+**Pass threshold:** 75  
+**Bands:** `low` (<60), `moderate` (60–74), `high` (75+)
+
+### The Honesty Asymmetry (Critical)
+
+This is deliberate and load-bearing:
+
+- **High confidence (≥0.7) + structural gaps (no objects/entities):** Score = 0 (dishonest)
+- **Low confidence (<0.7) + explicit `unknowns`:** Score = max (honest)
+- **Low confidence + gaps NOT declared in `unknowns`:** Score = max/2 (somewhat honest)
+
+Why? Because a loop optimizing a score will find the cheapest path to a higher number, and the cheapest path is deleting caveats. The honesty asymmetry **rewards explicit unknowns** so the loop is incentivized to surface gaps rather than hide them.
+
+### Falsifiability
+
+`spec_score.py` includes a self-check (`_assert_scorer_is_falsifiable()`) that creates two synthetic specs (one good, one bad) and confirms:
+
+1. The good spec scores higher than the bad spec
+2. The bad spec scores below `PASS_THRESHOLD`
+3. The bad spec does NOT pass
+
+A gate that always returns 100/100 trains the loop to fabricate data. The scorer must be able to FAIL.
+
+---
+
+## 6. Running the Round-Trip
+
+`scripts/agentforce_roundtrip.sh` (B9) drives the full CLI chain and reports honestly at every stage.
+
+### Usage
+
+```bash
+bash scripts/agentforce_roundtrip.sh <org-alias> <derived-spec.json> [out-dir]
+```
+
+**Arguments:**
+
+- `org-alias`: Sandbox, scratch, or `.develop.my.salesforce.com` dev org alias. PPCDM and PPCaccenture are permanently blocked.
+- `derived-spec.json`: Path to `DerivedAgentSpec` JSON (from `spec_builder.py`)
+- `out-dir`: Optional output directory (default: `./outputs/roundtrip`)
+
+**Environment:**
+
+- `DRY_RUN=1`: Run only local stages (S1/S2), skip org-dependent CLI stages
+- `PY_BIN`: Python interpreter to use (auto-detected if unset)
+
+### Stages (S1–S6)
+
+| Stage | Description | Org Required | Exit Codes |
+|-------|-------------|--------------|------------|
+| S1 | Emit `agentSpec.yaml` from derived JSON (B1) | No | 0=pass, 1=fail, 5=insufficient evidence |
+| S2 | Emit `.agent` and run local structural checks (B2) | No | 0=pass, 1=fail, 5=insufficient evidence |
+| S3 | `sf agent generate authoring-bundle` (REAL CLI) | Yes | 0=pass, 1=fail |
+| S4 | `sf agent validate authoring-bundle` (AUTHORITATIVE) | Yes | 0=pass, 1=compile error, 2=404, 3=500 |
+| S5 | Generate test spec (both dialects, B3) | No | 0=pass, 1=fail |
+| S6 | Machine-readable summary JSON | No | Always succeeds |
+
+**Exit code table (script overall):**
+
+| Code | Meaning |
+|------|---------|
+| 0 | All executed stages passed |
+| 1 | At least one stage failed |
+| 2 | Invalid arguments |
+| 3 | Org safety guard triggered |
+| 4 | CLI preflight failed |
+| 5 | InsufficientEvidenceError (recording inadequate — legitimate failure) |
+
+### DRY_RUN Mode (Local-Only Path)
+
+```bash
+DRY_RUN=1 bash scripts/agentforce_roundtrip.sh dummy-org-alias ./derived-spec.json
+```
+
+Runs S1, S2, S5, S6 only (no org calls). Use for local development or when no org is available. The `dummy-org-alias` argument is ignored.
+
+### Real Example
+
+```bash
+export SF_ACCESS_TOKEN="$(cat ~/.sf_token)"  # never pass tokens as argv
+bash scripts/agentforce_roundtrip.sh my-sandbox ./outputs/master_blueprint.agent-spec.json ./outputs/roundtrip
+```
+
+Outputs:
+
+- `./outputs/roundtrip/agentSpec.yaml`
+- `./outputs/roundtrip/AgentScript.agent`
+- `./outputs/roundtrip/authoring_bundle/` (from S3)
+- `./outputs/roundtrip/testSpec-legacy.yaml`
+- `./outputs/roundtrip/testSpec-ngt.yaml`
+- `./outputs/roundtrip/roundtrip_summary.json` (pass/fail for each stage)
+- `./outputs/roundtrip/logs/` (stdout/stderr for each stage)
+
+---
+
+## 7. Safety
+
+### Sandbox/Scratch/Dev Only
+
+- The org safety guard (S3 preflight) refuses to proceed unless `instanceUrl` matches:
+  - `*.sandbox.my.salesforce.com`
+  - `*.scratch.my.salesforce.com`
+  - `*.develop.my.salesforce.com`
+- PPCDM and PPCaccenture are **hard-blocked by alias name** (no override)
+- The guard is fail-closed: if `sf org display` fails or `instanceUrl` cannot be resolved, the script exits with code 3
+
+### Secrets
+
+- Tokens are passed via environment variables (`SF_ACCESS_TOKEN`), never as argv
+- Rationale: `ps aux` is world-readable on Unix systems
+
+### No Override
+
+There is NO override for the org safety guard. If you need to run against a production org (DON'T), you must edit the script source — that is a deliberate friction.
+
+---
+
+## 8. The Impedance Mismatch — Be Explicit, It Is the Key Design Honesty
+
+Our `DerivedAgentSpec` (from `spec_builder.py`) has first-class fields for:
+
+- `guardrails: list[str]`
+- `failure_handling: list[str]`
+
+The Agentforce spec YAML has NO dedicated fields for these. They survive only as instruction prose inside topic descriptions.
+
+From `agentforce_spec.py` (B1) line 275:
+
+```python
+# Guardrails (critical — must not be silently lost)
+if spec.guardrails:
+    description_parts.append("\nGuardrails:")
+    for guard in spec.guardrails:
+        description_parts.append(f"- {guard}")
+
+# Failure handling (if observed)
+if spec.failure_handling and not spec.failure_handling[0].startswith("No failures"):
+    description_parts.append("\nError handling:")
+    for handling in spec.failure_handling:
+        description_parts.append(f"- {handling}")
+```
+
+This is **lossy**. Guardrails and failure handling are embedded as text in `topics[].description`, not as structured fields. A human MUST verify they survived in the generated `.agent` file.
+
+### What a Reviewer Should Check
+
+Before publishing an agent, confirm:
+
+1. **Guardrails are present** in the `.agent` instructions (search for the guardrail text)
+2. **No `[NEEDS EVIDENCE` markers** remain in the `.agent` file
+3. **Topic names are consistent** between `agentSpec.yaml`, the `.agent` subagent names, and the test spec `expectedTopic` values
+4. **Actions are wired** (see §9 — actions are NOT fabricated)
+5. **Failure paths were actually recorded** (not assumed)
+6. **Provenance is `dom-capture` + `live-org`**, not `stub`/`mock` (check the JSON's `provenance` key)
+
+---
+
+## 9. What Is NOT Wired (Stated Plainly)
+
+Read the source: B1, B2, B3, B5 reported their own gaps. This section consolidates them.
+
+### Actions Are Not Fabricated
+
+From `agent_script.py` (B2) line 19:
+
+> CONSTRAINT: This module NEVER fabricates `@apex.Foo` or `@flow.Bar` action references. The only safe actions are `@utils.transition to @subagent.X` and `@utils.escalate`. If the recording observed a Flow/Apex invocation, emit a clearly-marked instruction line noting that, not a fake action reference.
+
+**Reality:** Generated `.agent` files contain only routing actions (`go_to_<topic>`) and transitions (`@utils.transition to @subagent.<name>`). No Flow or Apex actions are emitted. If the recording observed a Flow execution (via telemetry), it appears as a prose note in the subagent's instructions, not as a wired action.
+
+A human MUST manually add the `@flow.FlowName` or `@apex.ClassName.methodName` action reference after reviewing the telemetry and confirming the Flow/Apex exists in the target org.
+
+### expectedActions Is Intentionally Empty
+
+From `eval_spec.py` (B3) line 169:
+
+```python
+expectedActions=[],  # see derivation rule 7
+```
+
+And line 179 (in the derivations):
+
+```python
+gaps=[
+    "expectedActions left empty: action API names were not observed. "
+    "Re-run with action telemetry enabled or manually fill from deployed agent metadata."
+],
+```
+
+**Reality:** The test specs emit `expectedActions: []` (legacy) or omit the `action_sequence_match` scorer (NGT) because action API names are not observed by the telemetry collector. To fill this, either:
+
+1. Re-run the recording with action telemetry enabled (requires deeper instrumentation), OR
+2. After deploying the agent, query its metadata and manually populate `expectedActions` in the test spec
+
+### Offline Improvement Is a Stub
+
+From `iterate.py` (B5) line 319:
+
+```python
+def _apply_offline_improvements(spec: DerivedAgentSpec, score: Any) -> DerivedAgentSpec:
+    """Apply deterministic, local improvements without new evidence.
+    
+    ...
+    
+    This is a placeholder for deterministic transformations. Real implementation
+    would parse recommendations and apply specific fixes.
+    """
+    # Placeholder: for now, return the spec unchanged. A production version would
+    # apply specific transformations based on score.recommendations.
+    return spec
+```
+
+**Reality:** Offline improvements are NOT implemented. The loop can run and score successive versions, but when `use_cli=False`, each iteration returns the same spec unchanged. The only way to get a different spec is to use `use_cli=True`, which shells to the CLI and regenerates topics via the org's LLM.
+
+### CLI Round-Trip Does Not Re-Parse YAML
+
+From `iterate.py` (B5) line 240:
+
+```python
+# NOTE: This is a simplification. A production version would need to either:
+# (1) round-trip YAML -> DerivedAgentSpec (requires a parser agent), OR
+# (2) keep iterating on the YAML directly and score YAML only.
+# For this prototype, we'll apply offline improvements instead when use_cli=False.
+pass
+```
+
+**Reality:** When `use_cli=True`, the loop calls `sf agent generate agent-spec --spec <prev>.yaml --role "<refined>"` and writes `<next>.yaml`, but it does NOT parse the new YAML back into a `DerivedAgentSpec`. The loop continues to score and refine based on the original derived spec. The CLI-generated YAML is written to disk but not ingested back into the iteration.
+
+### Nothing Validated Against a Real Org Yet
+
+From `agent_script.py` (B2) line 12:
+
+> CRITICAL: This module emits actual code in a grammar owned by Salesforce. The ONLY authoritative reference for Agent Script syntax is: `@salesforce/agents/lib/templates/agentScriptTemplate.js`. Do not invent syntax.
+
+And from `agentforce_roundtrip.sh` (B9) line 238:
+
+```bash
+# Every generated .agent is UNVERIFIED until sf agent validate authoring-bundle says otherwise.
+```
+
+**Reality:** Every generated `.agent` file is UNVERIFIED until `sf agent validate authoring-bundle` (S4) says otherwise. Local structural checks in `agent_script.validate_locally()` catch obvious errors (tabs, unclosed quotes, missing blocks) but are NOT a substitute for CLI validation.
+
+### Three Emitters Derive Topic API Names Independently (Coupling Risk)
+
+From `eval_spec.py` (B3) line 66:
+
+```python
+def _to_api_name(text: str) -> str:
+    """Turn a phrase into a CapitalCase API name.
+    
+    This is the same normalisation B1/B2 use. The three emitters MUST agree on
+    topic-name derivation or the test suite will reference topics that don't
+    exist in the generated spec.
+    
+    COUPLING RISK: This logic is duplicated by convention across three agents.
+    If it diverges, round-trip tests break silently. Centralising this into a
+    shared utility (spec_builder, or a new naming.py) would be safer, but
+    changing spec_builder is orchestrator-gated, so for now this comment flags
+    the risk.
+    """
+```
+
+**Reality:** `agentforce_spec.py` (B1), `agent_script.py` (B2), and `eval_spec.py` (B3) each implement their own topic-name normalization function (`_to_api_name()`, `to_snake_case()`, `_to_api_name()`). They MUST agree or the test suite will reference topics that don't exist in the agent. This is a known coupling risk. If these diverge, tests will break silently.
+
+---
+
+## 10. Worked Example (End to End)
+
+### Recording → Derived Spec
+
+```bash
+export SF_ACCESS_TOKEN="$(cat ~/.sf_token)"
+.venv/bin/python -m sf_video_blueprint.cli ./inputs/update_case.mp4 \
+  --org-url "https://my-sandbox.my.salesforce.com" \
+  --mode live \
+  --track-record Case:500xx0000012345AAA \
+  --spec-output ./outputs/derived_spec.json
+```
+
+Outputs: `./outputs/derived_spec.json` (a `DerivedAgentSpec` as JSON)
+
+### Derived Spec → YAML
+
+```bash
+.venv/bin/python -c "
+import json, pathlib
+from sf_video_blueprint.agentforce_spec import build_agent_spec_yaml, write_agent_spec_yaml
+from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
+
+data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
+# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S1 for full parser)
+spec_yaml = build_agent_spec_yaml(
+    derived_spec,
+    company_name='Acme Corp',
+    company_description='Case management',
+    allow_incomplete=False
+)
+write_agent_spec_yaml(pathlib.Path('./outputs/agentSpec.yaml'), spec_yaml)
+"
+```
+
+Outputs: `./outputs/agentSpec.yaml`
+
+### YAML → .agent (CLI, Requires Org)
+
+```bash
+sf agent generate authoring-bundle \
+  --target-org my-sandbox \
+  --spec ./outputs/agentSpec.yaml \
+  --name "Case Updater" \
+  --api-name "CaseUpdater" \
+  --output-dir ./outputs/authoring_bundle \
+  --force-overwrite
+```
+
+Outputs: `./outputs/authoring_bundle/agent/CaseUpdater.agent`
+
+### Validate .agent (CLI, Requires Org)
+
+```bash
+sf agent validate authoring-bundle \
+  --target-org my-sandbox \
+  --api-name "CaseUpdater"
+```
+
+Exit codes: 0=pass, 1=compilation errors, 2=404, 3=500
+
+### Derived Spec → Test Spec
+
+```bash
+.venv/bin/python -c "
+import json, pathlib
+from sf_video_blueprint.eval_spec import build_legacy_test_spec, write_test_spec
+from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
+
+data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
+# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S5 for full parser)
+test_spec, derivations = build_legacy_test_spec(
+    derived_spec,
+    name='CaseUpdater_Tests',
+    subject_name='CaseUpdater',
+    subject_type='AGENT'
+)
+write_test_spec(pathlib.Path('./outputs/testSpec.yaml'), test_spec)
+"
+```
+
+Outputs: `./outputs/testSpec.yaml`
+
+### Score the Spec (Offline)
+
+```bash
+.venv/bin/python -c "
+from sf_video_blueprint.spec_score import score_spec_file
+score = score_spec_file(pathlib.Path('./outputs/derived_spec.json'))
+print(score.summary())
+for dim in score.dimensions.values():
+    print(f'{dim.name}: {dim.score}/{dim.max_score}')
+"
+```
+
+Example output:
+
+```
+PASS: 78/100 (high band), 0 blocking issue(s)
+evidence_grounding: 25/30
+completeness: 12/15
+honesty: 20/20
+specificity: 8/10
+testability: 8/10
+placeholder_freedom: 10/10
+provenance_integrity: 5/5
+```
+
+### Iterate to Improve
+
+```bash
+.venv/bin/python -c "
+from sf_video_blueprint.iterate import refine
+from sf_video_blueprint.spec_score import score_spec_file
+import json, pathlib
+
+data = json.loads(pathlib.Path('./outputs/derived_spec.json').read_text())
+# Parse JSON to DerivedAgentSpec (see agentforce_roundtrip.sh S1 for full parser)
+
+result = refine(
+    derived_spec,
+    out_dir=pathlib.Path('./outputs/iterations'),
+    company_name='Acme Corp',
+    company_description='Case management',
+    max_rounds=5,
+    epsilon=2,
+    org_alias='my-sandbox',
+    use_cli=False  # or True to shell to sf agent generate agent-spec
+)
+
+print(f'Best version: v{result.best.version}, score: {result.best.score.total}/{result.best.score.max_total}')
+print(f'Stop reason: {result.stop_reason}')
+"
+```
+
+Outputs: `./outputs/iterations/v1/`, `v2/`, ..., each with `agent-spec.json`, `agentSpec.yaml`, and score breakdown.
+
+### Validate End-to-End (All Stages)
+
+```bash
+bash scripts/agentforce_roundtrip.sh my-sandbox ./outputs/derived_spec.json ./outputs/roundtrip
+```
+
+Runs S1–S6 and reports pass/fail for each stage.
+
+---
+
+## 11. What a Human Must Review Before Publishing an Agent
+
+A checklist for reviewers:
+
+| Check | Where | Why |
+|-------|-------|-----|
+| Guardrails present | `.agent` instructions | Agentforce spec YAML has no guardrail field; they're embedded in topic descriptions and can be lost |
+| No `[NEEDS EVIDENCE` markers | `.agent`, YAML, test specs | Markers indicate `allow_incomplete=True` was used; these are gaps, not finished work |
+| Topic names consistent | YAML, `.agent`, test specs | Three emitters derive names independently; if they diverge, tests reference topics that don't exist |
+| Actions wired | `.agent` subagent actions | No Flow/Apex actions are auto-generated; a human must add `@flow.FlowName` or `@apex.ClassName.methodName` |
+| Failure paths recorded | Derived spec JSON | If `failure_handling` says "UNTESTED", no failure test cases exist. Record a failing run to observe error paths. |
+| Provenance is real | Derived spec JSON | Check `provenance.extraction_source` and `provenance.telemetry_source`. If either is `stub` or `mock`, the spec is fabricated. |
+| CLI validation passed | S4 output logs | Local structural checks are NOT authoritative. Only `sf agent validate authoring-bundle` confirms grammar correctness. |
+
+---
+
+## Report to Orchestrator
+
+### Sections Written
+
+All 11 required sections:
+
+1. The real CLI chain (extracted from B9, CLI flags verified)
+2. The two test-runner dialects and why conflating them fails (scorer/metric names from `ngtScorerCatalog.js` and `utils.js`)
+3. The iteration loop (offline vs CLI mode, versioned output, stopping conditions)
+4. The anti-gaming guard (line 176 of `iterate.py`, rationale for honesty asymmetry)
+5. How the spec is scored offline (7 dimensions, weights, pass threshold, falsifiability check)
+6. Running the round-trip (B9 stages, exit codes, DRY_RUN mode, real example)
+7. Safety (sandbox/scratch/dev only, token passing, no override)
+8. The impedance mismatch (guardrails/failure_handling are lossy, what to check in `.agent`)
+9. What is NOT wired (actions not fabricated, `expectedActions` empty, offline improvement stub, CLI round-trip does not re-parse, three emitters derive names independently)
+10. Worked example (recording → spec → YAML → `.agent` → validate → test spec → score → iterate)
+11. What a human must review (checklist with 7 items)
+
+### CLI Commands/Flags Documented and Where Confirmed
+
+| Command | Flags | Confirmed From |
+|---------|-------|---------------|
+| `sf agent generate authoring-bundle` | `--target-org`, `--spec`, `--name`, `--api-name`, `--output-dir`, `--force-overwrite` | B9 lines 387–394, `--help` output |
+| `sf agent validate authoring-bundle` | `--target-org`, `--api-name` | B9 lines 433–436, `--help` output |
+| `sf agent generate agent-spec` | `--spec`, `--output-file`, `--role`, `--target-org` | B5 lines 358–370 |
+| `sf agent generate test-spec` | (auto-detects runner) | B3 line 458, INTERFACE_CONTRACT.md §3.3 |
+| `sf org display` | `--target-org`, `--json` | B9 lines 143–144 |
+
+### Inconsistencies Found Between Modules
+
+1. **Topic name derivation is duplicated across three modules:**
+   - `agentforce_spec._to_api_name()` (B1, line 52): converts to `Capitalized_API_Name`
+   - `agent_script.to_snake_case()` (B2, line 40): converts to `snake_case`
+   - `eval_spec._to_api_name()` (B3, line 60): converts to `CapitalCase`
+   
+   **Risk:** If these diverge, test specs will reference topics that don't exist in the agent. B3 documents this as a coupling risk (line 66) but does not resolve it. Recommendation: Centralize topic-name derivation into a shared utility (e.g., `naming.py` or add to `spec_builder.py` if orchestrator allows).
+
+2. **Placeholder marker lists are duplicated:**
+   - `spec_score.PLACEHOLDER_MARKERS` (B4, line 54): 10 markers
+   - `scripts/score_run.py`: (not read by me, but B4 notes drift risk at line 52)
+   
+   **Risk:** If these lists diverge, one gate may pass content the other would fail. B4 recommends centralizing these markers in a shared constants module.
+
+3. **Offline improvement is a stub but the loop runs:**
+   - `iterate.refine()` (B5) runs and scores multiple rounds
+   - `_apply_offline_improvements()` (B5, line 319) returns the spec unchanged
+   - The loop only produces different specs when `use_cli=True` (which shells to the CLI)
+   
+   **Status:** This is documented as "not wired" in §9. Not an inconsistency, but a limitation.
+
+4. **CLI round-trip does not re-parse YAML:**
+   - `iterate.refine()` (B5, line 240) notes that CLI-generated YAML is not ingested back into the loop
+   - The loop continues to score and refine based on the original `DerivedAgentSpec`
+   
+   **Status:** Documented as "not wired" in §9. Not an inconsistency, but a gap.
+
+5. **Exit code 5 (`InsufficientEvidenceError`) is used by both the emitters (B1, B2) and the roundtrip script (B9):**
+   - Consistent across modules
+   - B9 documents it as "legitimate failure" (line 649)
+   
+   **Status:** Consistent and correct.
+
+6. **Test spec dialect detection:**
+   - B3 (line 458) recommends "prefer letting the CLI decide" via `sf agent generate test-spec`
+   - INTERFACE_CONTRACT.md (line 284) says "default to legacy/testing-center unless the target org only has AiTestingDefinition"
+   
+   **Minor tension:** B3's recommendation (let CLI decide) is safer than the contract's guidance (default to legacy). Not a breaking inconsistency, but the contract could be updated to say "prefer CLI detection over guessing."
+
+All inconsistencies flagged for orchestrator review.
