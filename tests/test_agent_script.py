@@ -390,6 +390,93 @@ def test_failure_handling_appears_in_instructions():
 
 
 # ============================================================================
+# TEST 7b: Block scalars are attached to an `instructions:` key (COMPILER-VERIFIED)
+# ============================================================================
+#
+# These rules are not inferred from the template — they are what the Salesforce
+# compilation API (POST /einstein/ai-agent/v1.1/authoring/scripts, afScriptVersion
+# 2.0.0) reported when the first emitted bundle was validated against org AFT3 on
+# 2026-07-26. The emitter produced a bare `->` opener for derived subagents:
+#
+#     reasoning:
+#         ->
+#         | Follow these steps:
+#
+# and `sf agent validate authoring-bundle` returned, verbatim:
+#
+#     CompilationError: Syntax error: unexpected `->` [Ln 108, Col 8]
+#     CompilationError: Syntax error: unexpected `| Follow these steps:` [Ln 109, Col 8]
+#     ... (24 errors, one per line of the block)
+#
+# Two separate grammar facts came out of that run:
+#   1. `->` is not a standalone token. It is only legal as the value of a key,
+#      i.e. `instructions: ->`. The three standard subagents (copied verbatim from
+#      the first-party template) always had this; the derived one never did.
+#   2. The `|` continuation lines must be indented DEEPER than the key that owns
+#      the `->`. Emitting them at the same column as the opener is a syntax error.
+
+
+def test_derived_subagent_block_scalar_has_instructions_key():
+    """A derived subagent's block scalar must open with `instructions: ->`, not a bare `->`.
+
+    Compiler-verified: a bare `->` produces
+    "Syntax error: unexpected `->`" from the Agentforce compilation API.
+    """
+    spec = _minimal_spec(intent="Update Case (Status)")
+    script = build_agent_script(spec, developer_name="test_agent", agent_label="Test Agent")
+
+    lines = script.split("\n")
+    bare_arrows = [
+        (i + 1, line) for i, line in enumerate(lines) if line.strip() == "->"
+    ]
+    assert not bare_arrows, (
+        "Bare `->` opener is a compile error (Syntax error: unexpected `->`). "
+        f"Found at lines {[n for n, _ in bare_arrows]}. "
+        "Every block scalar must be introduced as `instructions: ->`."
+    )
+
+    # And the derived subagent specifically must carry the key.
+    derived = subagent_name("Update Case (Status)")
+    body = script.split(f"subagent {derived}:", 1)[1]
+    assert "instructions: ->" in body, (
+        f"Derived subagent '{derived}' has no `instructions: ->` opener; "
+        "the compilation API rejects a block scalar without its owning key."
+    )
+
+
+def test_block_scalar_pipes_are_indented_deeper_than_their_opener():
+    """`|` continuation lines must be nested one level below the `instructions: ->` key.
+
+    Compiler-verified: `|` lines at the same column as the opener produce
+    "Syntax error: unexpected `| ...`" for every line in the block.
+    """
+    spec = _minimal_spec(intent="Update Case (Status)")
+    script = build_agent_script(spec, developer_name="test_agent", agent_label="Test Agent")
+
+    lines = script.split("\n")
+    opener_indent: int | None = None
+    checked = 0
+
+    for i, line in enumerate(lines, start=1):
+        stripped = line.strip()
+        if stripped.endswith("->"):
+            opener_indent = len(line) - len(line.lstrip(" "))
+            continue
+        if stripped.startswith("|") and opener_indent is not None:
+            pipe_indent = len(line) - len(line.lstrip(" "))
+            assert pipe_indent > opener_indent, (
+                f"Line {i}: `|` line is indented {pipe_indent} but its `->` opener is at "
+                f"{opener_indent}. The compilation API rejects this as "
+                f"'Syntax error: unexpected `{stripped[:40]}`'."
+            )
+            checked += 1
+        elif stripped and not stripped.startswith("|"):
+            opener_indent = None
+
+    assert checked > 0, "Test found no block scalar lines to check; it would pass vacuously."
+
+
+# ============================================================================
 # TEST 8: Refuse-by-default on insufficient evidence
 # ============================================================================
 

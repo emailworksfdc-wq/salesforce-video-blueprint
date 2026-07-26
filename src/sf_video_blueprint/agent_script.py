@@ -79,20 +79,45 @@ def _indent(text: str, level: int) -> str:
     return "\n".join(spaces + line if line else "" for line in text.split("\n"))
 
 
-def _block_scalar(lines: list[str], indent_level: int) -> str:
-    """Format a multi-line block scalar using the `-> | ...` convention.
+def _block_scalar(lines: list[str], indent_level: int, *, key: str = "instructions") -> str:
+    """Format a multi-line block scalar as `<key>: ->` followed by `|` lines.
 
-    Returns the `->` opener line, then each content line prefixed with `| ` and
-    indented to `indent_level`. Each line is individually sanitized to prevent
-    structural breakage: tabs are converted to spaces, leading colons are escaped,
-    and unintended indentation is neutralized.
+    Two rules here are **compiler-verified**, not inferred from the template. The
+    first bundle this project ever sent to Salesforce's compilation API
+    (``POST /einstein/ai-agent/v1.1/authoring/scripts``, ``afScriptVersion``
+    ``2.0.0``, org AFT3, 2026-07-26) emitted a bare ``->`` opener with the ``|``
+    lines at the same column, and was rejected with 24 errors beginning::
+
+        CompilationError: Syntax error: unexpected `->` [Ln 108, Col 8]
+        CompilationError: Syntax error: unexpected `| Follow these steps:` [Ln 109, Col 8]
+
+    So:
+
+    1. ``->`` is not a standalone token. It is only legal as the *value of a key*,
+       hence the mandatory ``key`` (``instructions: ->``). The three standard
+       subagents were copied verbatim from the first-party template and always had
+       this key, which is why only the derived subagent failed.
+    2. The ``|`` continuation lines must be indented one level *deeper* than the
+       key that owns the ``->``. Same-column pipes are a syntax error per line.
+
+    Each line is additionally sanitized to prevent structural breakage: tabs are
+    converted to spaces, leading colons are escaped, and unintended indentation is
+    neutralized.
 
     The block scalar format is the ONLY place in Agent Script where multi-line text
     can safely appear. Config values use _quote() for single-line escaping; this
     function handles multi-line instructions.
+
+    Args:
+        lines: Content lines, each of which becomes one ``|`` line.
+        indent_level: Indent level of the ``<key>: ->`` opener.
+        key: The key that owns the block scalar. Defaults to ``instructions``,
+            the only owner the grammar is known to accept in a ``reasoning:`` block.
     """
     indent = "    " * indent_level
-    opener = f"{indent}->"
+    opener = f"{indent}{key}: ->"
+    # Compiler-verified: pipes must be deeper than the key that owns the `->`.
+    body_indent = "    " * (indent_level + 1)
 
     sanitized_lines: list[str] = []
     for line in lines:
@@ -111,7 +136,9 @@ def _block_scalar(lines: list[str], indent_level: int) -> str:
 
         sanitized_lines.append(sanitized)
 
-    body_lines = [f"{indent}| {line}" if line else f"{indent}|" for line in sanitized_lines]
+    body_lines = [
+        f"{body_indent}| {line}" if line else f"{body_indent}|" for line in sanitized_lines
+    ]
     return "\n".join([opener] + body_lines)
 
 
@@ -308,7 +335,8 @@ class AgentScriptBuilder:
         self.lines.append(f'    description: "{_quote(description)}"')
         self.lines.append("")
         self.lines.append("    reasoning:")
-        # Use block scalar for instructions
+        # `instructions: ->` sits one level inside `reasoning:` (level 2); _block_scalar
+        # nests the `|` lines at level 3. Both are compiler-verified — see _block_scalar.
         self.lines.append(_block_scalar(instructions, indent_level=2))
         self.lines.append("")
 
