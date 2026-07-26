@@ -72,9 +72,14 @@ table is the most important thing in this README.
 The pipeline is reachable three ways — an [MCP server](#1--mcp-server--use-it-from-any-ai-tool)
 for any AI harness, a [Python API](#2--python-library), and a [CLI](#3--command-line).
 That is packaging, not progress against the table above: all three run the same
-offline pipeline. None of them contacts an org — the validation above was driven
-by invoking the `sf` CLI separately on the emitted bundle, not by any code path
-in this repo.
+offline pipeline and none of them contacts an org.
+
+The one code path that does is `scripts/agentforce_roundtrip.sh`, which drives the
+whole chain — derive, score, emit the bundle into a throwaway SFDX project, then
+`sf agent validate authoring-bundle`. It runs **offline by default**; the org step
+is opt-in behind `--org <alias>`, and when you omit it the run says so rather than
+implying a verdict it never got. That script is how the validation above was
+performed and how you can reproduce it.
 
 ### How to validate an emitted bundle yourself
 
@@ -98,6 +103,20 @@ Exit 0 with `{"success": true}` means the Agent Script compiled. Exit 1 returns 
 `data.errors[]` array with `errorType`, `description`, and line/column for each
 error. Deploying (`sf project deploy start -d force-app`) is a separate,
 optional step and is only needed to publish.
+
+Or let the round-trip script do all of it, including laying out the throwaway
+project:
+
+```bash
+bash scripts/agentforce_roundtrip.sh --org <your-org>   # derive → score → emit → validate
+bash scripts/agentforce_roundtrip.sh                    # same, minus the org step
+```
+
+Every API name in the emitted artifacts is derived from `naming.py`, so the
+bundle, the `.agent` config, and both test-spec dialects cannot drift apart. Drop
+`--org` and the run reports the compile step as `SKIPPED` and ends with
+`NOTHING WAS VALIDATED BY SALESFORCE` — it will not imply a verdict it did not
+get. See [`docs/step6-agentforce-bridge.md`](docs/step6-agentforce-bridge.md) §6.
 
 ---
 
@@ -388,7 +407,6 @@ This project keeps an honest ledger rather than a feature list. Full detail in
 | UTF-8 BOM not stripped (`:217`) | A BOM-prefixed capture silently loses its first event. |
 | Leak detector inspects only `element.name` (`:414`) | The recorder derives field identity from eight signals. A secret identified via `type=password` or an SF field API name is not caught. |
 | `redaction.py` has zero production callers | The redaction primitives exist and are tested, but nothing in the pipeline calls them. |
-| `scripts/agentforce_roundtrip.sh` uses three different agent names in one run | A test run would target an agent that does not exist. Fix before spending an org run. |
 | Correlation is temporal, not causal | The join proves telemetry was *fetched during* a step, not *caused by* it. |
 | The `v0.1.0` tag does not install | It predates the dependency fix, so `pip install …@v0.1.0` fails to build `greenlet` on Python 3.12+. Install from `@main`. |
 | Video extraction is a stub | `HeuristicVideoExtractor` never decodes video; any video yields one placeholder step. **Use `--capture`.** |
