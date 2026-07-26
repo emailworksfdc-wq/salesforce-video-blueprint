@@ -2,66 +2,116 @@
 set -euo pipefail
 
 # ============================================================================
-# agentforce_roundtrip.sh — REAL verification for Step 6 Agentforce spec output
+# agentforce_roundtrip.sh — the whole round trip, end to end, honestly reported
 # ============================================================================
-# Drives a derived agent spec through the actual Salesforce CLI and reports
-# honestly at every stage. This is the ONLY authority on whether our generated
-# YAML, .agent, and testSpec files are accepted by the CLI.
+# capture -> derive -> score -> emit bundle -> emit test specs -> validate -> report
 #
-# Owner: B9
-# Contract: INTERFACE_CONTRACT.md § 3
-# Pattern source: validate_dev_org.sh (PY_BIN preflight, env-var token passing,
-#                 honest exit codes, real failure detection)
+# Runs offline by default. Pass `--org <alias>` to add the one org-dependent
+# stage (`sf agent validate authoring-bundle`, which compiles the .agent file
+# against Salesforce's real compiler).
 #
-# Requirements met:
-# 1. PY_BIN preflight identical in spirit to validate_dev_org.sh
-# 2. Org safety guard (sandbox/scratch/dev only, PPCDM/PPCaccenture hard-blocked)
-# 3. CLI preflight (sf exists, agent topic available)
-# 4. Six stages: local emit (S1/S2), CLI generate/validate (S3/S4), test-spec (S5), summary (S6)
-# 5. All CLI stdout/stderr captured to files, last 20 lines printed on failure
-# 6. No hardcoded success literals — every status from real exit codes
-# 7. Secrets passed via env vars, never argv
-# 8. DRY_RUN=1 support (S1/S2 only, no org)
-# 9. Exit non-zero if any executed stage failed
-# 10. bash -n clean
+# WHY THIS SCRIPT WAS REWRITTEN
+#
+# The previous version referred to three different agent names in a single run:
+# the .agent config said `test_agent`, the CLI flags said `RoundtripTestAgent`,
+# and both test specs said `TestAgent`. So it could never have completed a real
+# round trip — the emitted test suite targeted an agent that did not exist.
+# Every name is now derived from `naming.py` via `scripts/roundtrip_lib.py`; this
+# script does not spell a single API name itself.
+#
+# It also printed "All executed stages PASSED" while the org stages were skipped.
+# A skipped stage is now reported as SKIPPED, in the summary line and in the JSON,
+# and the final line names what did not run.
+#
+# House style: `scripts/ci_smoke_check.py` and `scripts/mcp_stdio_check.py` —
+# fail loudly, explain why, never assert a success that was not measured.
 # ============================================================================
 
 usage() {
-  cat <<EOF
-Usage: $0 <org-alias> <derived-spec.json> [out-dir]
+  cat <<'EOF'
+Usage: agentforce_roundtrip.sh [--capture <file>] [--spec <file>] [--org <alias>]
+                               [--out <dir>] [--keep-going]
 
-Arguments:
-  org-alias          Sandbox, scratch, or .develop.my.salesforce.com dev org alias.
-                     PPCDM and PPCaccenture are permanently blocked.
-  derived-spec.json  Path to DerivedAgentSpec JSON (from spec_builder.py).
-  out-dir            Optional output directory (default: ./outputs/roundtrip).
+Runs the full round trip. Offline by default; every org call is opt-in.
+
+Options:
+  --capture <file>  DOM capture JSONL to derive a spec from.
+                    Default: examples/case_triage.dom_capture.jsonl
+  --spec <file>     Skip capture and start from an existing agent-spec JSON.
+                    Mutually exclusive with --capture.
+  --org <alias>     Run the org-dependent validate stage against this alias.
+                    Omitted => S6 reports SKIPPED and claims nothing.
+  --out <dir>       Output directory. Default: ./outputs/roundtrip
+  --keep-going      Do not stop at the first failed stage (still exits non-zero).
+  -h, --help        This text.
 
 Environment:
-  DRY_RUN=1          Run only local stages (S1/S2), skip org-dependent CLI stages.
-  PY_BIN             Python interpreter to use (auto-detected if unset).
+  PY_BIN            Python interpreter (>=3.11). Auto-detected if unset.
 
 Exit codes:
-  0   All executed stages passed
-  1   At least one stage failed
-  2   Invalid arguments
-  3   Org safety guard triggered
-  4   CLI preflight failed
-  5   InsufficientEvidenceError (recording inadequate — legitimate failure)
+  0  every stage that RAN passed (skipped org stages are reported, not claimed)
+  1  at least one stage failed
+  2  bad arguments / preflight failure
+  3  org safety guard tripped
+  5  InsufficientEvidenceError — the recording is inadequate (a real finding)
+
+Notes:
+  * `sf agent validate authoring-bundle` is `requiresProject = true`: it resolves
+    the bundle from a local SFDX project and POSTs the file content to the
+    compile API, using the org for auth only. No deploy is required, so this
+    script does not deploy and creates no metadata in the org.
+  * The quality gate is REPORTED, never enforced down. A mock-telemetry run is
+    supposed to fail the gate; that is the gate working.
 EOF
-  exit 2
 }
 
-if [[ $# -lt 2 ]]; then
-  usage
+# ----------------------------------------------------------------------------
+# Argument parsing
+# ----------------------------------------------------------------------------
+CAPTURE=""
+SPEC_IN=""
+ORG_ALIAS=""
+OUT_DIR="./outputs/roundtrip"
+KEEP_GOING=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --capture) CAPTURE="${2:-}"; shift 2 ;;
+    --spec)    SPEC_IN="${2:-}"; shift 2 ;;
+    --org)     ORG_ALIAS="${2:-}"; shift 2 ;;
+    --out)     OUT_DIR="${2:-}"; shift 2 ;;
+    --keep-going) KEEP_GOING=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "ERROR: unknown argument: $1" >&2; echo >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_CAPTURE="${REPO_ROOT}/examples/case_triage.dom_capture.jsonl"
+
+if [[ -n "${CAPTURE}" && -n "${SPEC_IN}" ]]; then
+  echo "ERROR: --capture and --spec are mutually exclusive" >&2
+  exit 2
+fi
+if [[ -z "${SPEC_IN}" && -z "${CAPTURE}" ]]; then
+  CAPTURE="${DEFAULT_CAPTURE}"
+fi
+if [[ -n "${CAPTURE}" && ! -f "${CAPTURE}" ]]; then
+  echo "ERROR: capture file not found: ${CAPTURE}" >&2
+  exit 2
+fi
+if [[ -n "${SPEC_IN}" && ! -f "${SPEC_IN}" ]]; then
+  echo "ERROR: spec file not found: ${SPEC_IN}" >&2
+  exit 2
 fi
 
-ORG_ALIAS="$1"
-DERIVED_SPEC="$2"
-OUT_DIR="${3:-./outputs/roundtrip}"
-DRY_RUN="${DRY_RUN:-0}"
+LOG_DIR="${OUT_DIR}/logs"
+mkdir -p "${LOG_DIR}"
 
-[[ -f "${DERIVED_SPEC}" ]] || { echo "ERROR: derived spec not found: ${DERIVED_SPEC}" >&2; exit 2; }
-mkdir -p "${OUT_DIR}/logs"
+# `sf` prints an update notice and ANSI colour into stdout, which corrupts
+# --json parsing downstream. Silence both before any sf call.
+export SF_SKIP_NEW_VERSION_CHECK=true NO_COLOR=1 FORCE_COLOR=0
+export SF_DISABLE_LOG_FILE=true
 
 die() {
   echo "ERROR: $*" >&2
@@ -70,585 +120,403 @@ die() {
 
 banner() {
   echo ""
-  echo "========================================"
+  echo "=============================================================="
   echo "  $1"
-  echo "========================================"
+  echo "=============================================================="
+}
+
+# --- Stage bookkeeping ------------------------------------------------------
+# Names, statuses and details are kept in parallel arrays (bash 3.2 on macOS has
+# no associative-array ordering guarantees worth relying on). Every stage MUST
+# land in exactly one of: pass / fail / skipped / insufficient_evidence.
+STAGE_NAMES=()
+STAGE_STATUSES=()
+STAGE_DETAILS=()
+FINAL_EXIT=0
+
+record_stage() {
+  # record_stage <name> <status> <detail>
+  STAGE_NAMES+=("$1")
+  STAGE_STATUSES+=("$2")
+  STAGE_DETAILS+=("$3")
+  case "$2" in
+    pass)    echo "  [pass]    $1" ;;
+    skipped) echo "  [SKIPPED] $1 — $3" ;;
+    insufficient_evidence)
+             echo "  [EVIDENCE] $1 — $3"
+             FINAL_EXIT=5 ;;
+    fail)    echo "  [FAIL]    $1 — $3"
+             [[ ${FINAL_EXIT} -eq 5 ]] || FINAL_EXIT=1 ;;
+    *) die "internal error: unknown stage status '$2'" ;;
+  esac
+}
+
+# Defined before its first caller (`halt_unless_keep_going`, which can fire from
+# S1 onwards): bash resolves function names at call time, so a definition further
+# down the file would abort an early failure with "command not found" instead of
+# writing the summary that explains what went wrong.
+write_summary() {
+  local summary="${OUT_DIR}/roundtrip_summary.json"
+  RT_STAGE_NAMES="$(printf '%s\n' "${STAGE_NAMES[@]:-}")" \
+  RT_STAGE_STATUSES="$(printf '%s\n' "${STAGE_STATUSES[@]:-}")" \
+  RT_STAGE_DETAILS="$(printf '%s\n' "${STAGE_DETAILS[@]:-}")" \
+  RT_ORG_ALIAS="${ORG_ALIAS}" \
+  RT_SUMMARY_PATH="${summary}" \
+  RT_IDENTITY_PATH="${LOG_DIR}/s2_identity.json" \
+  "${PY_BIN}" - <<'PY'
+import json, os
+from pathlib import Path
+
+def lines(key):
+    raw = os.environ.get(key, "")
+    return [line for line in raw.splitlines() if line]
+
+names, statuses, details = lines("RT_STAGE_NAMES"), lines("RT_STAGE_STATUSES"), lines("RT_STAGE_DETAILS")
+stages = [
+    {"stage": n, "status": s, "detail": d}
+    for n, s, d in zip(names, statuses, details)
+]
+
+ran = [s for s in stages if s["status"] != "skipped"]
+skipped = [s for s in stages if s["status"] == "skipped"]
+failed = [s for s in stages if s["status"] in ("fail", "insufficient_evidence")]
+org_alias = os.environ.get("RT_ORG_ALIAS", "")
+validated = any(s["stage"] == "s5_org_validate" and s["status"] == "pass" for s in stages)
+
+identity = {}
+identity_path = Path(os.environ["RT_IDENTITY_PATH"])
+if identity_path.is_file():
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+
+payload = {
+    # Deliberately NOT called "pass": a run where every org stage was skipped
+    # has not passed a round trip, and a single boolean invited exactly the
+    # overclaim this script used to make.
+    "all_executed_stages_passed": not failed,
+    "stages_run": len(ran),
+    "stages_skipped": len(skipped),
+    "salesforce_validated": validated,
+    "org_alias": org_alias or None,
+    "derived_names": identity,
+    "stages": stages,
+}
+Path(os.environ["RT_SUMMARY_PATH"]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+# Stop at the first failure unless --keep-going: continuing past a broken stage
+# is how the previous version ended up reporting success for work it never did.
+halt_unless_keep_going() {
+  if [[ ${KEEP_GOING} -eq 0 ]]; then
+    write_summary
+    echo ""
+    echo "ABORTED after a failed stage. Re-run with --keep-going to see the rest."
+    exit "${FINAL_EXIT}"
+  fi
 }
 
 # ============================================================================
-# Preflight 1: Python interpreter (identical to validate_dev_org.sh pattern)
+# Preflight — interpreter and imports
 # ============================================================================
-banner "Preflight: Python interpreter"
+banner "Preflight"
 
 PY_BIN="${PY_BIN:-}"
 if [[ -z "${PY_BIN}" ]]; then
-  if [[ -x "./.venv/bin/python" ]]; then
-    PY_BIN="./.venv/bin/python"
-  else
-    for cand in python3.13 python3.12 python3.11 python3; do
-      if command -v "${cand}" >/dev/null 2>&1; then
-        PY_BIN="$(command -v "${cand}")"
-        break
-      fi
-    done
-  fi
+  for cand in "${REPO_ROOT}/.lanevenv/bin/python" "${REPO_ROOT}/.venv/bin/python"; do
+    if [[ -x "${cand}" ]]; then PY_BIN="${cand}"; break; fi
+  done
 fi
+if [[ -z "${PY_BIN}" ]]; then
+  for cand in python3.13 python3.12 python3.11 python3; do
+    if command -v "${cand}" >/dev/null 2>&1; then PY_BIN="$(command -v "${cand}")"; break; fi
+  done
+fi
+[[ -n "${PY_BIN}" ]] || die "no python3 interpreter found; set PY_BIN" 2
 
-[[ -n "${PY_BIN}" ]] || die "no python3 interpreter found" 2
-
-# Assert Python >= 3.11 (PEP 604 unions)
-"${PY_BIN}" - <<'PY' || die "Python >=3.11 required; set PY_BIN or create ./.venv (uv venv --python 3.13 .venv)" 2
+"${PY_BIN}" - <<'PY' || die "Python >=3.11 required (PEP 604 unions are evaluated at runtime); set PY_BIN" 2
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
 PY
+echo "  interpreter: ${PY_BIN} ($("${PY_BIN}" -V 2>&1))"
 
-echo "  interpreter: ${PY_BIN} ($(${PY_BIN} -V 2>&1))"
-
-# Assert project imports work
-"${PY_BIN}" -c 'import sf_video_blueprint.agentforce_spec' >/dev/null 2>&1 || \
-  die "sf_video_blueprint.agentforce_spec not importable. Run: uv pip install --python ${PY_BIN} -e ." 2
-
-"${PY_BIN}" -c 'import sf_video_blueprint.agent_script' >/dev/null 2>&1 || \
-  die "sf_video_blueprint.agent_script not importable. Run: uv pip install --python ${PY_BIN} -e ." 2
-
-"${PY_BIN}" -c 'import sf_video_blueprint.eval_spec' >/dev/null 2>&1 || \
-  die "sf_video_blueprint.eval_spec not importable. Run: uv pip install --python ${PY_BIN} -e ." 2
-
-echo "  ✓ Project imports verified"
+RT_LIB="${REPO_ROOT}/scripts/roundtrip_lib.py"
+[[ -f "${RT_LIB}" ]] || die "missing ${RT_LIB}" 2
+"${PY_BIN}" "${RT_LIB}" --help >/dev/null 2>&1 \
+  || die "roundtrip_lib.py is not importable with ${PY_BIN}. Run: ${PY_BIN} -m pip install -e '.[dev]'" 2
+echo "  round-trip library: OK"
 
 # ============================================================================
-# Preflight 2: CLI itself
+# Preflight — org, only when --org was passed
 # ============================================================================
-banner "Preflight: Salesforce CLI"
+ORG_INSTANCE=""
+if [[ -n "${ORG_ALIAS}" ]]; then
+  banner "Preflight: org ${ORG_ALIAS}"
 
-command -v sf >/dev/null 2>&1 || die "sf CLI not found in PATH" 4
-SF_VERSION="$(sf --version 2>&1 | head -1)"
-echo "  ${SF_VERSION}"
-
-sf agent --help >/dev/null 2>&1 || die "agent topic not available. Install: sf plugins install @salesforce/plugin-agent" 4
-echo "  ✓ agent topic available"
-
-# ============================================================================
-# Preflight 3: Org safety guard (HARD BLOCK — no override)
-# ============================================================================
-if [[ "${DRY_RUN}" == "0" ]]; then
-  banner "Preflight: Org safety guard"
-
-  # HARD BLOCK by alias name
+  # Hard block, no override. These two orgs are out of scope for this project
+  # even read-only.
   if [[ "${ORG_ALIAS}" == "PPCDM" || "${ORG_ALIAS}" == "PPCaccenture" ]]; then
-    die "PPCDM and PPCaccenture are permanently out of scope for this project" 3
+    die "${ORG_ALIAS} is permanently out of scope for this project" 3
   fi
+
+  command -v sf >/dev/null 2>&1 || die "sf CLI not found in PATH" 2
+  echo "  $(sf --version 2>&1 | head -1)"
+  sf agent --help >/dev/null 2>&1 \
+    || die "sf agent topic unavailable. Install: sf plugins install @salesforce/plugin-agent" 2
 
   set +e
-  ORG_DISPLAY_JSON="$(SF_DISABLE_LOG_FILE=true sf org display --target-org "${ORG_ALIAS}" --json 2>&1)"
-  ORG_DISPLAY_RC=$?
+  ORG_JSON="$(sf org display --target-org "${ORG_ALIAS}" --json 2>&1)"
+  ORG_RC=$?
   set -e
-
-  if [[ ${ORG_DISPLAY_RC} -ne 0 ]]; then
-    echo "ERROR: sf org display failed for ${ORG_ALIAS}" >&2
-    echo "${ORG_DISPLAY_JSON}" >&2
-    exit 3
+  if [[ ${ORG_RC} -ne 0 ]]; then
+    echo "${ORG_JSON}" >&2
+    die "sf org display failed for ${ORG_ALIAS}" 3
   fi
 
-  INSTANCE_URL="$("${PY_BIN}" - <<PY
-import sys, json
-data = json.loads('''${ORG_DISPLAY_JSON}''')
-print(data.get("result", {}).get("instanceUrl", ""))
+  # Strip ANSI and slice from the first `{`: sf can still prepend warnings.
+  ORG_INSTANCE="$(
+    ORG_JSON="${ORG_JSON}" "${PY_BIN}" - <<'PY'
+import json, os, re, sys
+raw = re.sub(r"\x1b\[[0-9;]*m", "", os.environ["ORG_JSON"])
+raw = raw[raw.index("{"):]
+print(json.loads(raw).get("result", {}).get("instanceUrl", ""))
 PY
-)"
+  )"
+  [[ -n "${ORG_INSTANCE}" ]] || die "could not resolve instanceUrl for ${ORG_ALIAS}" 3
 
-  [[ -n "${INSTANCE_URL}" ]] || die "could not resolve instanceUrl for ${ORG_ALIAS}" 3
-
-  echo "  org: ${ORG_ALIAS}"
-  echo "  instance: ${INSTANCE_URL}"
-
-  # Refuse production: only allow sandbox, scratch, or .develop.my.salesforce.com dev orgs
-  if [[ "${INSTANCE_URL}" =~ \.sandbox\.my\.salesforce\.com$ ]] || \
-     [[ "${INSTANCE_URL}" =~ \.scratch\.my\.salesforce\.com$ ]] || \
-     [[ "${INSTANCE_URL}" =~ \.develop\.my\.salesforce\.com$ ]] || \
-     [[ "${INSTANCE_URL}" =~ ^https://[^.]+--[^.]+\.sandbox\.my\.salesforce\.com$ ]]; then
-    echo "  ✓ Org is sandbox/scratch/dev (safe)"
-  else
-    die "Org safety guard: ${INSTANCE_URL} is NOT a sandbox/scratch/dev org. Refusing to proceed." 3
-  fi
+  # Refuse anything that is not demonstrably a sandbox, scratch or dev org.
+  # The instance URL is host-only and carries no credential, so it is safe to
+  # print; tokens and frontdoor URLs are never echoed anywhere in this script.
+  case "${ORG_INSTANCE}" in
+    *.sandbox.my.salesforce.com|*.scratch.my.salesforce.com|*.develop.my.salesforce.com)
+      echo "  instance: ${ORG_INSTANCE} (sandbox/scratch/dev — safe)" ;;
+    *)
+      die "org safety guard: ${ORG_INSTANCE} is not a sandbox/scratch/dev org" 3 ;;
+  esac
 fi
 
 # ============================================================================
-# STAGE 1: Emit agentSpec.yaml from derived JSON
+# S1: capture -> derived spec
 # ============================================================================
-banner "S1: agentSpec.yaml (local)"
+banner "S1: derive a spec from the capture"
 
-S1_STATUS="unknown"
-S1_EXIT=999
-S1_START="$(date +%s)"
-AGENT_SPEC_YAML="${OUT_DIR}/agentSpec.yaml"
-
-set +e
-"${PY_BIN}" - <<PY "${DERIVED_SPEC}" "${AGENT_SPEC_YAML}" >"${OUT_DIR}/logs/s1_agentspec.out" 2>"${OUT_DIR}/logs/s1_agentspec.err"
-import sys, json, pathlib
-from sf_video_blueprint.agentforce_spec import build_agent_spec_yaml, write_agent_spec_yaml, InsufficientEvidenceError
-from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
-
-def parse_derived_spec(data: dict) -> DerivedAgentSpec:
-    """Parse a JSON dict into a DerivedAgentSpec with proper nested dataclasses."""
-    entities = [
-        DerivedEntity(
-            name=e["name"],
-            object_api_name=e.get("object_api_name"),
-            field_api_name=e.get("field_api_name"),
-            evidence=[SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in e.get("evidence", [])]
-        )
-        for e in data.get("entities", [])
-    ]
-    evidence = [SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in data.get("evidence", [])]
-
-    return DerivedAgentSpec(
-        intent=data["intent"],
-        confidence=data["confidence"],
-        objects_touched=data.get("objects_touched", []),
-        entities=entities,
-        orchestration_steps=data.get("orchestration_steps", []),
-        guardrails=data.get("guardrails", []),
-        failure_handling=data.get("failure_handling", []),
-        unknowns=data.get("unknowns", []),
-        evidence=evidence,
-    )
-
-try:
-    derived_path = pathlib.Path(sys.argv[1])
-    out_path = pathlib.Path(sys.argv[2])
-    derived_json = json.loads(derived_path.read_text(encoding="utf-8"))
-
-    # Parse JSON to DerivedAgentSpec
-    derived_spec = parse_derived_spec(derived_json)
-
-    # Build the YAML structure
-    spec_yaml = build_agent_spec_yaml(
-        derived_spec,
-        company_name=derived_json.get("company_name", "Unknown Company"),
-        company_description=derived_json.get("company_description", "Unknown description"),
-        allow_incomplete=False  # Fail loudly if evidence is insufficient
-    )
-
-    # Write to disk
-    write_agent_spec_yaml(out_path, spec_yaml)
-    print(f"✓ Wrote {out_path}")
-except InsufficientEvidenceError as e:
-    print(f"INSUFFICIENT_EVIDENCE: {e}", file=sys.stderr)
-    sys.exit(5)
-except Exception as e:
-    print(f"ERROR: {e}", file=sys.stderr)
-    import traceback
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-PY
-S1_EXIT=$?
-set -e
-
-S1_END="$(date +%s)"
-S1_DURATION=$((S1_END - S1_START))
-
-if [[ ${S1_EXIT} -eq 0 ]]; then
-  S1_STATUS="pass"
-  echo "  ✓ agentSpec.yaml emitted: ${AGENT_SPEC_YAML}"
-elif [[ ${S1_EXIT} -eq 5 ]]; then
-  S1_STATUS="insufficient_evidence"
-  echo "  ✗ Recording is inadequate (InsufficientEvidenceError)"
-  tail -20 "${OUT_DIR}/logs/s1_agentspec.err"
+DERIVED_SPEC="${SPEC_IN}"
+if [[ -n "${SPEC_IN}" ]]; then
+  record_stage "s1_derive_spec" "skipped" "--spec given; using ${SPEC_IN} as-is"
 else
-  S1_STATUS="fail"
-  echo "  ✗ agentSpec.yaml emission failed"
-  tail -20 "${OUT_DIR}/logs/s1_agentspec.err"
-fi
-
-# ============================================================================
-# STAGE 2: Emit local .agent and run its structural checks
-# ============================================================================
-banner "S2: Agent Script (local checks)"
-
-S2_STATUS="unknown"
-S2_EXIT=999
-S2_START="$(date +%s)"
-AGENT_SCRIPT_FILE="${OUT_DIR}/AgentScript.agent"
-
-set +e
-"${PY_BIN}" - <<PY "${DERIVED_SPEC}" "${AGENT_SCRIPT_FILE}" >"${OUT_DIR}/logs/s2_agentscript.out" 2>"${OUT_DIR}/logs/s2_agentscript.err"
-import sys, json, pathlib
-from sf_video_blueprint.agent_script import build_agent_script, write_agent_script, validate_locally, InsufficientEvidenceError
-from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
-
-def parse_derived_spec(data: dict) -> DerivedAgentSpec:
-    """Parse a JSON dict into a DerivedAgentSpec with proper nested dataclasses."""
-    entities = [
-        DerivedEntity(
-            name=e["name"],
-            object_api_name=e.get("object_api_name"),
-            field_api_name=e.get("field_api_name"),
-            evidence=[SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in e.get("evidence", [])]
-        )
-        for e in data.get("entities", [])
-    ]
-    evidence = [SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in data.get("evidence", [])]
-
-    return DerivedAgentSpec(
-        intent=data["intent"],
-        confidence=data["confidence"],
-        objects_touched=data.get("objects_touched", []),
-        entities=entities,
-        orchestration_steps=data.get("orchestration_steps", []),
-        guardrails=data.get("guardrails", []),
-        failure_handling=data.get("failure_handling", []),
-        unknowns=data.get("unknowns", []),
-        evidence=evidence,
-    )
-
-try:
-    derived_path = pathlib.Path(sys.argv[1])
-    out_path = pathlib.Path(sys.argv[2])
-    derived_json = json.loads(derived_path.read_text(encoding="utf-8"))
-
-    # Parse JSON to DerivedAgentSpec
-    derived_spec = parse_derived_spec(derived_json)
-
-    # Build Agent Script content
-    script_content = build_agent_script(
-        derived_spec,
-        developer_name="test_agent",
-        agent_label="Test Agent",
-        description=derived_json.get("intent", "Test agent description"),
-        allow_incomplete=False
-    )
-
-    # Run local structural checks
-    errors = validate_locally(script_content)
-    if errors:
-        print("Local structural checks found issues:", file=sys.stderr)
-        for err in errors:
-            print(f"  - {err}", file=sys.stderr)
-        print("NOTE: These are LOCAL checks only. CLI validation (S4) is authoritative.", file=sys.stderr)
-
-    # Write to disk
-    write_agent_script(out_path, script_content)
-    print(f"✓ Wrote {out_path}")
-    if errors:
-        print(f"  (with {len(errors)} local warnings)")
-except InsufficientEvidenceError as e:
-    print(f"INSUFFICIENT_EVIDENCE: {e}", file=sys.stderr)
-    sys.exit(5)
-except Exception as e:
-    print(f"ERROR: {e}", file=sys.stderr)
-    import traceback
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-PY
-S2_EXIT=$?
-set -e
-
-S2_END="$(date +%s)"
-S2_DURATION=$((S2_END - S2_START))
-
-if [[ ${S2_EXIT} -eq 0 ]]; then
-  S2_STATUS="pass"
-  echo "  ✓ Agent Script emitted (local structural checks ONLY): ${AGENT_SCRIPT_FILE}"
-  echo "  NOTE: Local checks are NOT CLI validation — see S4 for real verdict"
-elif [[ ${S2_EXIT} -eq 5 ]]; then
-  S2_STATUS="insufficient_evidence"
-  echo "  ✗ Recording is inadequate (InsufficientEvidenceError)"
-  tail -20 "${OUT_DIR}/logs/s2_agentscript.err"
-else
-  S2_STATUS="fail"
-  echo "  ✗ Agent Script emission failed"
-  tail -20 "${OUT_DIR}/logs/s2_agentscript.err"
-fi
-
-# ============================================================================
-# STAGE 3: sf agent generate authoring-bundle (REAL CLI)
-# ============================================================================
-S3_STATUS="skipped"
-S3_EXIT=0
-S3_DURATION=0
-AUTHORING_BUNDLE_DIR="${OUT_DIR}/authoring_bundle"
-
-if [[ "${DRY_RUN}" == "0" && "${S1_STATUS}" == "pass" ]]; then
-  banner "S3: sf agent generate authoring-bundle"
-
-  S3_START="$(date +%s)"
-  mkdir -p "${AUTHORING_BUNDLE_DIR}"
-
-  # Flags verified from --help:
-  # -o/--target-org (required)
-  # -f/--spec (path to spec YAML)
-  # -n/--name (label)
-  # --api-name (API name)
-  # -d/--output-dir (where to write bundle)
-  # --force-overwrite (don't prompt)
-
+  DERIVED_SPEC="${OUT_DIR}/roundtrip.agent-spec.json"
   set +e
-  SF_DISABLE_LOG_FILE=true sf agent generate authoring-bundle \
-    --target-org "${ORG_ALIAS}" \
-    --spec "${AGENT_SPEC_YAML}" \
-    --name "Roundtrip Test Agent" \
-    --api-name "RoundtripTestAgent" \
-    --output-dir "${AUTHORING_BUNDLE_DIR}" \
-    --force-overwrite \
-    >"${OUT_DIR}/logs/s3_authoring_bundle.out" 2>"${OUT_DIR}/logs/s3_authoring_bundle.err"
-  S3_EXIT=$?
+  "${PY_BIN}" -m sf_video_blueprint.cli \
+    --capture "${CAPTURE}" \
+    --org-url "${ORG_INSTANCE:-https://example-dev.develop.my.salesforce.com}" \
+    --output-path "${OUT_DIR}/roundtrip.html" \
+    --spec-output "${DERIVED_SPEC}" \
+    >"${LOG_DIR}/s1_derive.out" 2>"${LOG_DIR}/s1_derive.err"
+  S1_RC=$?
   set -e
-
-  S3_END="$(date +%s)"
-  S3_DURATION=$((S3_END - S3_START))
-
-  if [[ ${S3_EXIT} -eq 0 ]]; then
-    S3_STATUS="pass"
-    echo "  ✓ Authoring bundle generated by CLI"
+  if [[ ${S1_RC} -eq 0 && -f "${DERIVED_SPEC}" ]]; then
+    record_stage "s1_derive_spec" "pass" "derived from $(basename "${CAPTURE}")"
+    grep -E '^(Derived intent|WARNING)' "${LOG_DIR}/s1_derive.out" | sed 's/^/    /' || true
   else
-    S3_STATUS="fail"
-    echo "  ✗ sf agent generate authoring-bundle failed (exit ${S3_EXIT})"
-    echo "  Last 20 lines of stderr:"
-    tail -20 "${OUT_DIR}/logs/s3_authoring_bundle.err"
+    record_stage "s1_derive_spec" "fail" "pipeline exit ${S1_RC}; see ${LOG_DIR}/s1_derive.err"
+    tail -20 "${LOG_DIR}/s1_derive.err" >&2 || true
+    halt_unless_keep_going
   fi
-elif [[ "${DRY_RUN}" == "1" ]]; then
-  echo "  S3: skipped (DRY_RUN=1)"
-else
-  echo "  S3: skipped (S1 failed)"
 fi
 
 # ============================================================================
-# STAGE 4: sf agent validate authoring-bundle (AUTHORITATIVE grammar verdict)
+# S2: name derivation — the three artifacts must agree BEFORE anything is emitted
 # ============================================================================
-S4_STATUS="skipped"
-S4_EXIT=0
-S4_DURATION=0
+banner "S2: derive names from naming.py"
 
-if [[ "${DRY_RUN}" == "0" && "${S3_STATUS}" == "pass" ]]; then
-  banner "S4: sf agent validate authoring-bundle"
-
-  S4_START="$(date +%s)"
-
-  # Flags verified from --help:
-  # -o/--target-org (required)
-  # -n/--api-name (API name of bundle to validate)
-
+IDENTITY_OK=0
+if [[ -f "${DERIVED_SPEC}" ]]; then
   set +e
-  SF_DISABLE_LOG_FILE=true sf agent validate authoring-bundle \
-    --target-org "${ORG_ALIAS}" \
-    --api-name "RoundtripTestAgent" \
-    >"${OUT_DIR}/logs/s4_validate.out" 2>"${OUT_DIR}/logs/s4_validate.err"
-  S4_EXIT=$?
+  IDENTITY_SHELL="$("${PY_BIN}" "${RT_LIB}" identity "${DERIVED_SPEC}" --shell 2>"${LOG_DIR}/s2_identity.err")"
+  S2_RC=$?
+  set -e
+  if [[ ${S2_RC} -eq 0 ]]; then
+    eval "${IDENTITY_SHELL}"
+    "${PY_BIN}" "${RT_LIB}" identity "${DERIVED_SPEC}" >"${LOG_DIR}/s2_identity.json"
+    IDENTITY_OK=1
+    record_stage "s2_derive_names" "pass" "all cross-artifact linkages agree"
+    echo "    agent (bundle api name) : ${RT_AGENT_API_NAME}"
+    echo "    agent (config dev name) : ${RT_DEVELOPER_NAME}"
+    echo "    agent (test subjectName): ${RT_TEST_SUBJECT_NAME}"
+    echo "    topic (spec yaml)       : ${RT_TOPIC_NAME}"
+    echo "    topic (subagent block)  : ${RT_SUBAGENT}"
+    echo "    topic (router action)   : ${RT_ROUTER_ACTION}"
+    echo "    topic (expectedTopic)   : ${RT_EXPECTED_TOPIC}"
+  else
+    record_stage "s2_derive_names" "fail" "name derivation refused; see ${LOG_DIR}/s2_identity.err"
+    cat "${LOG_DIR}/s2_identity.err" >&2 || true
+    halt_unless_keep_going
+  fi
+else
+  record_stage "s2_derive_names" "skipped" "no derived spec to name"
+fi
+
+# ============================================================================
+# S3: quality gate — reported, never enforced downward
+# ============================================================================
+banner "S3: score the derived spec"
+
+if [[ -f "${DERIVED_SPEC}" ]]; then
+  set +e
+  "${PY_BIN}" "${RT_LIB}" score "${DERIVED_SPEC}" --out "${OUT_DIR}/score.json" \
+    >"${LOG_DIR}/s3_score.out" 2>"${LOG_DIR}/s3_score.err"
+  S3_RC=$?
+  set -e
+  if [[ ${S3_RC} -eq 0 ]]; then
+    sed 's/^/    /' "${LOG_DIR}/s3_score.out"
+    # A failing gate on a mock-telemetry run is the gate doing its job, so the
+    # stage passes on "the gate returned a verdict", not on "the verdict was
+    # good". The verdict itself is in score.json and printed above.
+    record_stage "s3_score_gate" "pass" "gate returned a verdict (see score.json)"
+  else
+    record_stage "s3_score_gate" "fail" "scorer errored; see ${LOG_DIR}/s3_score.err"
+    tail -20 "${LOG_DIR}/s3_score.err" >&2 || true
+    halt_unless_keep_going
+  fi
+else
+  record_stage "s3_score_gate" "skipped" "no derived spec to score"
+fi
+
+# ============================================================================
+# S4: emit the bundle and both test spec dialects
+# ============================================================================
+banner "S4: emit bundle + test specs"
+
+BUNDLE_READY=0
+SFDX_DIR=""
+if [[ ${IDENTITY_OK} -eq 1 ]]; then
+  set +e
+  "${PY_BIN}" "${RT_LIB}" emit "${DERIVED_SPEC}" "${OUT_DIR}" \
+    --manifest "${OUT_DIR}/emit_manifest.json" \
+    >"${LOG_DIR}/s4_emit.out" 2>"${LOG_DIR}/s4_emit.err"
+  S4_RC=$?
+  set -e
+  if [[ ${S4_RC} -eq 0 ]]; then
+    SFDX_DIR="$(
+      "${PY_BIN}" -c 'import json,sys;print(json.load(open(sys.argv[1]))["paths"]["sfdx_project_dir"])' \
+        "${OUT_DIR}/emit_manifest.json"
+    )"
+    BUNDLE_READY=1
+    record_stage "s4_emit_artifacts" "pass" "bundle + both test spec dialects written"
+    echo "    bundle project: ${SFDX_DIR}"
+    LOCAL_FINDINGS="$(
+      "${PY_BIN}" -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["local_findings"]))' \
+        "${OUT_DIR}/emit_manifest.json"
+    )"
+    # Lane 01 measured validate_locally returning zero findings on a file the
+    # real compiler rejected with 24 errors. Report the count, claim nothing.
+    echo "    validate_locally findings: ${LOCAL_FINDINGS} (NOT a grammar verdict — see S5)"
+  elif [[ ${S4_RC} -eq 5 ]]; then
+    record_stage "s4_emit_artifacts" "insufficient_evidence" "recording inadequate; see ${LOG_DIR}/s4_emit.err"
+    tail -20 "${LOG_DIR}/s4_emit.err" >&2 || true
+    halt_unless_keep_going
+  else
+    record_stage "s4_emit_artifacts" "fail" "emit exit ${S4_RC}; see ${LOG_DIR}/s4_emit.err"
+    tail -30 "${LOG_DIR}/s4_emit.err" >&2 || true
+    halt_unless_keep_going
+  fi
+else
+  record_stage "s4_emit_artifacts" "skipped" "names were not derived"
+fi
+
+# ============================================================================
+# S5: sf agent validate authoring-bundle — the ONLY authoritative grammar verdict
+# ============================================================================
+banner "S5: sf agent validate authoring-bundle"
+
+if [[ -z "${ORG_ALIAS}" ]]; then
+  record_stage "s5_org_validate" "skipped" "no --org given; nothing was validated by Salesforce"
+elif [[ ${BUNDLE_READY} -eq 0 ]]; then
+  record_stage "s5_org_validate" "skipped" "no bundle was emitted to validate"
+else
+  # `requiresProject = true`: run from inside the emitted SFDX project so the
+  # CLI can resolve the bundle off local disk. No deploy, no org mutation.
+  set +e
+  ( cd "${SFDX_DIR}" && sf agent validate authoring-bundle \
+      --target-org "${ORG_ALIAS}" \
+      --api-name "${RT_AGENT_API_NAME}" \
+      --json ) >"${LOG_DIR}/s5_validate.json" 2>"${LOG_DIR}/s5_validate.err"
+  S5_RC=$?
   set -e
 
-  S4_END="$(date +%s)"
-  S4_DURATION=$((S4_END - S4_START))
+  case ${S5_RC} in
+    0) record_stage "s5_org_validate" "pass" "Salesforce compiled ${RT_AGENT_API_NAME} without errors" ;;
+    1) record_stage "s5_org_validate" "fail" "compilation errors from the real compiler" ;;
+    2) record_stage "s5_org_validate" "fail" "compile API returned HTTP 404 (unavailable in this org/region)" ;;
+    3) record_stage "s5_org_validate" "fail" "compile API returned HTTP 500 (server error)" ;;
+    *) record_stage "s5_org_validate" "fail" "unexpected exit ${S5_RC}" ;;
+  esac
 
-  # Exit codes per --help:
-  # 0 = success, 1 = compilation errors, 2 = 404 (API not available), 3 = 500 server error
-  if [[ ${S4_EXIT} -eq 0 ]]; then
-    S4_STATUS="pass"
-    echo "  ✓ Agent Script validated by CLI — grammar is CORRECT"
-  elif [[ ${S4_EXIT} -eq 1 ]]; then
-    S4_STATUS="fail"
-    echo "  ✗ Compilation errors in Agent Script"
-    echo "  Last 20 lines of stderr:"
-    tail -20 "${OUT_DIR}/logs/s4_validate.err"
-  elif [[ ${S4_EXIT} -eq 2 ]]; then
-    S4_STATUS="fail"
-    echo "  ✗ Validation API returned 404 (not available in org/region)"
-  elif [[ ${S4_EXIT} -eq 3 ]]; then
-    S4_STATUS="fail"
-    echo "  ✗ Validation API returned 500 (server error)"
-  else
-    S4_STATUS="fail"
-    echo "  ✗ Validation failed with unexpected exit code ${S4_EXIT}"
-  fi
-elif [[ "${DRY_RUN}" == "1" ]]; then
-  echo "  S4: skipped (DRY_RUN=1)"
-else
-  echo "  S4: skipped (S3 not executed or failed)"
-fi
-
-# ============================================================================
-# STAGE 5: Generate test spec (both dialects)
-# ============================================================================
-banner "S5: Test spec (both dialects)"
-
-S5_STATUS="unknown"
-S5_EXIT=999
-S5_START="$(date +%s)"
-LEGACY_TEST_SPEC="${OUT_DIR}/testSpec-legacy.yaml"
-NGT_TEST_SPEC="${OUT_DIR}/testSpec-ngt.yaml"
-
-set +e
-"${PY_BIN}" - <<PY "${DERIVED_SPEC}" "${LEGACY_TEST_SPEC}" "${NGT_TEST_SPEC}" >"${OUT_DIR}/logs/s5_testspec.out" 2>"${OUT_DIR}/logs/s5_testspec.err"
-import sys, json, pathlib
-from sf_video_blueprint.eval_spec import build_legacy_test_spec, build_ngt_test_spec, write_test_spec
-from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
-
-def parse_derived_spec(data: dict) -> DerivedAgentSpec:
-    """Parse a JSON dict into a DerivedAgentSpec with proper nested dataclasses."""
-    entities = [
-        DerivedEntity(
-            name=e["name"],
-            object_api_name=e.get("object_api_name"),
-            field_api_name=e.get("field_api_name"),
-            evidence=[SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in e.get("evidence", [])]
-        )
-        for e in data.get("entities", [])
-    ]
-    evidence = [SpecEvidence(source=ev["source"], detail=ev["detail"]) for ev in data.get("evidence", [])]
-
-    return DerivedAgentSpec(
-        intent=data["intent"],
-        confidence=data["confidence"],
-        objects_touched=data.get("objects_touched", []),
-        entities=entities,
-        orchestration_steps=data.get("orchestration_steps", []),
-        guardrails=data.get("guardrails", []),
-        failure_handling=data.get("failure_handling", []),
-        unknowns=data.get("unknowns", []),
-        evidence=evidence,
-    )
-
+  # Print the compiler's own words. Paraphrasing a compiler error is how a
+  # project ends up guessing at a grammar it could have simply read.
+  if [[ ${S5_RC} -ne 0 ]]; then
+    "${PY_BIN}" - "${LOG_DIR}/s5_validate.json" <<'PY' || true
+import json, re, sys
+from pathlib import Path
+raw = re.sub(r"\x1b\[[0-9;]*m", "", Path(sys.argv[1]).read_text(encoding="utf-8"))
 try:
-    derived_path = pathlib.Path(sys.argv[1])
-    legacy_out = pathlib.Path(sys.argv[2])
-    ngt_out = pathlib.Path(sys.argv[3])
-    derived_json = json.loads(derived_path.read_text(encoding="utf-8"))
-
-    # Parse JSON to DerivedAgentSpec
-    derived_spec = parse_derived_spec(derived_json)
-
-    # Build legacy test spec
-    legacy_spec, legacy_derivations = build_legacy_test_spec(
-        derived_spec,
-        name="Test Agent Tests (Legacy)",
-        subject_name="TestAgent",
-        subject_type="AGENT"
-    )
-    write_test_spec(legacy_out, legacy_spec)
-    print(f"✓ Legacy test spec: {legacy_out} ({len(legacy_spec.testCases)} test cases)")
-
-    # Build NGT test spec
-    ngt_spec, ngt_derivations = build_ngt_test_spec(
-        derived_spec,
-        name="Test Agent Tests (NGT)",
-        subject_name="TestAgent"
-    )
-    write_test_spec(ngt_out, ngt_spec)
-    print(f"✓ NGT test spec: {ngt_out} ({len(ngt_spec.testCases)} test cases)")
-except Exception as e:
-    print(f"ERROR: {e}", file=sys.stderr)
-    import traceback
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
+    payload = json.loads(raw[raw.index("{"):])
+except (ValueError, json.JSONDecodeError):
+    print("    (unparseable CLI output)")
+    print("\n".join(f"    {line}" for line in raw.splitlines()[:20]))
+    raise SystemExit(0)
+errors = (payload.get("data") or {}).get("errors") or []
+for err in errors:
+    print(f"    {err.get('errorType')}: {err.get('description')} "
+          f"[Ln {err.get('lineStart')}, Col {err.get('colStart')}]")
+# Only fall back to `message` when there is no structured error list: `message`
+# is the concatenation of every error, so printing both repeats the first one.
+if not errors and payload.get("message"):
+    print(f"    {payload['message'].splitlines()[0]}")
+print(f"    ({len(errors)} compilation error(s); full JSON in {sys.argv[1]})")
 PY
-S5_EXIT=$?
-set -e
-
-S5_END="$(date +%s)"
-S5_DURATION=$((S5_END - S5_START))
-
-if [[ ${S5_EXIT} -eq 0 ]]; then
-  S5_STATUS="pass"
-  echo "  ✓ Both test spec dialects emitted"
-else
-  S5_STATUS="fail"
-  echo "  ✗ Test spec emission failed"
-  tail -20 "${OUT_DIR}/logs/s5_testspec.err"
+    halt_unless_keep_going
+  fi
 fi
 
 # ============================================================================
-# STAGE 6: Machine-readable summary
+# S6: summary — says SKIPPED where it skipped
 # ============================================================================
-banner "S6: Summary"
-
-SUMMARY_JSON="${OUT_DIR}/roundtrip_summary.json"
-
-"${PY_BIN}" - <<PY "${SUMMARY_JSON}" "${S1_STATUS}" "${S1_EXIT}" "${S1_DURATION}" \
-  "${S2_STATUS}" "${S2_EXIT}" "${S2_DURATION}" \
-  "${S3_STATUS}" "${S3_EXIT}" "${S3_DURATION}" \
-  "${S4_STATUS}" "${S4_EXIT}" "${S4_DURATION}" \
-  "${S5_STATUS}" "${S5_EXIT}" "${S5_DURATION}"
-import sys, json, pathlib
-
-summary_path = pathlib.Path(sys.argv[1])
-stages = {
-  "s1_agentspec_yaml": {
-    "status": sys.argv[2],
-    "exit_code": int(sys.argv[3]),
-    "duration_s": int(sys.argv[4]),
-    "stdout_path": "logs/s1_agentspec.out",
-    "stderr_path": "logs/s1_agentspec.err"
-  },
-  "s2_agent_script_local": {
-    "status": sys.argv[5],
-    "exit_code": int(sys.argv[6]),
-    "duration_s": int(sys.argv[7]),
-    "stdout_path": "logs/s2_agentscript.out",
-    "stderr_path": "logs/s2_agentscript.err"
-  },
-  "s3_authoring_bundle_cli": {
-    "status": sys.argv[8],
-    "exit_code": int(sys.argv[9]),
-    "duration_s": int(sys.argv[10]),
-    "stdout_path": "logs/s3_authoring_bundle.out",
-    "stderr_path": "logs/s3_authoring_bundle.err"
-  },
-  "s4_validate_cli": {
-    "status": sys.argv[11],
-    "exit_code": int(sys.argv[12]),
-    "duration_s": int(sys.argv[13]),
-    "stdout_path": "logs/s4_validate.out",
-    "stderr_path": "logs/s4_validate.err"
-  },
-  "s5_test_spec": {
-    "status": sys.argv[14],
-    "exit_code": int(sys.argv[15]),
-    "duration_s": int(sys.argv[16]),
-    "stdout_path": "logs/s5_testspec.out",
-    "stderr_path": "logs/s5_testspec.err"
-  }
-}
-
-overall_pass = all(
-  stage["status"] in ("pass", "skipped")
-  for stage in stages.values()
-)
-
-summary = {
-  "pass": overall_pass,
-  "stages": stages
-}
-
-summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-print(json.dumps(summary, indent=2))
-PY
+banner "S6: summary"
+write_summary
 
 echo ""
-echo "========================================"
-echo "  Roundtrip complete"
-echo "========================================"
-echo "Summary: ${SUMMARY_JSON}"
-echo "Outputs: ${OUT_DIR}"
+for i in "${!STAGE_NAMES[@]}"; do
+  printf '  %-22s %s\n' "${STAGE_NAMES[$i]}" "${STAGE_STATUSES[$i]}"
+done
+
+echo ""
+echo "  outputs: ${OUT_DIR}"
+echo "  summary: ${OUT_DIR}/roundtrip_summary.json"
 echo ""
 
-# ============================================================================
-# Exit code: non-zero if ANY executed stage failed
-# ============================================================================
-FINAL_EXIT=0
-
-if [[ "${S1_STATUS}" == "fail" ]]; then FINAL_EXIT=1; fi
-if [[ "${S1_STATUS}" == "insufficient_evidence" ]]; then FINAL_EXIT=5; fi
-if [[ "${S2_STATUS}" == "fail" ]]; then FINAL_EXIT=1; fi
-if [[ "${S3_STATUS}" == "fail" ]]; then FINAL_EXIT=1; fi
-if [[ "${S4_STATUS}" == "fail" ]]; then FINAL_EXIT=1; fi
-if [[ "${S5_STATUS}" == "fail" ]]; then FINAL_EXIT=1; fi
+# The verdict line. It names what was skipped rather than implying completeness.
+SKIPPED_LIST=""
+for i in "${!STAGE_NAMES[@]}"; do
+  if [[ "${STAGE_STATUSES[$i]}" == "skipped" ]]; then
+    SKIPPED_LIST="${SKIPPED_LIST}${SKIPPED_LIST:+, }${STAGE_NAMES[$i]}"
+  fi
+done
 
 if [[ ${FINAL_EXIT} -eq 0 ]]; then
-  echo "✓ All executed stages PASSED"
+  if [[ -n "${ORG_ALIAS}" ]]; then
+    echo "ROUND TRIP COMPLETE — Salesforce validated ${RT_AGENT_API_NAME:-the bundle} in org ${ORG_ALIAS}."
+  else
+    echo "LOCAL ROUND TRIP COMPLETE — NOTHING WAS VALIDATED BY SALESFORCE."
+    echo "  No --org was given, so the compile step did not run. Re-run with"
+    echo "  --org <alias> for a grammar verdict from Salesforce."
+  fi
+  [[ -n "${SKIPPED_LIST}" ]] && echo "  Skipped (not attempted, not claimed): ${SKIPPED_LIST}"
 elif [[ ${FINAL_EXIT} -eq 5 ]]; then
-  echo "✗ RECORDING INADEQUATE (InsufficientEvidenceError) — this is a legitimate, informative failure"
+  echo "RECORDING INADEQUATE — InsufficientEvidenceError. This is a real, informative"
+  echo "  failure: the capture does not carry enough evidence to emit an honest spec."
 else
-  echo "✗ AT LEAST ONE STAGE FAILED"
+  echo "ROUND TRIP FAILED — at least one stage failed. See the stage table above."
+  [[ -n "${SKIPPED_LIST}" ]] && echo "  Skipped: ${SKIPPED_LIST}"
 fi
 
-exit ${FINAL_EXIT}
+exit "${FINAL_EXIT}"
