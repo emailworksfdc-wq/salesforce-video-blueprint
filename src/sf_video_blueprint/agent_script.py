@@ -633,6 +633,7 @@ def validate_locally(content: str) -> list[str]:
     Returns:
         List of error strings (empty if no issues detected)
     """
+    from .agent_script_grammar import check_action_grammar
     from .naming import is_reserved, MAX_NAME_LENGTH
 
     errors: list[str] = []
@@ -747,10 +748,41 @@ def validate_locally(content: str) -> list[str]:
             "Human review required before deploying."
         )
 
+    # CHECK: Action grammar (invocation namespaces + target URI schemes).
+    # MEASURED against the real compiler from AFT3: `@apex.Foo` / `@flow.Bar` are
+    # rejected with "'apex' is not a valid invocation target", yet this function
+    # previously reported nothing for them. See agent_script_grammar for the
+    # probe-by-probe evidence.
+    errors.extend(check_action_grammar(content))
+
     # CHECK: Indentation integrity (4-space multiples, no tabs)
+    #
+    # EXCEPTION — block-scalar continuation lines. The first-party template
+    # continues a `|` block by indenting the *text* under the pipe rather than
+    # starting a new pipe, e.g. 12 spaces for `| first line` then 14 for the
+    # continuation. `sf agent generate authoring-bundle --no-spec` emits exactly
+    # that and it compiles with exit 0, so a strict multiple-of-4 rule produces
+    # false positives on Salesforce's own output. Only the *structural* lines are
+    # checked for 4-space alignment; continuation lines are skipped.
+    in_block_scalar = False
+    block_scalar_indent = 0
     for i, line in enumerate(content.split("\n"), start=1):
+        stripped = line.strip()
+        leading = len(line) - len(line.lstrip(" "))
+
+        # A key whose value is `->` opens a block scalar.
+        if stripped.endswith("->"):
+            in_block_scalar = True
+            block_scalar_indent = leading
+        elif in_block_scalar and stripped:
+            if leading <= block_scalar_indent:
+                # Dedented back to or past the owning key: the block has ended.
+                in_block_scalar = False
+            elif not stripped.startswith("|"):
+                # Inside the block and not a new pipe -> continuation text.
+                continue
+
         if line and line[0] == " ":
-            leading = len(line) - len(line.lstrip(" "))
             # The template has a deliberate 10-space indent for VerifiedCustomerId's description line
             if leading == 10 and 'description: "This variable may also be referred to as VerifiedCustomerId"' in line:
                 continue
