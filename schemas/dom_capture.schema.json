@@ -1,0 +1,180 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DOM Capture Event",
+  "description": "A single DOM event from the browser-based recorder (capture/recorder.js). Each line in dom_capture.jsonl is one RawDomEvent serialized as JSON.",
+  "type": "object",
+  "required": ["v", "seq", "t", "type", "url", "frame_path", "selectors", "element", "sf"],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "description": "Schema version (1 for current format)",
+      "minimum": 0
+    },
+    "seq": {
+      "type": "integer",
+      "description": "Sequence number within the recording session",
+      "minimum": 1
+    },
+    "t": {
+      "type": "integer",
+      "description": "Timestamp in epoch milliseconds (from performance.now or Date.now)",
+      "minimum": 0
+    },
+    "type": {
+      "type": "string",
+      "description": "Event type (click, input, change, submit, navigate, etc.)"
+    },
+    "url": {
+      "type": "string",
+      "description": "Page URL where the event occurred",
+      "format": "uri"
+    },
+    "frame_path": {
+      "type": "array",
+      "description": "Frame nesting path (empty for top-level, non-empty for iframe events)",
+      "items": {
+        "type": "string"
+      }
+    },
+    "selectors": {
+      "type": "object",
+      "description": "Multiple selector strategies for relocating the element",
+      "properties": {
+        "test_id": {
+          "type": ["string", "null"],
+          "description": "data-testid or data-test attribute value"
+        },
+        "aria": {
+          "type": ["string", "null"],
+          "description": "Aria-based selector (e.g., [aria-label='...'])"
+        },
+        "role_name": {
+          "type": ["object", "null"],
+          "description": "ARIA role and accessible name",
+          "properties": {
+            "role": {"type": "string"},
+            "name": {"type": "string"}
+          }
+        },
+        "label_for": {
+          "type": ["string", "null"],
+          "description": "Associated label text"
+        },
+        "sf_field": {
+          "type": ["string", "null"],
+          "description": "Salesforce field API name extracted from context"
+        },
+        "css_path": {
+          "type": ["string", "null"],
+          "description": "CSS selector path"
+        },
+        "text": {
+          "type": ["string", "null"],
+          "description": "Visible text content"
+        },
+        "xpath": {
+          "type": ["string", "null"],
+          "description": "XPath selector (optional)"
+        }
+      }
+    },
+    "element": {
+      "type": "object",
+      "description": "Element metadata at event time",
+      "required": ["tag"],
+      "properties": {
+        "tag": {
+          "type": "string",
+          "description": "HTML tag name (button, input, a, etc.)"
+        },
+        "type": {
+          "type": ["string", "null"],
+          "description": "Input type attribute (text, checkbox, etc.)"
+        },
+        "name": {
+          "type": ["string", "null"],
+          "description": "Name attribute"
+        },
+        "id": {
+          "type": ["string", "null"],
+          "description": "ID attribute"
+        },
+        "classes": {
+          "type": "array",
+          "description": "CSS classes",
+          "items": {"type": "string"}
+        },
+        "aria_label": {
+          "type": ["string", "null"],
+          "description": "aria-label attribute"
+        },
+        "text": {
+          "type": ["string", "null"],
+          "description": "Visible text content"
+        },
+        "is_in_modal": {
+          "type": "boolean",
+          "description": "True if element is inside a modal/dialog"
+        },
+        "modal_label": {
+          "type": ["string", "null"],
+          "description": "Modal title/label if applicable"
+        },
+        "shadow_depth": {
+          "type": "integer",
+          "description": "Shadow DOM nesting depth (0 for light DOM)",
+          "minimum": 0
+        }
+      }
+    },
+    "value": {
+      "type": ["string", "null"],
+      "description": "Input value (for input/change events) or null"
+    },
+    "value_redacted": {
+      "type": "boolean",
+      "description": "True if value was redacted for PII/security (value should be null when true)"
+    },
+    "sf": {
+      "type": "object",
+      "description": "Salesforce-specific context extracted from the page",
+      "properties": {
+        "object": {
+          "type": ["string", "null"],
+          "description": "Salesforce object API name (Case, Account, etc.)"
+        },
+        "record_id": {
+          "type": ["string", "null"],
+          "description": "Salesforce record ID (15 or 18 chars)"
+        },
+        "page_type": {
+          "type": ["string", "null"],
+          "description": "Lightning page type (record-detail, list-view, etc.)"
+        },
+        "app": {
+          "type": ["string", "null"],
+          "description": "Lightning app name"
+        }
+      }
+    },
+    "_ingest_seq": {
+      "type": ["integer", "null"],
+      "description": "Driver-stamped sequence number (authoritative for ordering)",
+      "minimum": 1
+    },
+    "_ingest_t": {
+      "type": ["integer", "null"],
+      "description": "Driver-stamped timestamp in epoch ms (authoritative clock)",
+      "minimum": 0
+    },
+    "_frame_url": {
+      "type": ["string", "null"],
+      "description": "Frame URL if event occurred in an iframe"
+    },
+    "_page_index": {
+      "type": ["integer", "null"],
+      "description": "Page index for multi-tab recordings",
+      "minimum": 0
+    }
+  }
+}

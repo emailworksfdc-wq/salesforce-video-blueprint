@@ -1,0 +1,13 @@
+{
+  "capture_id": "example-case-triage-0001",
+  "org_alias": "example-dev",
+  "org_instance_url": "https://example-dev.develop.my.salesforce.com",
+  "is_sandbox": false,
+  "is_scratch": false,
+  "started_at": "2026-03-20T09:00:00Z",
+  "ended_at": "2026-03-20T09:00:18Z",
+  "event_count": 8,
+  "network_event_count": 0,
+  "sink_errors": 0,
+  "operator_note": "Synthetic example capture. Not from a real org; all IDs and values are fabricated for documentation."
+}
