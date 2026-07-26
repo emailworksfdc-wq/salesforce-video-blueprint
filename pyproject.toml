@@ -22,6 +22,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# mcp: the Model Context Protocol server (sf-blueprint-mcp), which exposes the
+# pipeline to any MCP-capable AI harness. Optional rather than a hard runtime dep
+# because the CLI and library work without it, and `mcp` pulls in a web stack
+# (starlette, uvicorn, httpx) that a CLI-only user should not have to install.
+mcp = [
+  "mcp>=1.28,<2",
+]
 dev = [
   # Lower bound rather than an exact pin: an exact pytest pin makes the package
   # uninstallable alongside any other project that pins a different patch.
@@ -40,6 +47,10 @@ dev = [
 
 [project.scripts]
 sf-blueprint = "sf_video_blueprint.cli:app"
+# Declared unconditionally even though it needs the [mcp] extra: an entry point
+# cannot be conditional, and the module raises a SystemExit naming the install
+# command when `mcp` is missing. A clear message beats a bare ImportError.
+sf-blueprint-mcp = "sf_video_blueprint.mcp_server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
