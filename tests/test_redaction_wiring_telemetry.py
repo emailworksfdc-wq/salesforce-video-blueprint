@@ -201,6 +201,47 @@ def test_secret_does_not_reach_the_derived_spec(tmp_path) -> None:
     assert PLANTED_EMAIL not in spec_json, "an email reached the derived spec"
 
 
+def test_manual_event_payload_is_scrubbed() -> None:
+    """`append_manual_event` is the registry's other entry point and must scrub too.
+
+    It appends straight to `self.events`, bypassing `collect_step` entirely. No
+    in-tree caller uses it today, so this test is guarding the shape of the
+    guarantee rather than a live leak: "everything in this registry is scrubbed",
+    not "everything that arrived by the expected route is scrubbed".
+    """
+    registry = TelemetryRegistry()
+    registry.append_manual_event(
+        run_id="run-test",
+        step_id="step-001",
+        layer=TelemetryLayer.FLOW,
+        event_name="ManualNote",
+        status="ok",
+        payload={"note": f"key {PLANTED_KEY_SHAPED} seen", "contact": PLANTED_EMAIL},
+    )
+
+    blob = json.dumps([e.payload for e in registry.events])
+    assert PLANTED_KEY_SHAPED not in blob, "a key-shaped secret survived a manual event"
+    assert PLANTED_EMAIL not in blob, "an email survived a manual event"
+
+
+def test_manual_event_preserves_legitimate_payload() -> None:
+    """The scrub must not corrupt an ordinary manual annotation."""
+    registry = TelemetryRegistry()
+    registry.append_manual_event(
+        run_id="run-test",
+        step_id="step-001",
+        layer=TelemetryLayer.FLOW,
+        event_name="ManualNote",
+        status="ok",
+        payload={"note": "Operator confirmed the panel swap", "attempts": 2, "retried": False},
+    )
+
+    payload = registry.events[0].payload
+    assert payload["note"] == "Operator confirmed the panel swap"
+    assert payload["attempts"] == 2
+    assert payload["retried"] is False
+
+
 # ---------------------------------------------------------------------------
 # False-positive safety
 # ---------------------------------------------------------------------------
