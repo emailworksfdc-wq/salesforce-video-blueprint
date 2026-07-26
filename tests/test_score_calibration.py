@@ -1286,7 +1286,8 @@ def test_c11_on_lane_02_real_capture_when_available():
     if not capture.is_file():
         pytest.skip("lane 02's real capture has not merged yet")
 
-    from sf_video_blueprint.dom_capture import CaptureRejected
+    # CaptureRejected is raised by (and defined in) pipeline, not dom_capture.
+    from sf_video_blueprint.pipeline import CaptureRejected
 
     try:
         spec = run_pipeline(capture, org_url=ORG_URL).spec
