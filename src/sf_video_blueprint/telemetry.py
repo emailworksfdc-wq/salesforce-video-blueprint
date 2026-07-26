@@ -8,6 +8,10 @@ from typing import Any, Protocol
 from .org_denylist import BLOCKED_ORG_ALIASES as _BLOCKED_ORG_ALIASES
 from .org_denylist import is_org_blocked
 
+# Safe to import at module scope: `redaction` imports only stdlib (hashlib, hmac,
+# re), nothing from this package, so there is no cycle. Verified, not assumed.
+from .redaction import pipeline_policy, redact_mapping
+
 
 class TelemetryLayer(str, Enum):
     UI = "ui"
@@ -101,11 +105,62 @@ class MockTelemetryCollector(TelemetryCollector):
 
 
 class TelemetryRegistry:
-    """In-memory event contract store; replace with persistent backend in production."""
+    """In-memory event contract store; replace with persistent backend in production.
+
+    **Ingest is a redaction boundary.** Everything that enters this registry is
+    scrubbed on the way in, not on the way out. Snapshots and payloads are whole
+    Salesforce records — `SalesforceRestClient.get_record` results and raw SOQL rows
+    — fetched *after* extraction has finished, so the extraction choke point in
+    `dom_extractor` structurally cannot see them. `spec_builder._derive_entities`
+    interpolates their field values straight into entity evidence, so an unscrubbed
+    token in a Case Description reached `agent-spec.json` verbatim.
+
+    Scrubbing here rather than at the call site is deliberate: a boundary that lives
+    on the container covers every caller, including ones not written yet. The
+    alternative — each caller remembering to scrub — is the shape of defect that
+    ships. `cli.py` still calls `redaction.scrub_collected_telemetry` afterwards as
+    defence in depth; that pass is idempotent, so the two do not fight.
+
+    Scrubbing uses `redaction.pipeline_policy()`, NOT `RedactionPolicy.strict()`.
+    Strict redacts record ids (destroying the audit trail that ties a spec back to
+    the record it came from) and any 10 consecutive digits (rewriting Luhn-passing
+    epoch-millisecond timestamps as `[REDACTED:phone]`, corrupting the correlation
+    timeline). Both were measured, not assumed — see `tests/test_redaction_wiring_telemetry.py`.
+    """
 
     def __init__(self) -> None:
         self.events: list[TelemetryEvent] = []
         self.snapshots: list[ObjectSnapshot] = []
+        # What the ingest scrub actually found, so the run can report that the
+        # control fired. A silent control cannot be audited. Names the KIND of
+        # value found ("aws_key", "email") and never the value itself.
+        self.redaction_categories: list[str] = []
+        self._redaction_policy = pipeline_policy()
+
+    def _record_categories(self, found: list[str]) -> None:
+        """Accumulate scrub categories, de-duplicated, preserving first-seen order."""
+        for category in found:
+            if category not in self.redaction_categories:
+                self.redaction_categories.append(category)
+
+    def _scrub_event(self, event: TelemetryEvent) -> TelemetryEvent:
+        if event.payload:
+            event.payload, found = redact_mapping(event.payload, self._redaction_policy)
+            self._record_categories(found)
+        return event
+
+    def _scrub_snapshot(self, snapshot: ObjectSnapshot) -> ObjectSnapshot:
+        # `record_id`, `object_api_name` and `changed_fields` are NOT scrubbed:
+        # they are the audit trail and the field API names that drive entity
+        # derivation. Masking a field name there would silently change what the
+        # derived agent spec asks for.
+        for attr in ("before", "after"):
+            record = getattr(snapshot, attr, None)
+            if record:
+                scrubbed, found = redact_mapping(record, self._redaction_policy)
+                setattr(snapshot, attr, scrubbed)
+                self._record_categories(found)
+        return snapshot
 
     def collect_step(
         self,
@@ -113,8 +168,14 @@ class TelemetryRegistry:
         run_id: str,
         step_id: str,
     ) -> None:
-        self.events.extend(collector.collect_for_step(run_id, step_id))
-        self.snapshots.extend(collector.snapshot_changes(run_id, step_id))
+        """Ingest one step's telemetry, scrubbing every value on the way in."""
+        self.events.extend(
+            self._scrub_event(event) for event in collector.collect_for_step(run_id, step_id)
+        )
+        self.snapshots.extend(
+            self._scrub_snapshot(snapshot)
+            for snapshot in collector.snapshot_changes(run_id, step_id)
+        )
 
     def append_manual_event(
         self,
@@ -125,17 +186,24 @@ class TelemetryRegistry:
         status: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        """Append a hand-built event. Scrubbed like any other ingest path.
+
+        No in-tree caller today, which is exactly why it is covered: the first
+        caller to appear would otherwise reintroduce the leak silently.
+        """
         self.events.append(
-            TelemetryEvent(
-                correlation=CorrelationKey(
-                    run_id=run_id,
-                    step_id=step_id,
-                    event_time=datetime.now(timezone.utc),
-                ),
-                layer=layer,
-                event_name=event_name,
-                status=status,
-                payload=payload or {},
+            self._scrub_event(
+                TelemetryEvent(
+                    correlation=CorrelationKey(
+                        run_id=run_id,
+                        step_id=step_id,
+                        event_time=datetime.now(timezone.utc),
+                    ),
+                    layer=layer,
+                    event_name=event_name,
+                    status=status,
+                    payload=payload or {},
+                )
             )
         )
 

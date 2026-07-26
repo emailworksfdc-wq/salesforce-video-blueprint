@@ -227,12 +227,25 @@ def run(
     for action in extraction.actions:
         telemetry.collect_step(collector, run_metadata.run_id, action.step_id)
 
-    # Scrub org records BEFORE correlation. In live mode the snapshots and payloads
-    # are whole Salesforce records, and `_derive_entities` interpolates their field
-    # values into entity evidence — so an unscrubbed token in a Case field lands in
-    # agent-spec.json. Extraction's choke point cannot see these: they were fetched
-    # after it ran.
-    telemetry_categories = scrub_collected_telemetry(telemetry.events, telemetry.snapshots)
+    # Org records are scrubbed on ingest by `TelemetryRegistry` itself — in live mode
+    # the snapshots and payloads are whole Salesforce records, and `_derive_entities`
+    # interpolates their field values into entity evidence, so an unscrubbed token in
+    # a Case field lands in agent-spec.json. Extraction's choke point cannot see
+    # these: they were fetched after it ran.
+    #
+    # This second pass stays as defence in depth for anything appended to the registry
+    # outside its own ingest methods. It is idempotent, so on already-clean data it
+    # finds nothing and returns no categories — which is why the reported categories
+    # are the UNION of both passes. Reporting only this pass's result would make the
+    # run stop saying the control fired, and a silent control cannot be audited.
+    telemetry_categories = list(
+        dict.fromkeys(
+            [
+                *telemetry.redaction_categories,
+                *scrub_collected_telemetry(telemetry.events, telemetry.snapshots),
+            ]
+        )
+    )
     if telemetry_categories:
         typer.echo(
             f"REDACTION: scrubbed telemetry values from the org "

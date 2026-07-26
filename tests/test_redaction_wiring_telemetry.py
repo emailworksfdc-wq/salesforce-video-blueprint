@@ -12,13 +12,19 @@ Measured, not hypothetical: with `--mode live --track-record Case:<id>`, a Case
 whose Description contains a token puts that token in `agent-spec.json` verbatim.
 Lane 02 is recording a real org session, so this is the live path.
 
-`redaction.scrub_collected_telemetry` is the scrub point, called from `cli.py`
-after collection and before `correlate_all`. Scrubbing on ingest inside
-`TelemetryRegistry` would be the stronger design — it would cover any future
-caller rather than this one — but `telemetry.py` belongs to another lane
-(orchestrator bulletin 02), so that is filed as a recommendation instead. The
-consequence is a real coverage limit, pinned by
-`test_registry_ingest_is_not_itself_a_boundary` below.
+There are now TWO scrub points, and the order matters:
+
+1. `TelemetryRegistry.collect_step` / `.append_manual_event` scrub on ingest. This
+   is the boundary — every caller is covered, including `pipeline.py` and any test
+   helper that builds a registry directly, without having to know the rule exists.
+2. `redaction.scrub_collected_telemetry` still runs in `cli.py` after collection
+   and before `correlate_all`, as defence in depth over anything a future caller
+   might append by hand.
+
+Ingest scrubbing was originally filed as a recommendation rather than done, because
+`telemetry.py` belonged to another lane (orchestrator bulletin 02). That owner took
+the handoff, so the two tests that pinned the gap are gone and their inverses
+(`test_registry_ingest_is_itself_a_boundary` and friends) pin the guarantee.
 
 CANARY HYGIENE: planted values are obviously fake and never interpolated into an
 assertion message.
@@ -104,9 +110,10 @@ def _event_with(payload: dict) -> TelemetryEvent:
 def _collect(snapshot: ObjectSnapshot, event: TelemetryEvent) -> TelemetryRegistry:
     """Collect then scrub, in the same order `cli.py` does.
 
-    Collection is deliberately NOT the scrub point here — see the module docstring.
-    This helper mirrors the real sequence so the tests exercise the shipped path
-    rather than a convenience shortcut.
+    Ingest now scrubs on its own, and the CLI's pass still runs after it. This
+    helper keeps BOTH calls so the tests exercise the shipped sequence rather than a
+    convenience shortcut — and so the second pass is exercised for idempotence on
+    every case below, not just the one test that names it.
     """
     registry = TelemetryRegistry()
     registry.collect_step(_StubCollector(snapshot, event), "run-test", "step-001")
@@ -214,7 +221,13 @@ def test_secret_does_not_reach_the_derived_spec(tmp_path) -> None:
 
 
 def test_scrub_reports_categories_so_the_run_can_say_it_fired() -> None:
-    """A silent control cannot be audited; the CLI echoes what this returns."""
+    """A silent control cannot be audited; the CLI echoes the union of both passes.
+
+    Ingest scrubs first, so by the time `scrub_collected_telemetry` runs there is
+    nothing left for it to find and it correctly reports nothing. The categories the
+    CLI prints therefore come from whichever pass actually fired. Asserting the
+    union is what keeps the audit line honest wherever the scrub happens to land.
+    """
     registry = TelemetryRegistry()
     registry.collect_step(
         _StubCollector(
@@ -225,7 +238,8 @@ def test_scrub_reports_categories_so_the_run_can_say_it_fired() -> None:
         "step-001",
     )
 
-    categories = scrub_collected_telemetry(registry.events, registry.snapshots)
+    second_pass = scrub_collected_telemetry(registry.events, registry.snapshots)
+    categories = [*registry.redaction_categories, *second_pass]
 
     assert "aws_key" in categories
     assert "email" in categories
@@ -233,18 +247,25 @@ def test_scrub_reports_categories_so_the_run_can_say_it_fired() -> None:
     assert PLANTED_KEY_SHAPED not in " ".join(categories)
 
 
-def test_registry_ingest_is_not_itself_a_boundary() -> None:
-    """Honest limit: the registry does not scrub on ingest, the CLI scrubs after it.
+# ---------------------------------------------------------------------------
+# Ingest IS the boundary (lane 06 -> lane 04 handoff, now closed)
+# ---------------------------------------------------------------------------
+#
+# These two tests replace `test_registry_ingest_is_not_itself_a_boundary` and
+# `test_manual_event_payload_is_a_known_uncovered_path`, which asserted the gap
+# while `telemetry.py` was owned by another lane. That owner (lane 04) has since
+# moved the scrub onto ingest, so the gap-asserting tests were deleted exactly as
+# their own assertion messages instructed. Their inverses live here: the property
+# that used to be pinned as a known limit is now pinned as a guarantee.
 
-    This is a coverage gap, not a design preference — `telemetry.py` is owned by
-    another lane, so the scrub sits at the call site instead of on ingest. A future
-    caller that collects and then reads `registry.snapshots` without calling
-    `scrub_collected_telemetry` gets unredacted org records.
 
-    Asserting the gap rather than hiding it: if a later change DOES make ingest
-    scrub, this test fails and whoever made that change gets to delete it and the
-    warning in the README along with it. A gap nobody has written down is the kind
-    that ships.
+def test_registry_ingest_is_itself_a_boundary() -> None:
+    """A caller that never calls the CLI's scrub still gets clean records.
+
+    This is the whole point of scrubbing at ingest rather than at one call site:
+    the guarantee belongs to `TelemetryRegistry`, so it holds for every present and
+    future caller, not just the two in-tree ones. `pipeline.py` and any test helper
+    that builds a registry directly are covered without knowing the rule exists.
     """
     registry = TelemetryRegistry()
     registry.collect_step(
@@ -255,20 +276,38 @@ def test_registry_ingest_is_not_itself_a_boundary() -> None:
         "step-001",
     )
 
-    unscrubbed = json.dumps([s.after for s in registry.snapshots])
-    assert PLANTED_KEY_SHAPED in unscrubbed, (
-        "ingest now scrubs on its own; delete this test and the README's coverage warning"
+    # NOTE: no scrub_collected_telemetry call. That is the assertion.
+    assert PLANTED_KEY_SHAPED not in json.dumps([s.after for s in registry.snapshots]), (
+        "a key-shaped secret survived registry ingest without an explicit scrub call"
     )
 
 
-def test_manual_event_payload_is_a_known_uncovered_path() -> None:
-    """`append_manual_event` appends straight to `.events`, bypassing the scrub.
+def test_ingest_scrub_covers_before_images_and_event_payloads() -> None:
+    """All three leak-bearing surfaces, not just `after`.
 
-    It has no in-tree caller today, so nothing leaks through it in the shipped
-    paths. Fixing it means editing `telemetry.py`, which another lane owns — the
-    one-line fix is in this lane's findings file for that owner.
+    `before` is a fetched record too, and `payload` holds raw SOQL rows. Scrubbing
+    only the one surface a test happened to plant in is the failure mode here.
+    """
+    snapshot = _snapshot_with({"Status": LEGIT_STATUS_AFTER})
+    snapshot.before = {"Status": LEGIT_STATUS_BEFORE, "Description": f"old {PLANTED_KEY_SHAPED}"}
+    event = _event_with({"records": [{"Id": LEGIT_RECORD_ID, "Note__c": f"tok {PLANTED_KEY_SHAPED}"}]})
 
-    Pinned so the gap is a recorded fact rather than an oversight.
+    registry = TelemetryRegistry()
+    registry.collect_step(_StubCollector(snapshot, event), "run-test", "step-001")
+
+    assert PLANTED_KEY_SHAPED not in json.dumps([s.before for s in registry.snapshots]), (
+        "a secret survived ingest in the before-image"
+    )
+    assert PLANTED_KEY_SHAPED not in json.dumps([e.payload for e in registry.events]), (
+        "a secret survived ingest in an event payload"
+    )
+
+
+def test_manual_event_payload_is_scrubbed_on_append() -> None:
+    """`append_manual_event` is a second ingest door and must scrub like the first.
+
+    It has no in-tree caller today, which is precisely why it is worth covering:
+    the first caller to appear would otherwise reintroduce the leak silently.
     """
     registry = TelemetryRegistry()
     registry.append_manual_event(
@@ -280,16 +319,106 @@ def test_manual_event_payload_is_a_known_uncovered_path() -> None:
         payload={"note": f"key {PLANTED_KEY_SHAPED} seen"},
     )
 
-    # Not scrubbed, because nothing scrubs it. Asserting reality, not the ideal.
-    assert PLANTED_KEY_SHAPED in json.dumps([e.payload for e in registry.events]), (
-        "append_manual_event now scrubs; delete this test and the findings recommendation"
+    assert PLANTED_KEY_SHAPED not in json.dumps([e.payload for e in registry.events]), (
+        "a key-shaped secret survived append_manual_event"
     )
 
-    # And it IS covered once the CLI's scrub runs over the registry.
-    scrub_collected_telemetry(registry.events, registry.snapshots)
-    assert PLANTED_KEY_SHAPED not in json.dumps([e.payload for e in registry.events]), (
-        "the scrub pass does not cover manually appended events"
+
+def test_the_cli_scrub_is_still_called_and_still_reports() -> None:
+    """Ingest scrubbing must not make the CLI's audit line go silent.
+
+    `scrub_collected_telemetry` stays wired in `cli.py` as defence in depth, and it
+    is what echoes `REDACTION: scrubbed telemetry values from the org`. If ingest
+    left nothing for it to find it would return no categories and the run would
+    stop saying the control fired — a silent control cannot be audited. So the
+    registry records what it scrubbed and the CLI reports from that.
+    """
+    registry = TelemetryRegistry()
+    registry.collect_step(
+        _StubCollector(
+            _snapshot_with({"Description": f"key {PLANTED_KEY_SHAPED} for {PLANTED_EMAIL}"}),
+            _event_with({}),
+        ),
+        "run-test",
+        "step-001",
     )
+
+    assert "aws_key" in registry.redaction_categories
+    assert "email" in registry.redaction_categories
+    # Categories name the KIND of value, never the value itself.
+    assert PLANTED_KEY_SHAPED not in " ".join(registry.redaction_categories)
+
+    # And the second pass over already-clean data is a no-op, not a corruption.
+    before_second_pass = json.dumps([s.after for s in registry.snapshots])
+    scrub_collected_telemetry(registry.events, registry.snapshots)
+    assert json.dumps([s.after for s in registry.snapshots]) == before_second_pass, (
+        "the scrub is not idempotent; running it twice changes the data"
+    )
+
+
+def test_the_cli_still_announces_the_redaction_it_performed(tmp_path, monkeypatch) -> None:
+    """Drives the real CLI, because this is the regression moving the scrub caused.
+
+    Moving the scrub to ingest made `scrub_collected_telemetry` find nothing, so the
+    CLI's `REDACTION:` line disappeared while redaction was still happening — the
+    control went quiet, which reads as "no secrets found". Caught only by asserting
+    on the CLI's own output, so that is what this does.
+    """
+    from typer.testing import CliRunner
+
+    from sf_video_blueprint import cli as cli_module
+
+    event_json = {
+        "v": 1, "seq": 1, "t": 1737830000000, "type": "click",
+        "url": "https://example.my.salesforce.com/lightning/r/Case/view",
+        "frame_path": [],
+        "selectors": {"test_id": None, "aria": None, "role_name": None, "label_for": None,
+                      "sf_field": None, "css_path": "button.save", "text": "Save", "xpath": None},
+        "element": {"tag": "button", "type": None, "name": None, "id": None, "classes": [],
+                    "aria_label": "Save", "text": "Save", "is_in_modal": False,
+                    "modal_label": None, "shadow_depth": 0},
+        "value": None, "value_redacted": False,
+        "sf": {"object": "Case", "record_id": LEGIT_RECORD_ID,
+               "page_type": "record", "app": "Service"},
+    }
+    capture = tmp_path / "c.jsonl"
+    capture.write_text(json.dumps(event_json) + "\n", encoding="utf-8")
+
+    # Stand in for the mock collector with one that returns a planted secret, so the
+    # scrub has something real to find on the default (non-live) path.
+    class _LeakyCollector(TelemetryCollector):
+        def collect_for_step(self, run_id: str, step_id: str) -> list[TelemetryEvent]:
+            return [
+                TelemetryEvent(
+                    correlation=CorrelationKey(
+                        run_id=run_id, step_id=step_id, event_time=datetime.now(UTC)
+                    ),
+                    layer=TelemetryLayer.FLOW,
+                    event_name="FlowInterviewFetch",
+                    status="ok",
+                    payload={"note": f"key {PLANTED_KEY_SHAPED}"},
+                )
+            ]
+
+        def snapshot_changes(self, run_id: str, step_id: str) -> list[ObjectSnapshot]:
+            return []
+
+    monkeypatch.setattr(cli_module, "MockTelemetryCollector", _LeakyCollector)
+
+    out = tmp_path / "report.html"
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["--capture", str(capture), "--org-url", "https://example.my.salesforce.com",
+         "--output-path", str(out)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "REDACTION: scrubbed telemetry values from the org" in result.stdout, (
+        "the CLI performed redaction but stopped reporting it"
+    )
+    assert "aws_key" in result.stdout
+    # The announcement names the category, never the value.
+    assert PLANTED_KEY_SHAPED not in result.stdout, "the CLI echoed the secret it redacted"
 
 
 # ---------------------------------------------------------------------------
