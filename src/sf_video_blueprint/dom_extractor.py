@@ -213,6 +213,38 @@ class ReductionReport:
     synthesized_navigate_count: int
 
 
+def _is_sensitive_event(event: Any, field_name: str) -> bool:
+    """True if this event's field looks sensitive, so its value must not be echoed.
+
+    REVIEW FINDING R2: delegates to `dom_capture`'s detector — the ONE place the
+    sensitive-field patterns live — instead of keeping a second copy here. The
+    duplicate list this replaced had drifted eleven patterns behind after DEFECT
+    L4-6 hardened the original, so values from `IBAN__c`, `Passport_No__c`,
+    `tax_id`, `National_ID__c` and `Credential__c` fields were flagged as leaks by
+    the validator and then written into the spec by this module anyway.
+
+    Falls back to matching the field name alone when `dom_capture` is unavailable
+    (the defensive-import path at the top of this file). The fallback is
+    deliberately fail-CLOSED in spirit: if the shared detector cannot be reached
+    the name is still checked, so this never becomes a silent pass-through.
+    """
+    try:
+        from .dom_capture import _matches_sensitive_pattern, _sensitive_signal_hits
+    except ImportError:  # pragma: no cover - defensive, mirrors module-level guard
+        return "password" in field_name.lower()
+
+    # The full fourteen-signal check catches `<input type="password">` whose name
+    # is innocuous, which a name-only check cannot. It reads attributes that the
+    # fallback stub models above do not define, so a missing attribute falls
+    # through to the name check rather than failing the extraction.
+    try:
+        if _sensitive_signal_hits(event):
+            return True
+    except AttributeError:  # pragma: no cover - fallback stub models lack some fields
+        pass
+    return _matches_sensitive_pattern(field_name.lower()) is not None
+
+
 def _tier_to_confidence(tier: int) -> float:
     """Map selector tier to confidence per contract 2.2."""
     if tier <= 2:
@@ -860,12 +892,21 @@ class DomCaptureExtractor:
                 if field_name:
                     # SECURITY: Never echo sensitive values in inferred_intent (defense in depth).
                     # dom_capture.validate_trace already flags leaks, but we must not launder them.
-                    sensitive_patterns = [
-                        "password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
-                        "ssn", "social_security", "card", "credit", "cvv", "pin"
-                    ]
-                    field_lower = field_name.lower()
-                    if any(pattern in field_lower for pattern in sensitive_patterns):
+                    #
+                    # REVIEW FINDING R2: this used to hold its OWN copy of the
+                    # pattern list. DEFECT L4-6 hardened the one in dom_capture and
+                    # the two silently diverged by eleven patterns, so an
+                    # unredacted `IBAN__c` / `Passport_No__c` / `Credential__c` was
+                    # correctly reported as a leak by the validator and then written
+                    # verbatim into inferred_intent by this line — into the spec,
+                    # the HTML report and the terminal. Detecting a leak and then
+                    # laundering it is worse than not detecting it, because the
+                    # finding claims the control held.
+                    #
+                    # Now delegates to the single shared detector, which also reads
+                    # all fourteen identity signals rather than just these two, so
+                    # `<input type="password">` with an innocuous name is caught.
+                    if _is_sensitive_event(event, field_name):
                         inferred_intent = f"Set {field_name} (redacted)"
                     else:
                         inferred_intent = f"Set {field_name} to {value}"

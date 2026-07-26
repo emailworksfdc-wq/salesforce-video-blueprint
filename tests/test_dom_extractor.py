@@ -1153,3 +1153,60 @@ def test_produced_actions_feed_correlation_and_spec_builder() -> None:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_extractor_uses_the_hardened_pattern_list_not_a_stale_copy() -> None:
+    """REVIEW FINDING R2: the extractor kept its own copy of the sensitive-field
+    patterns, and DEFECT L4-6 hardened only the one in `dom_capture`.
+
+    The two lists diverged by eleven patterns. `dom_capture.validate_trace`
+    correctly flagged an unredacted `IBAN__c` / `Passport_No__c` /
+    `National_ID__c` / `Credential__c` as a leak, while the extractor — not
+    recognising the field as sensitive — wrote the value straight into
+    `inferred_intent`, which lands in the emitted spec, the HTML report and the
+    terminal. Detecting a leak in one module and laundering it in the next is
+    worse than not detecting it, because the finding says the control worked.
+
+    Asserts on the SHARED constant rather than a hardcoded list, so the two
+    cannot drift apart again.
+    """
+    from sf_video_blueprint.dom_capture import RawDomEvent, CaptureTrace, SENSITIVE_PATTERNS
+
+    canary = "CANARY-MUST-NOT-APPEAR"
+    extractor = DomCaptureExtractor()
+
+    # One field name per pattern in the shared list, so adding a pattern to
+    # dom_capture without teaching the extractor about it fails here.
+    for pattern in SENSITIVE_PATTERNS:
+        field_name = f"{pattern}__c"
+        events = [
+            RawDomEvent.model_validate(
+                {
+                    "v": 1,
+                    "seq": 1,
+                    "t": 1000000,
+                    "type": "input",
+                    "url": "https://test.salesforce.com",
+                    "frame_path": [],
+                    "selectors": {"sf_field": field_name},
+                    "element": {"tag": "input", "type": "text", "name": field_name},
+                    "value": canary,
+                    "value_redacted": False,  # recorder failed to redact
+                    "sf": {},
+                }
+            )
+        ]
+        trace = CaptureTrace(events=events, warnings=[], skipped_lines=[], manifest=None)
+
+        bundle = extractor.extract_from_trace(trace)
+        action = bundle.actions[0]
+
+        assert canary not in (action.inferred_intent or ""), (
+            f"SECURITY LEAK: field {field_name!r} matches the shared sensitive "
+            f"pattern {pattern!r}, but the extractor echoed its value into "
+            f"inferred_intent"
+        )
+        for warning in bundle.warnings:
+            assert canary not in warning, (
+                f"SECURITY LEAK: field {field_name!r} value echoed into a warning"
+            )
