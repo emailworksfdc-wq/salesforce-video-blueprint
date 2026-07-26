@@ -600,10 +600,16 @@ def validate_locally(content: str) -> list[str]:
     structural errors that would break the script or indicate corruption — but a
     clean `validate_locally` does NOT guarantee the bundle will deploy.
 
-    `sf agent validate authoring-bundle` has never been run in this project, so the
-    grammar rules enforced here are derived from the emitter's own output and the
-    documented template structure. Any rule this validator cannot justify from those
-    sources is omitted.
+    **This validator's blind spot is measured, not hypothetical.** On 2026-07-26 the
+    first bundle this project ever submitted to Salesforce was rejected with 24
+    `CompilationError`s, and `validate_locally` reported **zero findings** on that
+    exact file — the whole error class (a block scalar missing its `instructions:`
+    key) was invisible to every check below. It is still invisible: the checks here
+    are structural, and only the compiler parses the grammar.
+
+    Most rules enforced here remain derived from the emitter's own output and the
+    first-party template rather than from the compiler. The exception is the name
+    length cap, which is now measured — see `naming.COMPILER_VERIFIED_NAME_LIMIT`.
 
     This function validates ONLY the .agent file content. It does NOT check the
     .bundle-meta.xml file because that file has a fixed structure (emitted by
@@ -618,7 +624,11 @@ def validate_locally(content: str) -> list[str]:
     - Indentation is a multiple of 4, no tabs
     - No unclosed double quotes in config values
     - No [NEEDS EVIDENCE] markers unless allow_incomplete was used
-    - All emitted names fit within MAX_NAME_LENGTH (74 chars for subagents, 80 for router actions)
+    - All emitted subagent names fit within MAX_NAME_LENGTH (74), which is inside the
+      compiler-measured limit of 80. The router-action check below uses 80 as a
+      convention only: the compiler does not length-check router actions (a 100-char
+      action compiled successfully on AFT3), so that finding is advisory, not a
+      reproduction of a real rejection.
 
     Returns:
         List of error strings (empty if no issues detected)
@@ -703,9 +713,13 @@ def validate_locally(content: str) -> list[str]:
                 f"Subagent name '{name}' exceeds MAX_NAME_LENGTH ({len(name)} > {MAX_NAME_LENGTH})"
             )
 
-    # CHECK: Router action name length (must be <= 80)
-    # Router actions are "go_to_<subagent>", and we assume 80 is the Salesforce cap.
-    # This is an ASSUMPTION not CLI-verified, but it's the project's documented budget.
+    # CHECK: Router action name length.
+    # ADVISORY, not a real compiler rule. Measured on AFT3 2026-07-26: a 100-char
+    # router action referencing a short subagent compiled successfully (exit 0), and
+    # an 80-char subagent name produced an 86-char action that also compiled. The
+    # compiler applies its <=80 rule to the subagent name only. The check is kept
+    # because a router action that long still signals a runaway derived name, but it
+    # does not reproduce a rejection the org would issue.
     for action_name, _ in router_actions:
         if len(action_name) > 80:
             errors.append(
