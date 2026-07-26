@@ -413,7 +413,7 @@ gets written.
 | --- | --- |
 | `DomCaptureExtractor._redact_actions` | Everything derived from the capture: action values, targets, inferred intents, and `ui_context` URLs/labels. Inherited by the HTML report, the spec JSON, the extraction bundle, and every stage-6 emitter. |
 | `MasterBlueprintRenderer._redact_analyses` | Org-authored text that never passes extraction: `replay_message` and `failure_reason`. A real `FIELD_CUSTOM_VALIDATION_EXCEPTION` can quote a customer email straight back. |
-| `TelemetryRegistry.collect_step` | Live-org data fetched *after* extraction: `ObjectSnapshot.before`/`.after` (whole records from `get_record`) and `TelemetryEvent.payload` (raw SOQL rows). These flow into entity evidence details, so with `--mode live --track-record` a token in a Case field reached `agent-spec.json` verbatim. |
+| `TelemetryRegistry.collect_step` (and `append_manual_event`) | Live-org data fetched *after* extraction: `ObjectSnapshot.before`/`.after` (whole records from `get_record`) and `TelemetryEvent.payload` (raw SOQL rows). These flow into entity evidence details, so with `--mode live --track-record` a token in a Case field reached `agent-spec.json` verbatim. Both of the registry's entry points scrub, so the guarantee is "everything in the registry is clean" rather than "everything that arrived the expected way". |
 
 **Stripped:** Salesforce session tokens, JWTs, private keys, AWS/GitHub/Slack
 tokens, bearer tokens, Luhn-valid card numbers, SSNs, emails, and
@@ -459,7 +459,7 @@ This project keeps an honest ledger rather than a feature list. Full detail in
 | `parse_capture_file` hardcodes `manifest=None` (`:276`) | The manifest `event_count` cross-check — the one test that would catch loss at *any* ratio — never runs. |
 | UTF-8 BOM not stripped (`:217`) | A BOM-prefixed capture silently loses its first event. |
 | Leak detector inspects only `element.name` (`:414`) | The recorder derives field identity from eight signals. A secret identified via `type=password` or an SF field API name is not caught. |
-| Redaction does not cover record IDs, names, or free-text field values | Secrets, emails, and credential URL parameters are now stripped at three pipeline choke points. Record IDs are retained deliberately (audit trail); customer **names** and ordinary field text are **not** detected at all. `outputs/` is still org-confidential. |
+| Redaction does not cover record IDs, names, or free-text field values | Secrets, emails, and credential URL parameters are stripped at three choke points. Record IDs are retained deliberately (audit trail); customer **names** and ordinary field text are **not** detected at all. `outputs/` is still org-confidential. |
 | Correlation is temporal, not causal | The join proves telemetry was *fetched during* a step, not *caused by* it. |
 | The `v0.1.0` tag does not install | Measured on Python 3.13.14: `playwright~=1.46.0` pins `greenlet==3.0.3`, which has no cp313 wheel and whose C++ source fails to build (`error: unknown type name '_PyCFrame'`) → `ERROR: Failed building wheel for greenlet`. Fixed on `main` (relaxed to `playwright>=1.55,<2`, resolving `greenlet 3.5.4` from a wheel) and carried by v0.1.1. The broken tag still exists, so install from `@main`. |
 | Video extraction is a stub | `HeuristicVideoExtractor` never decodes video; any video yields one placeholder step. **Use `--capture`.** |
