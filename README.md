@@ -18,15 +18,41 @@ fabricated evidence is *designed to fail* its own quality gate.
 
 ---
 
-## Status: v0.1.0 — working pipeline, unvalidated output
+## Status: v0.1.0 — working pipeline, output now compiles in one measured case
 
 Read this before trusting anything this produces.
 
-**Nothing in this project has ever been validated against a real Salesforce
-org.** The emitted `.agent` bundle has never been fed to
-`sf agent validate authoring-bundle` — the only authority on whether the output
-is syntactically valid Agent Script. Local validation passes, but local
-validation is this repo's own opinion, not Salesforce's.
+**The emitted `.agent` bundle now compiles against a real Salesforce org — and
+it did not the first time.** On 2026-07-26 the bundle derived from
+`examples/case_triage.dom_capture.jsonl` was submitted to
+`sf agent validate authoring-bundle` against a Developer Edition org. Salesforce
+rejected it with **24 `CompilationError`s**, beginning:
+
+```
+CompilationError: Syntax error: unexpected `->` [Ln 108, Col 8]
+CompilationError: Syntax error: unexpected `| Follow these steps:` [Ln 109, Col 8]
+```
+
+Every derived subagent was malformed: the emitter wrote a bare `->` opener where
+the grammar requires `instructions: ->`, with the `|` lines under-indented. The
+three standard subagents compiled fine — they are copy-pasted from the
+first-party template, so they were never testing this project's grammar model at
+all. After fixing the emitter, the same bundle compiles: exit 0,
+`{"success": true}`.
+
+**What that does and does not license.** Validated: one bundle, one intent
+(`Update Case (Status)`), one org, one CLI version (`@salesforce/cli 2.143.6`,
+`@salesforce/agents 1.6.6`). The `.agent` **grammar** for a topic-router agent is
+confirmed, as is the 80-character subagent-name limit (measured: 80 passes, 81
+fails with `Too big: expected string to have <=80 characters`). Not validated:
+any spec shape other than the single-topic router, any bundle carrying
+`@apex.*`/`@flow.*` actions (the emitter never emits them), and anything about
+whether the compiled agent *behaves* correctly — compilation is syntax, not
+semantics. No agent has been published.
+
+The critical lesson stands regardless: **`validate_locally()` reported zero
+findings on the file Salesforce rejected.** Local validation is this repo's own
+opinion, and it was measurably blind to the entire error class. Run the CLI.
 
 Against the stated end goal — *record → derive → run the spec repeatedly →
 deploy as an Agentforce agent* — the honest grade is roughly **55%**:
@@ -38,7 +64,7 @@ deploy as an Agentforce agent* — the honest grade is roughly **55%**:
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
 | 5 · Iterate | 🔴 Absent | `sf agent test create/run/results` appear **nowhere** in this repo. The offline loop scores 79/79/79 and reports `converged=true` — a loop that cannot change its input is not a loop. |
-| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and now reachable from the MCP server. **No org has ever validated the output** — `sf agent validate authoring-bundle` has never run. |
+| 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and reachable from the MCP server. One emitted bundle now **compiles** (`sf agent validate authoring-bundle` → exit 0) and **deploys** as `AiAuthoringBundle` metadata to a DE org. Still partial: one intent shape only, no agent has been published, and nothing checks the compiled agent's behaviour. |
 
 The two stages nearest to zero are the two the end goal names explicitly. This
 table is the most important thing in this README.
@@ -46,7 +72,32 @@ table is the most important thing in this README.
 The pipeline is reachable three ways — an [MCP server](#1--mcp-server--use-it-from-any-ai-tool)
 for any AI harness, a [Python API](#2--python-library), and a [CLI](#3--command-line).
 That is packaging, not progress against the table above: all three run the same
-offline pipeline and none of them has seen a real org.
+offline pipeline. None of them contacts an org — the validation above was driven
+by invoking the `sf` CLI separately on the emitted bundle, not by any code path
+in this repo.
+
+### How to validate an emitted bundle yourself
+
+`sf agent validate authoring-bundle` does **not** require the bundle to be
+deployed first, contrary to a natural reading of its docs. The command
+(`plugin-agent` 1.40.5) is `requiresProject = true`: it locates the bundle in the
+**local** SFDX project, reads the `.agent` file off disk, and POSTs its contents
+to the compile endpoint, using the org connection for authentication only. So the
+loop is cheap and mutates nothing:
+
+```bash
+# 1. Emit the bundle (see the Python API section) into a throwaway SFDX project:
+#      <proj>/force-app/main/default/aiAuthoringBundles/<ApiName>/<ApiName>.agent
+#                                                               /<ApiName>.bundle-meta.xml
+#    <proj>/sfdx-project.json needs only: packageDirectories [{path: force-app, default: true}]
+# 2. Compile it. No deploy required.
+cd <proj> && sf agent validate authoring-bundle -o <your-org> -n <ApiName> --json
+```
+
+Exit 0 with `{"success": true}` means the Agent Script compiled. Exit 1 returns a
+`data.errors[]` array with `errorType`, `description`, and line/column for each
+error. Deploying (`sf project deploy start -d force-app`) is a separate,
+optional step and is only needed to publish.
 
 ---
 
@@ -381,10 +432,16 @@ Do not read these as status:
 
 Ordered by what unblocks the most:
 
-1. **Validate against a real dev org.** Run `sf agent validate authoring-bundle`
-   on an emitted bundle. This is the only way to learn whether the `.agent`
-   grammar is right, whether the API-name cap is really 80 characters, and
-   whether the bundle deploys. Everything else is speculation until this runs.
+1. **Broaden org validation.** ~~Run `sf agent validate authoring-bundle` on an
+   emitted bundle.~~ Done for one case, and it found a real emitter bug on the
+   first attempt (see [Status](#status-v010--working-pipeline-output-now-compiles-in-one-measured-case)).
+   The grammar for a single-topic router agent is confirmed and the subagent-name
+   cap is measured at 80. What remains speculative: multi-topic specs, bundles
+   with `@apex.*`/`@flow.*` actions, the name limit on the *metadata* path
+   (spec YAML `topics[].name` and `expectedTopic`, which the compiler never sees),
+   and whether a published agent behaves as the spec describes. Validation should
+   also become a step this repo can run itself, rather than a manual CLI
+   invocation alongside it.
 2. **Fix the ingest losses** (the first four rows above) so a capture cannot be
    silently truncated while still being stamped as real evidence.
 3. **Close stage 5.** Wire `sf agent test create/run/results` so a spec can
