@@ -139,41 +139,76 @@ class TestForbiddenOrgDetection:
 # ============================================================================
 
 
+#: `sf org display --json` as the CLI really answers it — no `isSandbox` key.
+#: Measured against AFT3; see REVIEW FINDING R3 below. Values are placeholders,
+#: because a real access token must never appear in a test fixture.
+_REAL_ORG_DISPLAY_JSON = json.dumps(
+    {
+        "status": 0,
+        "result": {
+            "accessToken": "placeholder",
+            "alias": "placeholder",
+            "apiVersion": "65.0",
+            "clientId": "placeholder",
+            "connectedStatus": "Connected",
+            "id": "placeholder",
+            "instanceUrl": "placeholder",
+            "username": "placeholder",
+        },
+    }
+)
+
+
+def _org_query_json(is_sandbox, org_type="Enterprise Edition"):
+    """`sf data query ... FROM Organization --json` shaped as the CLI returns it."""
+    record = {"OrganizationType": org_type}
+    if is_sandbox is not None:
+        record["IsSandbox"] = is_sandbox
+    return json.dumps({"status": 0, "result": {"records": [record]}})
+
+
 class TestOrgVerification:
-    """Org type verification must fail closed: deny unless positively sandbox."""
+    """Org type verification must fail closed: deny unless positively safe.
+
+    REVIEW FINDING R3 — every mock in this class used to be
+    `{"result": {"isSandbox": ...}}`, a payload `sf org display --json` does not
+    produce. The tests passed while the function they guard could not return True
+    for any real org. The fixtures now use the measured CLI shape and the
+    two-call sequence (`org display`, then a query against `Organization`).
+    """
 
     @patch("sf_video_blueprint.telemetry.subprocess.run")
     def test_sandbox_verified(self, mock_run):
-        """Sandbox with IsSandbox=true passes."""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps({"result": {"isSandbox": True}}),
-        )
+        """A real sandbox (Organization.IsSandbox=true) passes."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
+        ]
         is_safe, detail = _verify_org_is_sandbox("safe-sandbox")
         assert is_safe
         assert "verified as sandbox" in detail.lower()
 
     @patch("sf_video_blueprint.telemetry.subprocess.run")
     def test_production_org_denied(self, mock_run):
-        """Production org with IsSandbox=false is denied."""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps({"result": {"isSandbox": False}}),
-        )
+        """Production org (not a sandbox, production edition) is denied."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(False, "Enterprise Edition")),
+        ]
         is_safe, detail = _verify_org_is_sandbox("prod-org")
         assert not is_safe
         assert "production" in detail.lower()
 
     @patch("sf_video_blueprint.telemetry.subprocess.run")
     def test_missing_issandbox_field_denied(self, mock_run):
-        """Missing IsSandbox field -> fail closed."""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout=json.dumps({"result": {}}),
-        )
+        """IsSandbox absent from the query result -> fail closed."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(None, "")),
+        ]
         is_safe, detail = _verify_org_is_sandbox("unknown-org")
         assert not is_safe
-        assert "issandbox field missing" in detail.lower()
+        assert "could not determine" in detail.lower()
 
     @patch("sf_video_blueprint.telemetry.subprocess.run")
     def test_cli_failure_denied(self, mock_run):
@@ -195,6 +230,188 @@ class TestOrgVerification:
         is_safe2, detail2 = _verify_org_is_sandbox("PPCaccenture")
         assert not is_safe2
         assert "forbidden" in detail2.lower()
+
+
+# ============================================================================
+# 16. REVIEW FINDING R3 — the guard could never say yes to any real org
+#
+# `_verify_org_is_sandbox` read `isSandbox` out of `sf org display --json`. That
+# key is not in the payload. Measured against AFT3, the org this lane is
+# assigned, on sf CLI as installed:
+#
+#     keys present: ['accessToken', 'alias', 'apiVersion', 'clientId',
+#                    'connectedStatus', 'id', 'instanceUrl', 'username']
+#     'isSandbox' -> <<ABSENT>>
+#
+# So the `is_sandbox is None` branch fired for every org that has ever been
+# passed to it, and the function returned "IsSandbox field missing" — always.
+# Every EventLogFile collection returned ORG_TYPE_UNKNOWN with zero events
+# regardless of the org.
+#
+# It failed CLOSED, so this was never a safety hole. It is worse in a different
+# way: a guard that always refuses is indistinguishable from a guard that works,
+# because the refusal looks like the fail-closed path doing its job. The org
+# safety check was decorative for the whole life of the module.
+#
+# The four tests above passed throughout, because each one mocks
+# `{"result": {"isSandbox": ...}}` — a shape the real CLI never produces. Same
+# root cause as L4-4: the fixture was written from the code's belief about its
+# input, not from the input. A mock is only evidence if the shape is real.
+#
+# The org type lives on the Organization sobject, not in the CLI's auth blob, so
+# the fix queries it: `SELECT IsSandbox, OrganizationType FROM Organization`.
+# ============================================================================
+
+
+class TestOrgVerificationAgainstTheRealCliShape:
+    """The guard must work against what `sf` actually returns, not a fiction."""
+
+    #: Verbatim key set from `sf org display --json -o AFT3`. Values are
+    #: placeholders on purpose — never put a real token or instance URL in a test.
+    REAL_ORG_DISPLAY_KEYS = (
+        "accessToken",
+        "alias",
+        "apiVersion",
+        "clientId",
+        "connectedStatus",
+        "id",
+        "instanceUrl",
+        "username",
+    )
+
+    @staticmethod
+    def _real_org_display_payload() -> str:
+        """`sf org display --json` as it really comes back. No `isSandbox`."""
+        return json.dumps(
+            {
+                "status": 0,
+                "result": {k: "placeholder" for k in
+                           TestOrgVerificationAgainstTheRealCliShape.REAL_ORG_DISPLAY_KEYS},
+            }
+        )
+
+    def test_org_display_json_really_has_no_issandbox_key(self):
+        """Pins the measured fact the fix rests on, so it cannot be quietly lost."""
+        payload = json.loads(self._real_org_display_payload())
+        assert "isSandbox" not in payload["result"]
+        assert "IsSandbox" not in payload["result"]
+
+    @patch("sf_video_blueprint.telemetry.subprocess.run")
+    def test_sandbox_is_verified_from_the_organization_object(self, mock_run):
+        """REVIEW FINDING R3: a real sandbox must verify.
+
+        Fails before the fix: `sf org display` carries no `isSandbox`, so the
+        guard returned (False, "IsSandbox field missing") for a genuine sandbox.
+        """
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._real_org_display_payload()),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "status": 0,
+                        "result": {
+                            "records": [
+                                {"IsSandbox": True, "OrganizationType": "Enterprise Edition"}
+                            ]
+                        },
+                    }
+                ),
+            ),
+        ]
+        is_safe, detail = _verify_org_is_sandbox("a-real-sandbox")
+        assert is_safe, detail
+        assert "sandbox" in detail.lower()
+
+    @patch("sf_video_blueprint.telemetry.subprocess.run")
+    def test_developer_edition_is_allowed_and_named_as_such(self, mock_run):
+        """A DE org is not a sandbox and not production. It must still be usable.
+
+        AFT3 — the org LANE_RULES assigns this lane — measures as
+        `IsSandbox=False, OrganizationType='Developer Edition'`. Treating that as
+        production would refuse the one org this project is allowed to use;
+        treating it as a sandbox would be a lie. It gets its own verdict.
+        """
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._real_org_display_payload()),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "status": 0,
+                        "result": {
+                            "records": [
+                                {"IsSandbox": False, "OrganizationType": "Developer Edition"}
+                            ]
+                        },
+                    }
+                ),
+            ),
+        ]
+        is_safe, detail = _verify_org_is_sandbox("AFT3-like")
+        assert is_safe, detail
+        assert "developer edition" in detail.lower()
+        # It must not be *classified* as production. The message is allowed to
+        # say "not production", so check the verdict, not the substring.
+        assert "is a production org" not in detail.lower()
+
+    @patch("sf_video_blueprint.telemetry.subprocess.run")
+    def test_real_production_org_is_still_refused(self, mock_run):
+        """The whole point of the guard. Non-sandbox, non-DE => refuse."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._real_org_display_payload()),
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "status": 0,
+                        "result": {
+                            "records": [
+                                {"IsSandbox": False, "OrganizationType": "Enterprise Edition"}
+                            ]
+                        },
+                    }
+                ),
+            ),
+        ]
+        is_safe, detail = _verify_org_is_sandbox("prod")
+        assert not is_safe
+        assert "production" in detail.lower()
+
+    @patch("sf_video_blueprint.telemetry.subprocess.run")
+    def test_unqueryable_org_still_fails_closed(self, mock_run):
+        """If the Organization query fails, refuse. Unknown is never yes."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._real_org_display_payload()),
+            MagicMock(returncode=1, stdout="", stderr="Error: INVALID_SESSION_ID"),
+        ]
+        is_safe, detail = _verify_org_is_sandbox("expired-auth")
+        assert not is_safe
+        assert "could not determine" in detail.lower()
+
+    @patch("sf_video_blueprint.telemetry.subprocess.run")
+    def test_empty_record_set_fails_closed(self, mock_run):
+        """A query that succeeds but returns no Organization row proves nothing."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=self._real_org_display_payload()),
+            MagicMock(
+                returncode=0, stdout=json.dumps({"status": 0, "result": {"records": []}})
+            ),
+        ]
+        is_safe, detail = _verify_org_is_sandbox("ghost-org")
+        assert not is_safe
+        assert "could not determine" in detail.lower()
+
+    def test_forbidden_org_never_reaches_either_subprocess_call(self):
+        """The hard deny still short-circuits before any org is contacted."""
+        with patch("sf_video_blueprint.telemetry.subprocess.run") as mock_run:
+            for alias in ("PPCDM", "ppcaccenture", " PPC-DM ", "admin@ppcdm.com"):
+                is_safe, detail = _verify_org_is_sandbox(alias)
+                assert not is_safe
+                assert "forbidden" in detail.lower()
+            assert mock_run.call_count == 0, (
+                "a hard-blocked org must not be contacted, even to classify it"
+            )
 
 
 # ============================================================================
@@ -398,11 +615,10 @@ class TestSecurityNoLeaks:
         """
         # Mock org verification
         mock_run.side_effect = [
-            # First call: org display for IsSandbox check
-            MagicMock(
-                returncode=0,
-                stdout=json.dumps({"result": {"isSandbox": True}}),
-            ),
+            # Org verification is TWO calls now (REVIEW FINDING R3): `sf org
+            # display` cannot report org type, so `Organization` is queried.
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
             # Second call: EventLogFile query returns no records
             MagicMock(
                 returncode=0,
@@ -442,7 +658,8 @@ class TestAvailabilityClassification:
 
         mock_run.side_effect = [
             # org verification
-            MagicMock(returncode=0, stdout=json.dumps({"result": {"isSandbox": True}})),
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
             # EventLogFile query returns no records
             MagicMock(returncode=0, stdout=json.dumps({"result": {"records": []}})),
         ]
@@ -469,7 +686,8 @@ class TestAvailabilityClassification:
         end_time = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
 
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout=json.dumps({"result": {"isSandbox": True}})),
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
             MagicMock(returncode=0, stdout=json.dumps({"result": {"records": []}})),
         ]
 
@@ -487,7 +705,8 @@ class TestAvailabilityClassification:
     def test_license_missing(self, mock_run):
         """Query failure with INVALID_TYPE -> LICENSE_MISSING."""
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout=json.dumps({"result": {"isSandbox": True}})),
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
             MagicMock(
                 returncode=1,
                 stderr="INVALID_TYPE: sObject type 'EventLogFile' is not supported",
@@ -542,7 +761,8 @@ class TestAvailabilityClassification:
     def test_query_failed_timeout(self, mock_run):
         """Query timeout -> QUERY_FAILED."""
         mock_run.side_effect = [
-            MagicMock(returncode=0, stdout=json.dumps({"result": {"isSandbox": True}})),
+            MagicMock(returncode=0, stdout=_REAL_ORG_DISPLAY_JSON),
+            MagicMock(returncode=0, stdout=_org_query_json(True)),
             subprocess.TimeoutExpired("sf", 30),
         ]
 

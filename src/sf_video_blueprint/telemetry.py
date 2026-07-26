@@ -218,20 +218,58 @@ def _is_org_forbidden(org_alias: str) -> bool:
     return is_org_blocked(org_alias)
 
 
+#: Org types that are safe to collect telemetry from even though `IsSandbox` is
+#: false. A Developer Edition org is not a sandbox *and* not production: it holds
+#: no customer data and exists to be experimented on.
+#:
+#: REVIEW FINDING R3 — this set is why the fix is not simply "read IsSandbox".
+#: Measured on AFT3, the org LANE_RULES assigns this lane:
+#:     SELECT IsSandbox, OrganizationType FROM Organization
+#:     -> IsSandbox=False, OrganizationType='Developer Edition'
+#: Keying safety on `IsSandbox` alone would refuse the only org this project is
+#: permitted to touch.
+_NON_PRODUCTION_ORG_TYPES: frozenset[str] = frozenset(
+    {
+        "developer edition",
+        "team edition",  # legacy name for DE-class orgs
+    }
+)
+
+
 def _verify_org_is_sandbox(org_alias: str) -> tuple[bool, str]:
     """
-    Verify that the target org is a sandbox, not production.
+    Verify that the target org is safe to collect from — sandbox, scratch or DE.
+
+    Fails closed: returns is_safe=True only on a *positive* identification. An
+    org that cannot be classified is refused.
+
+    REVIEW FINDING R3 — this function could previously never return True for any
+    org. It read `isSandbox` from `sf org display --json`, which does not contain
+    that key; measured against AFT3, the payload carries only::
+
+        accessToken alias apiVersion clientId connectedStatus id instanceUrl username
+
+    so the `is_sandbox is None` branch fired every time and the answer was always
+    "IsSandbox field missing". It failed closed, so it was never a safety hole —
+    but a guard that always refuses is indistinguishable from one that works,
+    because the refusal looks like the fail-closed path working as designed. The
+    org check was decorative. Its four unit tests all passed, because each mocked
+    a `{"result": {"isSandbox": ...}}` payload the real CLI never emits.
+
+    The org type lives on the `Organization` sobject, so that is what we query.
 
     Returns:
-        (is_safe, detail): is_safe=True only if positively identified as sandbox.
+        (is_safe, detail): is_safe=True only if positively identified as a
+                          sandbox, scratch org, or Developer Edition org.
                           is_safe=False with detail if prod, forbidden, or unknown.
     """
-    # HARD BLOCK on forbidden org aliases
+    # HARD BLOCK on forbidden org aliases. Before any subprocess: a blocked org
+    # must not be contacted even to classify it.
     if _is_org_forbidden(org_alias):
         return False, f"Org alias '{org_alias}' is strictly forbidden (PPCDM/PPCaccenture out of scope)"
 
     try:
-        # sf org display --json gives org info including IsSandbox
+        # Step 1: confirm the alias resolves to an authenticated org at all.
         result = subprocess.run(
             ["sf", "org", "display", "--target-org", org_alias, "--json"],
             capture_output=True,
@@ -244,19 +282,87 @@ def _verify_org_is_sandbox(org_alias: str) -> tuple[bool, str]:
                 f"Could not determine org type for '{org_alias}': sf org display failed",
             )
 
-        org_info = _json.loads(result.stdout)
-        is_sandbox = org_info.get("result", {}).get("isSandbox")
+        # Step 2: ask the org what it is. `sf org display` cannot answer this —
+        # see R3 above — so read it off the Organization object.
+        org_type_result = subprocess.run(
+            [
+                "sf",
+                "data",
+                "query",
+                "--query",
+                "SELECT IsSandbox, OrganizationType FROM Organization",
+                "--target-org",
+                org_alias,
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if org_type_result.returncode != 0:
+            return (
+                False,
+                (
+                    f"Could not determine org type for '{org_alias}': "
+                    "querying the Organization object failed"
+                ),
+            )
+
+        records = (
+            _json.loads(org_type_result.stdout).get("result", {}).get("records") or []
+        )
+        if not records:
+            return (
+                False,
+                (
+                    f"Could not determine org type for '{org_alias}': "
+                    "the Organization query returned no rows"
+                ),
+            )
+
+        record = records[0]
+        is_sandbox = record.get("IsSandbox")
+        org_type = (record.get("OrganizationType") or "").strip()
 
         if is_sandbox is None:
             return (
                 False,
-                f"Could not determine org type for '{org_alias}': IsSandbox field missing",
+                (
+                    f"Could not determine org type for '{org_alias}': "
+                    "Organization.IsSandbox was absent from the query result"
+                ),
             )
 
-        if not is_sandbox:
-            return False, f"Org '{org_alias}' is a production org; production orgs are off-limits"
+        if is_sandbox:
+            return True, f"Org '{org_alias}' verified as sandbox ({org_type or 'unknown edition'})"
 
-        return True, f"Org '{org_alias}' verified as sandbox"
+        # Not a sandbox. It may still be a non-production org type.
+        if org_type.lower() in _NON_PRODUCTION_ORG_TYPES:
+            return (
+                True,
+                (
+                    f"Org '{org_alias}' verified as {org_type} — not a sandbox, "
+                    "but not production either (no customer data)"
+                ),
+            )
+
+        if not org_type:
+            return (
+                False,
+                (
+                    f"Could not determine org type for '{org_alias}': "
+                    "not a sandbox and OrganizationType was empty"
+                ),
+            )
+
+        return (
+            False,
+            (
+                f"Org '{org_alias}' is a production org ({org_type}); "
+                "production orgs are off-limits"
+            ),
+        )
 
     except subprocess.TimeoutExpired:
         return False, f"Org verification timed out for '{org_alias}'"
