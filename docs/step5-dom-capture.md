@@ -261,12 +261,35 @@ This is implemented in `capture/recorder.js` lines 66–97 and `src/sf_video_blu
 
 ### What is NOT redacted
 
-- **Record IDs** (`500xx0000012345AAA`) — captured verbatim. The redaction module (`redaction.py`) includes a Salesforce ID detector with checksum validation, but it is **not enabled by default** in the DOM capture flow. If you need to scrub record IDs, pass a `RedactionPolicy` with `redact_record_ids=True` when processing the JSONL. (This is a known gap; the pipeline does not apply policy-based redaction to raw capture yet.)
-- **Field values** (Status, Priority, Subject, Description) — captured verbatim unless they match a secret pattern.
-- **Names, emails, phone numbers** — captured verbatim. The redaction module can detect these (see `redaction.py` lines 61–76), but they are not redacted by default because false positives are annoying (e.g., "Phone" as a field label vs. an actual phone number).
-- **URLs** — captured verbatim, including record IDs and query parameters.
+**Scope note:** this section is about the **raw JSONL on disk**. Nothing below is
+redacted *in the capture file*. The derived artifacts (`outputs/` — HTML report,
+spec JSON, extraction bundle) are a separate matter: `redaction.py` now runs on the
+way out of extraction and report rendering, so secrets, emails, and
+credential-bearing URL parameters do not reach them. See the README's
+"Redaction — what is and is not stripped".
 
-**The takeaway:** An operator who assumes full anonymization will leak data. The default redaction is **secrets only** (passwords, tokens, cards, SSNs). Business data (record IDs, field values, names) is captured as-is.
+Not redacted in the raw JSONL:
+
+- **Record IDs** (`500xx0000012345AAA`) — captured verbatim, and also retained in the
+  derived artifacts on purpose: they are the audit trail. `redaction.py` includes a
+  checksum-validated Salesforce ID detector, but `pipeline_policy()` leaves it off.
+  Pass `RedactionPolicy(redact_record_ids=True)` if you need them scrubbed.
+- **Field values** (Status, Priority, Subject, Description) — captured verbatim unless they match a secret pattern.
+- **Customer names** — captured verbatim, and **not** redacted in derived artifacts
+  either. Name detection is unbuilt because a dictionary match would corrupt
+  legitimate Case text.
+- **Emails and phone numbers** — captured verbatim in the JSONL. In derived
+  artifacts, emails **are** stripped; phone-shaped digit runs are not, because the
+  pattern matches any ten consecutive digits and would rewrite step identifiers and
+  epoch timestamps.
+- **URLs** — captured verbatim in the JSONL, including `frontdoor.jsp?sid=…`. **Treat
+  a raw capture as credential-bearing material.** Credential parameters are stripped
+  from derived artifacts, not from the JSONL.
+
+**The takeaway:** An operator who assumes full anonymization will leak data. The raw
+JSONL is redacted for **secrets only** (passwords, tokens, cards, SSNs), at capture
+time by the recorder. Business data is captured as-is, and the JSONL retains session
+URLs the derived artifacts drop.
 
 If you need stricter redaction, see `src/sf_video_blueprint/redaction.py` and configure a `RedactionPolicy` before processing the JSONL.
 
