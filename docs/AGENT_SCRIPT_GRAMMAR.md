@@ -10,8 +10,8 @@ inferred from a blog post, and nothing is a guess dressed as a fact.
 sf agent validate authoring-bundle --api-name <probe> -o AFT3 --json
 ```
 
-- CLI `@salesforce/cli 2.143.6`; `@salesforce/plugin-agent` **1.40.5**;
-  `@salesforce/agents` **1.6.6**
+- CLI `@salesforce/cli 2.143.6`; `@salesforce/plugin-agent` **1.44.4** (`agent 1.44.4 (core)`);
+  `@salesforce/agents` **1.10.2**
 - Compiler endpoint `POST https://api.salesforce.com/einstein/ai-agent/v1.1/authoring/scripts`,
   `afScriptVersion: "2.0.0"`
 - Org `AFT3` (Developer Edition, `IsSandbox=false`), 2026-07-26
@@ -21,10 +21,21 @@ SFDX project and POSTs its *contents*; the org supplies auth only. All probes
 below were validated without deploying anything. (Established by lane 01 and
 independently reproduced here.)
 
-**A version claim in `agent_script.py` is wrong.** Its docstring cites
-`@salesforce/agents` **1.10.2** as ground truth. The version actually installed
-under CLI 2.143.6 is **1.6.6**. The `.bundle-meta.xml` template does match, so
-the substance holds, but the citation is inaccurate.
+**There are two `sf` installs on this machine and only one of them runs.** An
+earlier draft of this file cited `@salesforce/agents` **1.6.6** /
+`@salesforce/plugin-agent` **1.40.5** and called `agent_script.py`'s citation of
+1.10.2 wrong. That was backwards. `/usr/local/lib/sf/bin/sf` is a launcher, not
+the CLI: it sets `CLIENT_HOME=$XDG_DATA_HOME/sf/client` and execs
+`$CLIENT_HOME/bin/sf`, which resolves through `current ->  2.143.6-4b4ce38`.
+
+| Tree | CLI | `@salesforce/agents` | `plugin-agent` | Runs? |
+|---|---|---|---|---|
+| `~/.local/share/sf/client/2.143.6-4b4ce38` | 2.143.6 | **1.10.2** | **1.44.4** | **yes** |
+| `/usr/local/lib/sf` | 2.137.7 | 1.6.6 | 1.40.5 | no — shadowed |
+
+Corroborated by `sf version --json` → `@salesforce/cli/2.143.6` and
+`sf plugins --core` → `agent 1.44.4 (core)`. So `agent_script.py`'s 1.10.2
+citation is **correct**, and every probe below was answered by 1.10.2 / 1.44.4.
 
 ---
 
@@ -37,7 +48,7 @@ artifact; "our status" is where this repo stands **after** this lane and lane 01
 |---|---|---|---|---|
 | 1 | `naming.MAX_NAME_LENGTH = 74`, budgeting a 6-char `go_to_` prefix inside an assumed 80-char cap | Cap is **80 inclusive on the subagent name itself**. 81 fails. The `go_to_` prefix is **not** inside the budget — a 100-char router action compiles | probes `len74/75/80/81/100/120/255`; verbatim error `Too big: expected string to have <=80 characters` | **Assumption's *reasoning* was wrong**; the value 74 is kept deliberately (see §6) |
 | 2 | `subagent <snake_case>:` declaration form | Correct, and `topic <name>:` / `@topic.` also compile | probe `B`; first-party template comment: "supports both `topic` and `subagent` … for backward compatibility" | **Correct** |
-| 3 | `system:` is the required first line | **Not required at all.** A file starting at `config:` compiles; so does `config:` before `system:` | probes `E`, `F` | **Over-strict** — `validate_locally` treats `system:` as mandatory |
+| 3 | `system:` is the required first line | **Not required at all.** A file starting at `config:` compiles; so does `config:` before `system:`. `config:` IS required (`Missing config block`) | probes `E`, `F`, `6e` | **Fixed this lane** — the `system:` check was removed as a false positive |
 | 4 | `.bundle-meta.xml` carries only `apiVersion` | It carries **`bundleType`** (no `apiVersion` anywhere). Org-authored bundles add `<target>Name.v1</target>` | first-party `scriptAgent.js:141-144`; retrieved `Local_Info_Agent.bundle-meta.xml` | **Docstring wording is wrong, emitted bytes are right** |
 | 5 | No `@apex.*` / `@flow.*` may be referenced (safety choice) | **`@apex.*` and `@flow.*` are not valid syntax at all** — the safety choice happens to coincide with the grammar. Apex/Flow are reached a completely different way (§3) | probes `act_apexbare`, `act_apexdot`, `act_flowbare` | **Correct outcome, wrong stated reason** |
 | 6 | A bundle can be valid with no action at all | Yes. A subagent with only `instructions:` and no `actions:` block compiles; so does one with no derived subagent beyond the standard three | probes `D`, `G` | **Correct** |
@@ -45,6 +56,9 @@ artifact; "our status" is where this repo stands **after** this lane and lane 01
 | 8 | Duplicate `subagent` blocks are fatal corruption | **The compiler accepts them.** Two `subagent escalation:` blocks compiled with exit 0 | probe `J` | **Our check is stricter than the compiler** (defensible, but it is a house rule, not grammar) |
 | 9 | Orphaned subagents (defined, unreferenced) are errors | **The compiler accepts them** | probe `I` | **House rule, not grammar** |
 | 10 | Indentation must be a multiple of 4 | **False.** Block-scalar continuation lines legitimately sit at 14 and 10 spaces in Salesforce's own output | first-party generator output lines 27, 54, 66-79 | **Was a false positive — fixed this lane** |
+| 11 | `config: developer_name` is a free-text field the caller supplies | It must match **`/^[A-Za-z](_?[A-Za-z0-9])*$/`** and be ≤80 chars. `"Update Case Status"` cannot compile | probes `dn_*` (9 cases); verbatim `Invalid string: must match pattern /^[A-Za-z](_?[A-Za-z0-9])*$/ for config` | **Was unchecked — fixed this lane** (§5a) |
+| 12 | `config:` is optional like `system:` | **`config:` IS required** — `Missing config block`. Within it, `developer_name` and `description` are required; `agent_label` and `default_agent_user` are not | probe `NoConfig` | **Correct after fix** |
+| 13 | A blank line inside a block scalar creates a paragraph break | **It cannot be expressed at all** — the compiler drops empty instruction lines however they are spelled | probes `Blank{a..e}`, compared via `compiledArtifact` (§7) | **No emitter change needed** |
 
 ---
 
@@ -251,9 +265,57 @@ resolution (`'X' is not defined in actions`/`topic`), which needs a symbol table
 rather than a lint pass.
 
 **It is still not a compiler.** A clean result does not mean the bundle compiles.
-Stricter than the grammar, deliberately: duplicate subagent blocks, orphaned
-subagents, and a missing `system:` block are all accepted by Salesforce but
-reported here as house rules.
+Stricter than the grammar, deliberately: duplicate subagent blocks and orphaned
+subagents are accepted by Salesforce but reported here as house rules.
+
+A missing `system:` block **is no longer reported** — that check was a false
+positive and has been removed, along with the test that asserted it (retargeted
+to `config:`, the block the compiler actually requires).
+
+---
+
+## 5a. The `config:` block — measured field by field
+
+`developer_name` is the only `config:` value this project takes verbatim from a
+caller, and it is the most constrained field in the file.
+
+| Field | Rule | Verbatim compiler error when violated |
+|---|---|---|
+| `developer_name` | **Required.** Must match `/^[A-Za-z](_?[A-Za-z0-9])*$/`, max **80** chars | `Invalid string: must match pattern /^[A-Za-z](_?[A-Za-z0-9])*$/ for config` · `Too big: expected string to have <=80 characters for config` |
+| `description` | **Required.** No length cap found (1000 chars compiled); empty string is accepted | `Missing required field 'description'` |
+| `agent_label` | **Optional.** Free text; 255 chars and empty both compiled | — |
+| `default_agent_user` | **Optional.** Free text; an email address, arbitrary text, and empty all compiled | — |
+
+Rejected `developer_name` values, each measured: `"Case Updater"` (space),
+`"case-updater"` (hyphen), `"9lives"` (leading digit), `"_leading"` (leading
+underscore), `"Trailing_"` (trailing underscore), `"Double__Underscore"`
+(consecutive underscores), `"é_accent"` (non-ASCII). Accepted: `"Valid_Name_1"`,
+`"lower_ok"`, `"A"`, `"a1"`, `"a_1_b_2"`, 80×`"a"`.
+
+**This pattern is stricter than the subagent-name pattern.** A subagent name may
+contain one run of two underscores —
+`/^[A-Za-z](_?[A-Za-z0-9])*(__(_?[A-Za-z0-9])*)?$/`, and `subagent
+double__underscore:` compiled — but `developer_name: "Double__Underscore"` was
+rejected. The two rules must not be unified.
+
+**Why this mattered.** `build_agent_script(developer_name=...)` writes the value
+straight into `config:`. A caller passing a human-readable process name — exactly
+what this project derives from a recording — produced a bundle that could never
+compile, and `validate_locally` reported **zero findings** on it.
+`check_config_block` now catches it. Nine cases were re-run end-to-end against the
+real compiler — the six rejections above plus `"Case_Triage_Agent"`, `"lower_ok"`
+and `"A"` — and the local verdict agrees with the compiler on **9/9**.
+
+### A false positive on Salesforce's own artifact
+
+`check_action_grammar` reported
+`cannot invoke '@testdrive.orgab948baa' — 'testdrive' is not a valid invocation target`
+on the **org-authored** `Local_Info_Agent` bundle retrieved from AFT3, because
+that bundle's `default_agent_user` is an agent-user address of the form
+`afdx-agent@testdrive.org<id>-<uuid>` and the `@` was read as an invocation.
+Re-validating that exact value through the compilation API returns **exit 0**. The
+invocation regex now requires the `@` not to follow a word character. After the
+fix, the retrieved org bundle passes `validate_locally` with **0 findings**.
 
 ---
 
@@ -272,9 +334,52 @@ now known to be a non-rule — it enforces something the compiler does not.
 **To lane 10 (docs):** two corrections. (a) `agent_script.py`'s module docstring
 says the only authoritative reference is `agentScriptTemplate.js`; the compiler
 API is strictly more authoritative and the template omits the entire action
-grammar in §3. (b) That docstring cites `@salesforce/agents` 1.10.2; installed is
-**1.6.6**. (c) Its `CONSTRAINT` paragraph frames avoiding `@apex.Foo` as purely a
-safety choice — it is also a syntax error, which is a stronger argument.
+grammar in §3. (b) Its `CONSTRAINT` paragraph frames avoiding `@apex.Foo` as
+purely a safety choice — it is also a syntax error, which is a stronger argument.
+Its `@salesforce/agents` 1.10.2 citation needs no change: it is the version that
+actually runs (see the two-installs table at the top of this file).
+
+---
+
+## 6a. Exit 0 is not the whole verdict — read `compiledArtifact`
+
+Every other section of this file uses `sf agent validate`'s exit code. That is
+enough for grammar, but it cannot see *semantic* differences between two files
+the compiler both accepts. To measure those, drive the first-party
+`ScriptAgent.compile()` directly and inspect the `compiledArtifact` it returns —
+the CLI discards it and reports only `{"success": true}`:
+
+```js
+const { ScriptAgent } = await import('~/.local/share/sf/client/current/node_modules/@salesforce/agents/lib/index.js')
+const agent = new ScriptAgent({ connection, project, aabName })
+const resp  = await agent.compile()          // resp.compiledArtifact
+```
+
+The artifact turns each `|` line into a separate state-update that appends to
+`AgentScriptInternal_agent_instructions`.
+
+**Finding: a paragraph break inside a block scalar cannot be expressed at all.**
+For `| AAA` / *separator* / `| BBB`, every spelling produced the **same two**
+appends, `"\nAAA"` then `"\nBBB"` — all with exit 0:
+
+| Separator spelling | Compiled appends |
+|---|---|
+| `\|` (bare pipe) | `"\nAAA"`, `"\nBBB"` |
+| `\| ` (pipe + space) | `"\nAAA"`, `"\nBBB"` |
+| a truly empty line (no pipe) | `"\nAAA"`, `"\nBBB"` |
+| two consecutive empty lines | `"\nAAA"`, `"\nBBB"` |
+
+Only a line with real content survives — a zero-width space produced a third
+append, which is a hack rather than a fix. Confirmed identically on
+`@salesforce/agents` 1.10.2 (the version that runs) and 1.6.6.
+
+**Consequence for our emitter: none.** `_block_scalar` keeping `|` on an empty
+line is correct — it costs nothing and matches the surrounding dialect. An
+in-progress change to make empty lines pipe-free was **reverted** when this
+measurement disproved its premise; `_block_scalar` is lane 01's function and is
+now byte-identical to what lane 01 merged. Anything in this repo that relies on
+blank lines to separate prose paragraphs in an instruction block is relying on
+something the compiler discards.
 
 ---
 
@@ -306,6 +411,11 @@ rest:
 - **Comment syntax.** Still unverified; no probe attempted it.
 - **`system:` optionality across versions.** Measured as optional at
   `afScriptVersion` 2.0.0 on one org, one day. It would be unwise to rely on.
+- **Whether the dropped blank line changes agent behaviour.** §6a proves the
+  compiler discards it. Whether the resulting run-together prose measurably
+  degrades the agent's responses is a Stage-5 question nobody has run.
+- **Everything in §6a on any version other than 1.10.2 and 1.6.6.** The
+  `compiledArtifact` shape is `@beta` in the first-party library and may change.
 
 ---
 
@@ -313,5 +423,7 @@ rest:
 
 Probe scripts are in `.lane-tmp/` (untracked): `probe.sh` writes a candidate into
 a throwaway SFDX project and validates it; `mkcases.py`, `mkactions.py`,
-`mktargets.py`, `mklen.py` generate the candidates. None contain tokens or
-frontdoor URLs. Every probe was validate-only and left **no** org artifact.
+`mktargets.py`, `mklen.py` generate the candidates; `dump_instr.mjs` drives
+`ScriptAgent.compile()` and prints the `compiledArtifact` instruction appends
+(§6a). None contain tokens or frontdoor URLs. Every probe was validate-only and
+left **no** org artifact.

@@ -517,11 +517,19 @@ def test_validate_locally_rejects_needs_evidence_markers():
 # ============================================================================
 
 
-def test_validate_locally_fails_on_missing_system_block():
-    """validate_locally must detect a missing system: block."""
-    broken = "config:\n    developer_name: test\n"
+def test_validate_locally_fails_on_missing_config_block():
+    """validate_locally must detect a missing config: block.
+
+    Retargeted from `system:` to `config:`. This test previously asserted that a
+    missing `system:` block is an error, which was measured to be FALSE: on AFT3 a
+    file whose first block is `config:` compiles with exit 0. `config:` is the
+    block the compiler actually requires ("Missing config block"), so the original
+    intent — that validate_locally is capable of failing on a missing required
+    block — is preserved against a rule that is real.
+    """
+    broken = "system:\n    instructions: \"x\"\n"
     errors = validate_locally(broken)
-    assert any("system:" in err for err in errors)
+    assert any("config" in err for err in errors)
 
 
 def test_validate_locally_fails_on_orphan_subagent():
@@ -1422,3 +1430,71 @@ def test_bundle_meta_xml_no_user_derived_content():
     assert '<AiAuthoringBundle xmlns="http://soap.sforce.com/2006/04/metadata">' in lines[1]
     assert '<bundleType>AGENT</bundleType>' in lines[2]
     assert '</AiAuthoringBundle>' in lines[3]
+
+
+# ---------------------------------------------------------------------------
+# config: developer_name — MEASURED against the real compiler from AFT3.
+#
+# `build_agent_script` takes `developer_name` from its caller and writes it into
+# the `config:` block verbatim. The compiler enforces
+# /^[A-Za-z](_?[A-Za-z0-9])*$/ on that field, so a caller that passes a
+# human-readable process name emits a bundle that cannot compile. Before this
+# change `validate_locally` reported ZERO findings for every one of these.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("developer_name", "why"),
+    [
+        ("Update Case Status", "spaces"),
+        ("update-case", "hyphen"),
+        ("9lives", "leading digit"),
+        ("_leading", "leading underscore"),
+        ("Trailing_", "trailing underscore"),
+        ("Double__Underscore", "consecutive underscores"),
+    ],
+)
+def test_validate_locally_rejects_a_developer_name_the_compiler_rejects(
+    developer_name, why
+):
+    """A developer_name the compilation API rejects must be caught locally.
+
+    Verbatim compiler error for each of these:
+        Invalid string: must match pattern /^[A-Za-z](_?[A-Za-z0-9])*$/ for config
+    """
+    spec = _minimal_spec(intent="Update Case (Status)")
+    script = build_agent_script(
+        spec, developer_name=developer_name, agent_label="Test Agent"
+    )
+
+    errors = validate_locally(script)
+    assert any("developer_name" in e for e in errors), (
+        f"developer_name {developer_name!r} ({why}) is rejected by the compiler "
+        f"but validate_locally reported: {errors}"
+    )
+
+
+def test_validate_locally_accepts_a_compiler_legal_developer_name():
+    """The happy path must stay clean — this rule must not fire on valid input."""
+    spec = _minimal_spec(intent="Update Case (Status)")
+    script = build_agent_script(
+        spec, developer_name="Case_Triage_Agent", agent_label="Case Triage"
+    )
+    assert [e for e in validate_locally(script) if "developer_name" in e] == []
+
+
+def test_validate_locally_does_not_require_a_system_block():
+    """`system:` is NOT required — measured on AFT3, a config:-first file compiles.
+
+    The earlier "Missing required block: system:" was a false positive: it would
+    reject a file Salesforce's own compiler accepts with exit 0.
+    """
+    content = (
+        "config:\n"
+        '    developer_name: "Ok_Name"\n'
+        '    description: "d"\n'
+        "\n"
+        "start_agent agent_router:\n"
+        '    label: "Agent Router"\n'
+    )
+    assert [e for e in validate_locally(content) if "system:" in e] == []

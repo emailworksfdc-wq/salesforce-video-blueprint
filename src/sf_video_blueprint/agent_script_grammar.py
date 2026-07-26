@@ -3,8 +3,10 @@
 Every constant and rule in this module was established empirically by POSTing
 candidate ``.agent`` files to the first-party compilation API via
 ``sf agent validate authoring-bundle -o AFT3`` (CLI 2.143.6, ``@salesforce/agents``
-1.6.6, ``@salesforce/plugin-agent`` 1.40.5) and recording what it accepted or
-rejected. Nothing here is inferred from a blog post or guessed from convention.
+1.10.2, ``@salesforce/plugin-agent`` 1.44.4 — the versions under
+``~/.local/share/sf/client/current``, which is what the ``sf`` launcher actually
+execs) and recording what it accepted or rejected. Nothing here is inferred from a
+blog post or guessed from convention.
 
 ``docs/AGENT_SCRIPT_GRAMMAR.md`` records the probe-by-probe evidence, including
 the verbatim compiler error text behind each rule and the list of things that
@@ -118,10 +120,50 @@ INVALID_NAMESPACE_HINTS = {
 # "'no_such_util' is not defined in utils", so the namespace is closed.
 KNOWN_UTILS_MEMBERS = frozenset({"transition", "escalate"})
 
+# ---------------------------------------------------------------------------
+# config: block identifiers
+# ---------------------------------------------------------------------------
+
+# GROUND TRUTH, verbatim from the compiler. A `developer_name` the pattern rejects
+# produces:
+#
+#   Invalid string: must match pattern /^[A-Za-z](_?[A-Za-z0-9])*$/ for config
+#
+# Measured consequences of that regex — every one of these was rejected:
+#   "Case Updater" (space), "case-updater" (hyphen), "9lives" (leading digit),
+#   "_leading" (leading underscore), "Trailing_" (trailing underscore),
+#   "Double__Underscore" (consecutive underscores), "é_accent" (non-ASCII).
+# Accepted: "Valid_Name_1", "lower_ok", "A", "a1", "a_1_b_2", and 80 x "a".
+#
+# Note this is STRICTER than the subagent-name pattern, which does permit one
+# run of two underscores: /^[A-Za-z](_?[A-Za-z0-9])*(__(_?[A-Za-z0-9])*)?$/.
+# `developer_name` has no such allowance, so a name that is legal as a subagent
+# can still be illegal as a developer_name.
+CONFIG_DEVELOPER_NAME_PATTERN = re.compile(r"^[A-Za-z](_?[A-Za-z0-9])*$")
+
+# MEASURED: 80 chars of `developer_name` compiles; 81 fails with
+#   "Too big: expected string to have <=80 characters for config"
+CONFIG_NAME_LIMIT = 80
+
+# MEASURED by omitting one config key at a time from an otherwise-valid file.
+# Omitting `developer_name` -> the pattern error above (the compiler treats a
+# missing name as an empty string). Omitting `description` ->
+# "Missing required field 'description'". Omitting `agent_label` or
+# `default_agent_user` compiles fine, so neither is required.
+REQUIRED_CONFIG_KEYS = frozenset({"developer_name", "description"})
+
 _TARGET_LINE = re.compile(r'^\s*target:\s*"([^"]*)"\s*$')
+_CONFIG_KEY_LINE = re.compile(r'^\s+([a-z_]+):\s*"(.*)"\s*$')
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9]*)://(.*)$")
 # Matches an invocation such as `@apex.Foo` / `@actions.bar` / `@utils.escalate`.
-_INVOCATION = re.compile(r"@([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_.]+)")
+#
+# The leading `(?<![\\w.@-])` guard is load-bearing: without it the local part of an
+# email address is read as an invocation. The org-authored `Local_Info_Agent` bundle
+# retrieved from AFT3 carries an `afdx-agent@testdrive.org…` value for
+# `default_agent_user`, and this checker reported `cannot invoke '@testdrive.orgab948baa'`
+# on it — a false positive on a bundle the org itself authored and accepted.
+# Re-validating that exact value through the compilation API returns exit 0.
+_INVOCATION = re.compile(r"(?<![\w.@-])@([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_.]+)")
 
 
 def check_target_scheme(target: str) -> str | None:
@@ -150,6 +192,84 @@ def check_target_scheme(target: str) -> str | None:
     if not match.group(2):
         return f'target "{target}" has a supported scheme but names no resource'
     return None
+
+
+def check_developer_name(name: str) -> str | None:
+    """Return an error string when ``name`` is an illegal ``config: developer_name``.
+
+    The compiler enforces ``/^[A-Za-z](_?[A-Za-z0-9])*$/`` and an 80-char cap on
+    this field. It is the one ``config:`` value this project passes straight
+    through from a caller without checking, so a caller that derives it from a
+    process name ("Update Case Status") produces a bundle that cannot compile.
+
+    >>> check_developer_name("Case_Updater") is None
+    True
+    >>> check_developer_name("Case Updater")
+    'developer_name "Case Updater" is invalid: ...'
+    """
+    if len(name) > CONFIG_NAME_LIMIT:
+        return (
+            f'developer_name "{name[:24]}…" is {len(name)} chars; the compiler '
+            f"rejects anything over {CONFIG_NAME_LIMIT} with "
+            f'"Too big: expected string to have <={CONFIG_NAME_LIMIT} characters"'
+        )
+    if not CONFIG_DEVELOPER_NAME_PATTERN.match(name):
+        return (
+            f'developer_name "{name}" is invalid: must match '
+            f"{CONFIG_DEVELOPER_NAME_PATTERN.pattern} — start with a letter, then "
+            "letters/digits singly separated by underscores (no spaces, hyphens, "
+            "leading digit, trailing or doubled underscore, or non-ASCII)"
+        )
+    return None
+
+
+def check_config_block(content: str) -> list[str]:
+    """Report ``config:`` block errors the real compiler would raise.
+
+    Checks the ``developer_name`` identifier rule and the presence of the keys
+    the compiler requires. Both were measured; see the module constants.
+
+    Args:
+        content: A complete ``.agent`` file body.
+
+    Returns:
+        Error strings, line-numbered where a specific line is at fault.
+    """
+    errors: list[str] = []
+    lines = content.split("\n")
+
+    # Locate the `config:` block: from `config:` to the next unindented line.
+    start: int | None = None
+    for i, line in enumerate(lines):
+        if line.rstrip() == "config:":
+            start = i
+            break
+    if start is None:
+        # The compiler reports this as "Missing config block".
+        return ["Missing config block; the compiler requires it (unlike system:)"]
+
+    found: dict[str, tuple[int, str]] = {}
+    for offset, line in enumerate(lines[start + 1 :], start=start + 2):
+        if line and not line[0].isspace():
+            break
+        match = _CONFIG_KEY_LINE.match(line)
+        if match:
+            found[match.group(1)] = (offset, match.group(2))
+
+    for key in sorted(REQUIRED_CONFIG_KEYS):
+        if key not in found:
+            errors.append(
+                f"config: is missing required key '{key}' "
+                "(the compiler rejects the bundle without it)"
+            )
+
+    if "developer_name" in found:
+        lineno, value = found["developer_name"]
+        problem = check_developer_name(value)
+        if problem:
+            errors.append(f"Line {lineno}: {problem}")
+
+    return errors
 
 
 def check_action_grammar(content: str) -> list[str]:

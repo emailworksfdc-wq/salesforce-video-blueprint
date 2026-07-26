@@ -136,6 +136,17 @@ def _block_scalar(lines: list[str], indent_level: int, *, key: str = "instructio
 
         sanitized_lines.append(sanitized)
 
+    # NOTE on blank lines: a paragraph break cannot be expressed here at all.
+    # MEASURED on AFT3 2026-07-26 by reading `compiledArtifact` back through the
+    # first-party `ScriptAgent.compile()` (exit code alone hides this — every
+    # spelling returns 0). For `| AAA` / <blank> / `| BBB`, all of these compile
+    # to the SAME two instruction appends, "\nAAA" then "\nBBB":
+    #   `|` (bare pipe), `| ` (pipe + space), a truly empty line, and two
+    #   consecutive empty lines.
+    # The compiler drops empty instruction lines regardless of how they are
+    # written, so keeping the `|` costs nothing and stays consistent with the
+    # surrounding per-line pipe style. Only a line with actual content survives
+    # (a zero-width space does, which is a hack, not a fix).
     body_lines = [
         f"{body_indent}| {line}" if line else f"{body_indent}|" for line in sanitized_lines
     ]
@@ -633,7 +644,7 @@ def validate_locally(content: str) -> list[str]:
     Returns:
         List of error strings (empty if no issues detected)
     """
-    from .agent_script_grammar import check_action_grammar
+    from .agent_script_grammar import check_action_grammar, check_config_block
     from .naming import is_reserved, MAX_NAME_LENGTH
 
     errors: list[str] = []
@@ -642,11 +653,14 @@ def validate_locally(content: str) -> list[str]:
     if "\t" in content:
         errors.append("File contains tabs; Agent Script requires spaces for indentation")
 
-    # Check for required blocks
-    if "system:" not in content:
-        errors.append("Missing required block: system:")
-    if "config:" not in content:
-        errors.append("Missing required block: config:")
+    # Check for required blocks.
+    #
+    # `system:` is deliberately NOT required. Measured on AFT3: a file whose first
+    # block is `config:` compiles (exit 0), and so does one with `config:` ahead of
+    # `system:`. An earlier version of this function reported
+    # "Missing required block: system:", which was a false positive.
+    #
+    # `config:` genuinely is required — the compiler answers "Missing config block".
     if "start_agent agent_router:" not in content:
         errors.append("Missing required block: start_agent agent_router:")
 
@@ -755,6 +769,13 @@ def validate_locally(content: str) -> list[str]:
     # probe-by-probe evidence.
     errors.extend(check_action_grammar(content))
 
+    # CHECK: config: block — the developer_name identifier rule and required keys.
+    # MEASURED: `developer_name` must match /^[A-Za-z](_?[A-Za-z0-9])*$/ and be
+    # <=80 chars. It is the only config value a caller supplies verbatim, so a
+    # caller passing a human-readable process name ("Update Case Status") emitted a
+    # bundle that could never compile while this function reported no findings.
+    errors.extend(check_config_block(content))
+
     # CHECK: Indentation integrity (4-space multiples, no tabs)
     #
     # EXCEPTION — block-scalar continuation lines. The first-party template
@@ -764,8 +785,20 @@ def validate_locally(content: str) -> list[str]:
     # that and it compiles with exit 0, so a strict multiple-of-4 rule produces
     # false positives on Salesforce's own output. Only the *structural* lines are
     # checked for 4-space alignment; continuation lines are skipped.
+    #
+    # Continuation lines are skipped for the 4-space rule but are NOT unchecked:
+    # a continuation must indent strictly deeper than the `|` line it continues.
+    # MEASURED on AFT3 2026-07-26 with `instructions: ->` at col 8 and `| AAA` at
+    # col 12, varying only the indent of a following bare `BBB`:
+    #   col 9/10/11 -> CompilationError: Unknown field `BBB` in subagent probe reasoning
+    #   col 12      -> CompilationError: Unrecognized syntax in subagent
+    #                  'probe reasoning' instructions: BBB
+    #   col 13/14   -> compiles (14 is what the first-party template emits)
+    # The threshold is the pipe's own column, not the owning key's, so a
+    # continuation level with its pipe is a hard error rather than valid text.
     in_block_scalar = False
     block_scalar_indent = 0
+    pipe_indent: int | None = None
     for i, line in enumerate(content.split("\n"), start=1):
         stripped = line.strip()
         leading = len(line) - len(line.lstrip(" "))
@@ -774,12 +807,22 @@ def validate_locally(content: str) -> list[str]:
         if stripped.endswith("->"):
             in_block_scalar = True
             block_scalar_indent = leading
+            pipe_indent = None
         elif in_block_scalar and stripped:
             if leading <= block_scalar_indent:
                 # Dedented back to or past the owning key: the block has ended.
                 in_block_scalar = False
-            elif not stripped.startswith("|"):
+                pipe_indent = None
+            elif stripped.startswith("|"):
+                pipe_indent = leading
+            else:
                 # Inside the block and not a new pipe -> continuation text.
+                if pipe_indent is not None and leading <= pipe_indent:
+                    errors.append(
+                        f"Line {i} is a block-scalar continuation at indent {leading}, "
+                        f"which is not deeper than its `|` line at indent {pipe_indent}; "
+                        "the compiler rejects this"
+                    )
                 continue
 
         if line and line[0] == " ":
