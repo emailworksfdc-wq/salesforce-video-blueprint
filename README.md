@@ -132,10 +132,10 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 1054 passed, 2 skipped
+.venv/bin/python -m pytest -q          # 1210 passed, 2 skipped
 ```
 
-Without the `mcp` extra you get `1016 passed, 3 skipped` — the MCP server tests
+Without the `mcp` extra you get `1172 passed, 3 skipped` — the MCP server tests
 skip rather than fail when the optional dependency is absent.
 
 Two skips are expected. One is an opt-in check that validates artifacts from a
