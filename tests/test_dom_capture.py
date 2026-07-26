@@ -834,10 +834,13 @@ def test_validate_trace_partial_data_loss_warns_above_threshold() -> None:
 
 
 def test_validate_trace_minor_data_loss_no_warning() -> None:
-    """DEFECT A2: Minor loss (<50% skipped) should NOT warn.
+    """DEFECT A2: Minor loss (<50% skipped) must not be FATAL.
 
-    A recorder that emits one bad line among 500 good ones must still produce
-    a usable trace without alarming the operator.
+    A recorder that emits one bad line among 500 good ones must still produce a
+    usable trace. What it must not do is proceed silently: as of DEFECT L4-7 the
+    same input also yields a non-fatal `EVIDENCE INCOMPLETE:` finding, which this
+    test deliberately does not exclude. The assertion is narrowly about the
+    `DATA LOSS:` prefix, which cli.py / pipeline.py / mcp_server.py abort on.
     """
     # 10 events, 2 skipped = 17% loss (below threshold)
     trace = synthesize_trace(
