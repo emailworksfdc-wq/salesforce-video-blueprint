@@ -9,6 +9,15 @@ While the major version is `0`, the public API may change in any minor release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.1] — 2026-07-26
+
+A release whose main job is to be installable. `v0.1.0` cannot be installed on
+Python 3.12 or 3.13 at all — see **Fixed** below — so every consumer of the
+latest tag was blocked. Also ships the MCP server and the first output of this
+project that Salesforce has ever accepted.
+
 ### Added
 
 - **MCP server** (`src/sf_video_blueprint/mcp_server.py`), installed as
@@ -59,6 +68,20 @@ While the major version is `0`, the public API may change in any minor release.
 
 ### Fixed
 
+- **`v0.1.0` could not be installed on Python 3.12 or 3.13.** `playwright~=1.46.0`
+  resolves to `playwright 1.46.0`, which pins `greenlet==3.0.3`; that greenlet has
+  no cp313 wheel, so pip builds it from source and the C extension fails against
+  the 3.12+ C API (`_PyCFrame` and `PyThreadState.trash` were removed):
+
+  ```
+  src/greenlet/greenlet_greenlet.hpp:104:9: error: unknown type name '_PyCFrame'
+  error: command '/usr/bin/clang++' failed with exit code 1
+  ERROR: Failed building wheel for greenlet
+  ```
+
+  Fixed in `ca6b0b8` by replacing compatible-release pins with lower bounds plus a
+  major-version ceiling, floored at versions that build on 3.13. That fix landed
+  on `main` after `v0.1.0` was tagged, which is why this release exists.
 - `SyntaxWarning: invalid escape sequence '\d'` from two docstrings in
   `selectors.py`, which will become a `SyntaxError` in a future Python.
 - **`scripts/agentforce_roundtrip.sh` referred to three different agent names in a
@@ -83,20 +106,61 @@ While the major version is `0`, the public API may change in any minor release.
   `assert_coherent` *passed* on the colliding name — every dialect agreed, on a
   name that identified no recording.
 
+### Validated against a real Salesforce org — a first for this project
+
+On 2026-07-26, `sf agent validate authoring-bundle` was run against output of
+this pipeline for the first time. Read the scope carefully; it is narrow.
+
+- **What passed.** One bundle, API name `SFVB_TEST_Case_Triage`, derived from
+  `examples/case_triage.dom_capture.jsonl` and validated against a Developer
+  Edition org: `{"status": 0, "result": {"success": true}}`.
+- **What failed first.** The initial emitted bundle was **rejected with 24
+  `CompilationError`s**, all in the derived subagent's `reasoning:` block. A bare
+  `->` on its own line is not legal Agent Script — `->` is only valid as the value
+  of a key, so `instructions: ->` compiles and a standalone `->` does not.
+- **The emitter fix is in this version.** `_block_scalar` now emits
+  `instructions: ->` with the `|` lines indented one level deeper, and the bundle
+  built from this release's emitter is the one the compiler accepted. It also
+  **deployed** to the org as `AiAuthoringBundle` metadata and round-tripped
+  byte-identically through deploy → retrieve.
+- **What this still does not license.** One bundle, one intent shape
+  (single-topic router), one org, one CLI version (`@salesforce/cli 2.143.6`,
+  `@salesforce/agents 1.6.6`). Compilation is **syntax, not semantics**: no agent
+  has been published and nothing has checked how a compiled agent behaves. Bundles
+  carrying `@apex.*`/`@flow.*` actions are never emitted, so they are unvalidated.
+  `[NEEDS EVIDENCE: …]` markers compile successfully — the compiler is not a
+  safety net for evidence quality.
+- **`validate_locally()` is blind to this error class.** It reported zero findings
+  on the exact file the compiler rejected, both before and after the fix. A clean
+  local validation is not evidence of deployability.
+- **The subagent name cap is now measured, not assumed.** 80 characters passes and
+  81 fails with `Too big: expected string to have <=80 characters`. Router action
+  names are not length-checked at all (a 100-char action compiled), which retracts
+  a previously recorded "router-action overflow" defect. `MAX_NAME_LENGTH` stays at
+  74 as deliberate headroom; the *metadata* channel's limit remains unmeasured.
+- **The docs premise about needing a deploy first was wrong.** The command
+  resolves the bundle from the *local* SFDX project and POSTs the file content to
+  the authoring compile endpoint; the org connection is used for auth only. A
+  purely local `.agent` file can be validated with no deploy at all.
+
 ### Planned
 
 - Teach `validate_locally()` the two grammar rules the compiler taught us, so a
   bare `->` opener and same-column `|` lines fail locally instead of only in an
   org. It reported zero findings on the file Salesforce rejected with 24 errors.
-- Validate a bundle that is not the single-topic router: another intent shape, and
-  one carrying `@apex.*`/`@flow.*` actions. One passing bundle confirms one
-  grammar path, not the emitter.
+- Broaden org validation beyond the single case: another intent shape, multi-topic
+  specs, bundles carrying `@apex.*`/`@flow.*` actions, and the name limit on the
+  *metadata* path. One passing bundle confirms one grammar path, not the emitter.
+- Make validation a step this repo runs itself rather than a manual CLI call
+  alongside it — it needs no deploy, so it is cheap enough for CI.
+- Publish an agent and run `sf agent test` against it, so something checks
+  behaviour rather than only syntax.
 - Fix the four ingest defects that allow a capture to be silently truncated
   while still being stamped as real evidence (see `docs/DEFECT_LEDGER.md`).
 - Wire `sf agent test create/run/results` so stage 5 (iterate) exists.
 - Call `redaction.py` from the pipeline instead of leaving it unreferenced.
-- Cut `v0.1.1` so the latest tag installs: `v0.1.0` predates the dependency fix
-  and fails to build `greenlet` on Python 3.12+.
+- Publish to PyPI. Until then the package installs from the git URL only, and the
+  `sf-video-blueprint` name is unclaimed.
 
 ## [0.1.0] — 2026-07-26
 
@@ -191,8 +255,10 @@ end goal).
 
 Carried forward deliberately, not overlooked:
 
-- **No real-org validation has ever occurred.** `sf agent validate
-  authoring-bundle` has never been run. The emitted bundle may be invalid.
+- **No real-org validation had occurred as of this release.** `sf agent validate
+  authoring-bundle` had not been run against any output. The emitted bundle may be
+  invalid. *(First validated on 2026-07-26 — see `[0.1.1]`, and note that the
+  bundle only compiled after an emitter fix.)*
 - Stage 5 (run the spec repeatedly to improve it) does not exist. The offline
   loop reports `converged=true` after three identical scores.
 - Stage 6 emitters have no production call site.
@@ -210,5 +276,6 @@ Carried forward deliberately, not overlooked:
 - HTML output embeds record IDs and field values verbatim. Treat every artifact
   in `outputs/` as sensitive.
 
-[Unreleased]: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/emailworksfdc-wq/salesforce-video-blueprint/releases/tag/v0.1.0
