@@ -13,6 +13,11 @@ dist/
 .venv/
 venv/
 env/
+.lanevenv/
+
+# Scratch space for parallel worktree runs. Holds probe bundles, raw sf --json
+# responses, and run output; same sensitivity as outputs/, never commit it.
+.lane-tmp/
 
 # Pipeline outputs — run artifacts, blueprints, screenshots, network traces.
 # These can contain real org data (record ids, field values); never commit them.
