@@ -43,6 +43,8 @@ a different failure mode:
 | **L4-4** | 6 | **CRITICAL (safety)** | Org deny-list was matched by exact string on a raw alias, and one of the two entries was misspelled `ppaccenture` (missing `c`) in both `telemetry.py:152` and `replay_browser.py:17`. `PPCaccenture` was therefore never blocked by the typo'd entry, and `ppcdm`/`ppcaccenture` in any other casing bypassed both guards | `ppcaccenture`, `PPCACCENTURE`, `PpCaccenture`, `" PPCaccenture "`, `PPC-accenture` all returned `False` from `_is_org_forbidden`. `replay_browser` did not block `ppcdm`/`ppcaccenture` at all. `open_org_with_frontdoor` contacted the org via `subprocess` BEFORE refusing. After: all 15 spellings blocked, `subprocess.run` call count 0 | Exact-match comparison on unnormalised operator input, a typo shared between the implementation and its own test (so the test verified nothing), and a guard placed after the side effect it was meant to prevent | `org_denylist.py` (new), `telemetry.py`, `replay_browser.py` | Fixed | `tests/test_org_denylist.py` (52 tests), `test_ppcaccenture_typo_spelling_still_blocked`, `test_blocked_alias_never_reaches_subprocess` |
 | **L4-5** | 6 | HIGH | `parse_capture_file` hardcoded `manifest=None`; `load_manifest` was written, tested, and never called from any production path — so no capture ever had a manifest to validate against and the count-mismatch and sink-error checks in `validate_trace` were unreachable | Manifest claiming 10 events beside a 6-event capture: `trace.manifest is None`, `findings == []`. After: count-mismatch and sink-error findings both raised | Loader implemented but never wired in — the same defect class as round 4's "validate_trace never called" | `dom_capture.py` | Fixed | `test_manifest_is_discovered_beside_the_capture`, `test_missing_manifest_warns_rather_than_failing` (+6) |
 | **L4-6** | 6 | HIGH | Redaction-leak detector checked only `element.name` for sensitive-field patterns, so a leaked value in a field identified by `id`, `type="password"`, `aria_label`, `sf_field`, `test_id`, `label_for`, `css_path`, `xpath` or visible `text` was not flagged | 12 field-identity signals carrying the same leak: 11 missed (including `type="password"`). After: 0 missed. A pre-existing `pin` substring false positive ("Shipping", "spinner") also fixed | Leak detection keyed on ONE of the many places a field's identity appears in the schema | `dom_capture.py` | Fixed | 12-way parametrized `test_leak_detected_via_signal`, `test_no_finding_ever_echoes_the_value`, plus false-positive guards |
+| **R1** | 6 | MEDIUM | Leak detector cried wolf on ordinary SLDS markup. L4-6's widening carried bare substrings `card` and `auth`, and two of the newly inspected signals (`element.classes`, `selectors.css_path`) are presentation metadata | A Case Subject field inside an `slds-card` produced `SECURITY: … [element.classes~'card', selectors.css_path~'card']`; `Author__c`, `AuthorName__c`, `Authorization_Status__c`, `Scorecard__c`, `Discard_Changes`, `Standard_Card_Layout` all fired. After: 0 false positives across those 9 cases, 0 true positives lost across 9 sensitive cases | Bare-substring patterns applied to presentation metadata. Findings are non-blocking, so the cost was alarm fatigue rather than a broken run — for a control whose entire output is an alarm, crying wolf IS the failure mode | `dom_capture.py` | Fixed (review finding on L4-6) | `test_benign_field_names_embedding_card_or_auth_do_not_false_positive`, `test_genuinely_sensitive_card_and_auth_fields_are_still_caught` |
+| **R2** | 6 | **HIGH** | `dom_extractor.py:788` kept a SECOND copy of the sensitive-field pattern list. L4-6 hardened the copy in `dom_capture` and the two silently diverged by eleven patterns | For an unredacted `IBAN__c` / `Passport_No__c` / `tax_id` / `National_ID__c` / `Credential__c`, `validate_trace` correctly emitted a SECURITY finding **and then the extractor wrote the value verbatim** into `inferred_intent` (`Set IBAN__c to <value>`). After: `Set IBAN__c (redacted)`. Verified end to end that the canary reaches neither stdout, spec JSON, nor HTML | Duplicated pattern list with no test pinning the two together. Detecting a leak in one module and laundering it in the next is worse than not detecting it, because the finding asserts the control held | `dom_extractor.py` | Fixed (review finding on L4-6) — now delegates to the single shared detector | `test_extractor_uses_the_hardened_pattern_list_not_a_stale_copy` (asserts against the shared `SENSITIVE_PATTERNS`, so a private copy fails the suite) |
 | **L4-7** | 6 | HIGH | Loss below the 50% fail-closed threshold reached no consumer at all; and loss via a truncated file was invisible by construction, since every line present parses cleanly and `skipped_lines` is empty | 10%/20%/30%/40% line loss each produced an EMPTY finding list and no CLI output. After: each emits `EVIDENCE INCOMPLETE:` in its own CLI block with the ratio; 50%/60% still emit fatal `DATA LOSS:`; 0% still silent | Only one loss channel was measured, only as a raw count, and only above a threshold — so "3 skipped lines" reached the operator without its denominator, or did not reach them at all | `dom_capture.py`, `pipeline.py`, `cli.py` | Fixed. Threshold NOT lowered — `_FAIL_CLOSED_LOSS_RATIO` stays 0.5 per LANE_RULES | `test_at_or_above_threshold_still_fails_closed`, `test_loss_at_the_threshold_still_aborts`, `test_truncated_capture_surfaces_a_manifest_gap` (+30) |
 
 ## Still open (requiring upstream or org-dependent validation)
@@ -63,7 +65,22 @@ Scope: the capture-ingest path only (`dom_capture.py`, plus the org deny-list sh
 each with a test that fails before the fix and passes after. Measured, not asserted: every defect
 was reproduced with a script before being touched and re-measured after.
 
-* **Suite: 829 passed / 1 skipped → 957 passed / 1 skipped** (`[dev,mcp]`), +128 tests, 0 failures.
+* **Suite: 829 passed / 1 skipped → 979 passed / 1 skipped** (`[dev,mcp]`), +150 tests, 0 failures.
+  Also 792/2 → **942/2** with `[dev]` only. The seven briefed defects accounted for 957/1; the two
+  review findings below (R1, R2) added the rest.
+* **Two review findings were raised against L4-6 itself and are fixed: R1 and R2 above.** L4-6's
+  widening was right in direction and wrong in two details — it carried bare substrings that fire
+  on ordinary Lightning markup, and it hardened only ONE of the two copies of the pattern list that
+  existed in the codebase, leaving `dom_extractor.py` to launder values the validator had just
+  flagged. The lesson worth carrying: widening a detector is not finished until you have measured
+  its false-positive rate on ordinary input AND grepped for a second copy of whatever list you
+  changed.
+* **Latent, not fixed, no test:** `ExtractedAction.value` retains the raw string for sensitive
+  fields even though its sibling `inferred_intent` is now redacted. Measured on this branch it
+  reaches no artifact — a canary in an `IBAN__c` field appears in neither stdout, the spec JSON,
+  nor the HTML, and there is no render path for the field — so there is nothing to fix today.
+  Nothing structurally prevents a future consumer from rendering it. Left for whoever owns the
+  redaction choke points.
 * Two pre-existing tests had their **assertions changed** because they encoded a defect as the
   contract. Both are integration risks worth knowing about:
   * `test_order_events_mixed_ingest_seq_and_fallback` asserted that `ingest_seq` events sort
@@ -92,8 +109,9 @@ Any count here is a snapshot and goes stale fast. Run `pytest -q` for the curren
 
 As of 2026-07-26, measured by lane 04 at the end of round 6:
 
-* **Total tests:** 957 passing, 1 skipped (`./.lanevenv/bin/python -m pytest -q`, `[dev,mcp]`).
-  The 1 skip is the MCP-extra guard, which skips by design without the extra installed.
+* **Total tests:** 979 passing, 1 skipped (`./.lanevenv/bin/python -m pytest -q`, `[dev,mcp]`);
+  942 passing, 2 skipped with `[dev]` only. The extra skip in the `[dev]` run is the MCP-extra
+  guard, which skips by design when the extra is absent.
 
 As of 2026-07-25, measured by the orchestrator at the end of round 5:
 
