@@ -31,6 +31,7 @@ from .models import (
     ExtractedAction,
     UIContext,
 )
+from .redaction import pipeline_policy, redact_text, redact_url
 
 # Defensive import for selectors module (agent A5)
 try:
@@ -447,6 +448,11 @@ class DomCaptureExtractor:
         )
         warnings.insert(0, reduction_summary)
 
+        # Step 4: Redact. THE choke point — see _redact_actions.
+        redaction_note = self._redact_actions(actions)
+        if redaction_note:
+            warnings.insert(0, redaction_note)
+
         return ActionExtractionBundle(
             recording_id=self._derive_recording_id(trace),
             source_video_path="<none>",  # Will be overridden by extract()
@@ -454,6 +460,75 @@ class DomCaptureExtractor:
             actions=actions,
             evidence=evidence,
             warnings=warnings,
+        )
+
+    def _redact_actions(self, actions: list[ExtractedAction]) -> str | None:
+        """Scrub secrets and PII out of extracted actions, in place.
+
+        WHY HERE. This is the single point every consumer funnels through:
+        `cli.py`, `pipeline.py` (and therefore `mcp_server.py`), and `write_bundle`
+        all obtain their actions from `extract_from_trace`. Redacting here means the
+        HTML report, the spec JSON, the extraction bundle, and every downstream
+        emitter (`agent_script.py`, `agentforce_spec.py`, `eval_spec.py`,
+        `iterate.py` version dirs) inherit clean data without each needing its own
+        call. Sprinkling redaction across ~8 write sites would guarantee the next
+        emitter added forgets it.
+
+        WHY AFTER VALIDATION, NOT BEFORE. `dom_capture.validate_trace` exists to make
+        a recorder redaction FAILURE visible, and it runs on the raw trace before this.
+        If redaction ran first it would launder the recorder's bug: the operator would
+        get a clean artifact and never learn their recorder is leaking. Detection reads
+        raw bytes; redaction cleans what gets written. Both matter, in that order.
+
+        WHAT IS COVERED. Free-text values, derived targets, inferred intents, and the
+        URL/label fields of `ui_context` — the fields that carry org-controlled text
+        into artifacts. `redact_url` handles URL query parameters, where the parameter
+        NAME is the only signal (an OAuth `code` has no detectable shape).
+
+        Returns:
+            An audit note naming the categories redacted, or None if nothing fired.
+            The note never contains the redacted bytes.
+        """
+        policy = pipeline_policy()
+        categories: list[str] = []
+
+        def _text(value: str | None) -> str | None:
+            if not value:
+                return value
+            scrubbed, found = redact_text(value, policy)
+            categories.extend(found)
+            return scrubbed
+
+        def _url(value: str | None) -> str | None:
+            if not value:
+                return value
+            # Parameter-name pass first (catches shapeless credentials), then the
+            # value-pattern pass (catches a token embedded in a path segment).
+            scrubbed, found = redact_url(value)
+            categories.extend(found)
+            return _text(scrubbed)
+
+        for action in actions:
+            action.value = _text(action.value)
+            action.target = _text(action.target) or action.target
+            action.inferred_intent = _text(action.inferred_intent)
+            action.expected_outcome = _text(action.expected_outcome)
+
+            ctx = action.ui_context
+            ctx.url = _url(ctx.url)
+            ctx.page_title = _text(ctx.page_title)
+            ctx.view_name = _text(ctx.view_name)
+            ctx.modal_name = _text(ctx.modal_name)
+
+        if not categories:
+            return None
+
+        # Categories only — never the values. A warning that echoes the secret it
+        # removed would put it straight back into the report and the terminal.
+        unique = sorted(set(categories))
+        return (
+            f"redaction: scrubbed {len(categories)} value(s) from extracted actions "
+            f"(categories: {', '.join(unique)})"
         )
 
     def _derive_recording_id(self, trace: CaptureTrace) -> str:

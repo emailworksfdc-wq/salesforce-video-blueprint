@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,6 +9,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from .correlation import StepAnalysis
 from .models import ActionExtractionBundle
+from .redaction import pipeline_policy, redact_text
 from .replay import ReplayRunMetadata
 
 
@@ -81,6 +83,39 @@ class MasterBlueprintRenderer:
             ),
         )
 
+    @staticmethod
+    def _redact_analyses(analyses: list[StepAnalysis]) -> list[StepAnalysis]:
+        """Scrub org-authored text out of the analyses before rendering.
+
+        The extraction choke point (`DomCaptureExtractor._redact_actions`) cannot
+        reach these fields: `replay_message` comes from the replay adapter and
+        `failure_reason` is synthesized from telemetry, so both enter the report
+        without ever passing through extraction. A real
+        `FIELD_CUSTOM_VALIDATION_EXCEPTION` is authored by an org admin and can quote
+        a customer email or account name straight back at us.
+
+        Escaping is not redaction. Jinja autoescaping (forced on above) stops the
+        value from becoming markup; it does nothing to stop it from being READ. The
+        report is an audit artifact that gets shared.
+
+        Operates on a DEEP COPY: the caller's `analyses` are also used to derive the
+        spec, and mutating them here would make the report and the spec disagree
+        about what the run observed.
+        """
+        policy = pipeline_policy()
+
+        def _text(value: str | None) -> str | None:
+            if not value:
+                return value
+            scrubbed, _ = redact_text(value, policy)
+            return scrubbed
+
+        redacted = copy.deepcopy(analyses)
+        for analysis in redacted:
+            analysis.replay_message = _text(analysis.replay_message)
+            analysis.failure_reason = _text(analysis.failure_reason)
+        return redacted
+
     def render(
         self,
         extraction: ActionExtractionBundle,
@@ -94,7 +129,7 @@ class MasterBlueprintRenderer:
             generated_at=datetime.now(timezone.utc).isoformat(),
             extraction=extraction,
             run=run,
-            analyses=analyses,
+            analyses=self._redact_analyses(analyses),
             agent_sections=agent_sections,
             provenance=provenance or DataProvenance(),
         )

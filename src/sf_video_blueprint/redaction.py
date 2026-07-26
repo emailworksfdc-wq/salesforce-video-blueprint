@@ -772,3 +772,97 @@ class RedactionReport:
         for cat, count in sorted(self.categories.items()):
             lines.append(f"  - {cat}: {count}")
         return "\n".join(lines)
+
+
+# ============================================================================
+# URL query-parameter redaction
+# ============================================================================
+
+# Query/fragment parameters whose VALUE is a credential regardless of shape.
+# `cli.py::_redact_sensitive_url` already covers sid/access_token/session on the
+# operator-supplied --org-url. This is the same discipline applied to the URLs the
+# recorder captured, which that function never sees, plus the parameters it misses.
+_SENSITIVE_URL_PARAMS = (
+    "sid",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "code",
+    "session",
+    "sessionid",
+    "session_id",
+    "sid_client",
+    "assertion",
+    "client_secret",
+    "apikey",
+    "api_key",
+    "signature",
+    "sig",
+    "token",
+    "auth",
+    "password",
+    "pw",
+)
+
+_URL_PARAM_RE = re.compile(
+    r"([?&#])(" + "|".join(_SENSITIVE_URL_PARAMS) + r")=([^&#\s]+)",
+    re.IGNORECASE,
+)
+
+
+def redact_url(url: str | None) -> tuple[str | None, list[str]]:
+    """Strip credential-bearing query parameters from a URL.
+
+    A captured `frontdoor.jsp?sid=...` URL is a live credential, not a location.
+    Pattern-based value detection is not enough here: an OAuth `code` or an opaque
+    `access_token` has no distinguishing shape, so the PARAMETER NAME is the signal
+    and the value is replaced wholesale.
+
+    The parameter name is preserved so the audit trail still shows which credential
+    was present — consistent with `cli.py::_redact_sensitive_url`, which redacts
+    rather than omits for the same reason.
+
+    Args:
+        url: The URL to scrub. None passes through.
+
+    Returns:
+        (scrubbed_url, categories_found)
+    """
+    if not url:
+        return (url, [])
+
+    categories: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        categories.append("url_credential")
+        return f"{match.group(1)}{match.group(2)}=[REDACTED:url_credential]"
+
+    scrubbed = _URL_PARAM_RE.sub(_replace, url)
+    return (scrubbed, list(dict.fromkeys(categories)))
+
+
+def pipeline_policy() -> RedactionPolicy:
+    """The policy applied to captured evidence on its way into artifacts.
+
+    Redacts secrets (tokens, keys, cards, SSNs) and emails. Deliberately does NOT
+    redact Salesforce record ids or phone-shaped digits:
+
+    - **Record ids are retained on purpose.** They are the audit trail. A blueprint
+      that cannot say which record a step touched is not evidence, and the ids are
+      already scoped to a single org that the report's reader has access to.
+    - **Phone redaction is off because it is measurably wrong here.** The phone
+      pattern matches any 10 consecutive digits, so `RedactionPolicy.strict()`
+      rewrites `step 1234567890` to `step [REDACTED:phone]`. Corrupting step
+      identifiers to hide digits that are usually not phone numbers trades a real
+      defect for a speculative one.
+
+    `RedactionPolicy.strict()` remains available for callers who want the maximal
+    setting and accept the false positives.
+    """
+    return RedactionPolicy(
+        redact_record_ids=False,
+        redact_emails=True,
+        redact_phones=False,
+        redact_names=False,
+        mode="mask",
+    )
