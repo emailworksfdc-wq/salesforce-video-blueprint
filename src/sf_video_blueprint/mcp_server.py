@@ -254,20 +254,33 @@ def health() -> dict[str, Any]:
             "launchesBrowser": False,
             "telemetry": "mock-only — collecting real telemetry needs a live org",
         },
+        # Each entry is parenthesised rather than relying on bare implicit
+        # concatenation: in a list of strings, a single missing comma silently
+        # merges two limitations into one and drops a disclosure.
         limitations=[
-            "No output from this server has ever been validated against a real "
-            "Salesforce org. `sf agent validate authoring-bundle` has never been "
-            "run, so an emitted .agent bundle may be syntactically invalid.",
-            "Telemetry is always mocked here, so every derived spec is stamped "
-            "telemetry_source=mock and cannot pass the score gate. That is "
-            "correct behaviour, not a bug to work around.",
-            "Video files are not supported. The video extractor is a stub that "
-            "returns one placeholder step for any input. Use a dom_capture.jsonl.",
-            "Capture ingest can silently discard events: the integrity gate only "
-            "refuses at >=50% loss, so check skipped_line_count on every result.",
-            "No agent actions (@apex.*/@flow.*) are ever emitted, by design — "
-            "referencing an action that may not exist in the target org produces "
-            "a bundle that fails to deploy for invisible reasons.",
+            (
+                "No output from this server has ever been validated against a real "
+                "Salesforce org. `sf agent validate authoring-bundle` has never been "
+                "run, so an emitted .agent bundle may be syntactically invalid."
+            ),
+            (
+                "Telemetry is always mocked here, so every derived spec is stamped "
+                "telemetry_source=mock and cannot pass the score gate. That is "
+                "correct behaviour, not a bug to work around."
+            ),
+            (
+                "Video files are not supported. The video extractor is a stub that "
+                "returns one placeholder step for any input. Use a dom_capture.jsonl."
+            ),
+            (
+                "Capture ingest can silently discard events: the integrity gate only "
+                "refuses at >=50% loss, so check skipped_line_count on every result."
+            ),
+            (
+                "No agent actions (@apex.*/@flow.*) are ever emitted, by design — "
+                "referencing an action that may not exist in the target org produces "
+                "a bundle that fails to deploy for invisible reasons."
+            ),
         ],
     )
 
@@ -622,7 +635,11 @@ def emit_test_spec(
         return _err(tool, request_id, started, ERROR_INTERNAL, f"Pipeline failed: {exc}")
 
     try:
-        from .eval_spec import build_legacy_test_spec, build_ngt_test_spec, render_test_spec
+        from .eval_spec import (
+            build_legacy_test_spec,
+            build_ngt_test_spec,
+            render_test_spec,
+        )
 
         if dialect == "legacy":
             spec_obj, derivations = build_legacy_test_spec(

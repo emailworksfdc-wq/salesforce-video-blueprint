@@ -70,95 +70,97 @@ def _payload(result) -> dict:
 async def run(capture: str, command: str) -> None:
     params = StdioServerParameters(command=command, args=[], env=None)
 
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            init = await session.initialize()
-            print(f"  connected: {init.serverInfo.name}")
+    async with (
+        stdio_client(params) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        init = await session.initialize()
+        print(f"  connected: {init.serverInfo.name}")
 
-            listing = await session.list_tools()
-            names = {tool.name for tool in listing.tools}
-            if names != EXPECTED_TOOLS:
-                fail(
-                    "tool set mismatch over the wire.\n"
-                    f"  missing: {sorted(EXPECTED_TOOLS - names)}\n"
-                    f"  unexpected: {sorted(names - EXPECTED_TOOLS)}"
-                )
-            print(f"  all {len(names)} tools advertised")
-
-            for tool in listing.tools:
-                if not tool.description:
-                    fail(f"tool {tool.name} has no description; a model cannot use it")
-                if not tool.inputSchema:
-                    fail(f"tool {tool.name} has no input schema")
-            print("  every tool has a description and an input schema")
-
-            health = _payload(await session.call_tool("health", {}))
-            if not health.get("ok"):
-                fail(f"health returned not-ok: {health}")
-            if health.get("capabilities", {}).get("contactsSalesforceOrg") is not False:
-                fail("health must declare that this server does not contact an org")
-            if not health.get("limitations"):
-                fail("health must disclose the project's limitations")
-            print(f"  health ok (version {health['serverVersion']})")
-
-            derived = _payload(
-                await session.call_tool(
-                    "derive_spec",
-                    {
-                        "capture_path": capture,
-                        "org_url": "https://example-dev.develop.my.salesforce.com",
-                    },
-                )
+        listing = await session.list_tools()
+        names = {tool.name for tool in listing.tools}
+        if names != EXPECTED_TOOLS:
+            fail(
+                "tool set mismatch over the wire.\n"
+                f"  missing: {sorted(EXPECTED_TOOLS - names)}\n"
+                f"  unexpected: {sorted(names - EXPECTED_TOOLS)}"
             )
-            if not derived.get("ok"):
-                fail(f"derive_spec failed: {derived.get('error')}")
-            if not derived.get("intent"):
-                fail("derive_spec returned no intent")
-            print(
-                f"  derive_spec ok: intent={derived['intent']!r} "
-                f"score={derived['score']} passed={derived['passed']}"
-            )
+        print(f"  all {len(names)} tools advertised")
 
-            # The contract. CI has no org, so telemetry is mock and the gate must
-            # refuse. A pass here means the gate was weakened.
-            if derived["provenance"]["telemetry_source"] != "mock":
-                fail(
-                    "expected telemetry_source='mock' in CI (there is no org here), "
-                    f"got {derived['provenance']['telemetry_source']!r}"
-                )
-            if derived["evidence_is_real"] is not False:
-                fail("a mock-telemetry run reported evidence_is_real=True")
-            if derived["passed"] is not False:
-                fail(
-                    "CONTRACT VIOLATION: a spec built from MOCK telemetry passed the "
-                    "quality gate over MCP. The gate has been weakened; that is a "
-                    "defect, not a fix."
-                )
-            if not derived["blocking_issues"]:
-                fail("a blocked run reported no blocking issues")
-            print("  contract holds: mock telemetry is refused by the gate")
+        for tool in listing.tools:
+            if not tool.description:
+                fail(f"tool {tool.name} has no description; a model cannot use it")
+            if not tool.inputSchema:
+                fail(f"tool {tool.name} has no input schema")
+        print("  every tool has a description and an input schema")
 
-            missing = _payload(
-                await session.call_tool(
-                    "derive_spec", {"capture_path": "/nonexistent/capture.jsonl"}
-                )
-            )
-            if missing.get("ok") is not False or missing["error"]["code"] != "NOT_FOUND":
-                fail(f"a missing file should return a NOT_FOUND envelope, got {missing}")
-            print("  error path returns structured data, not a crash")
+        health = _payload(await session.call_tool("health", {}))
+        if not health.get("ok"):
+            fail(f"health returned not-ok: {health}")
+        if health.get("capabilities", {}).get("contactsSalesforceOrg") is not False:
+            fail("health must declare that this server does not contact an org")
+        if not health.get("limitations"):
+            fail("health must disclose the project's limitations")
+        print(f"  health ok (version {health['serverVersion']})")
 
-            names_preview = _payload(
-                await session.call_tool(
-                    "preview_api_names", {"process_description": "Update Case Status"}
-                )
+        derived = _payload(
+            await session.call_tool(
+                "derive_spec",
+                {
+                    "capture_path": capture,
+                    "org_url": "https://example-dev.develop.my.salesforce.com",
+                },
             )
-            expected_router = f"go_to_{names_preview['subagentName']}"
-            if names_preview["routerActionName"] != expected_router:
-                fail(
-                    "router action name diverged from the subagent name: "
-                    f"{names_preview['routerActionName']!r} != {expected_router!r}"
-                )
-            print("  cross-artifact naming stays consistent")
+        )
+        if not derived.get("ok"):
+            fail(f"derive_spec failed: {derived.get('error')}")
+        if not derived.get("intent"):
+            fail("derive_spec returned no intent")
+        print(
+            f"  derive_spec ok: intent={derived['intent']!r} "
+            f"score={derived['score']} passed={derived['passed']}"
+        )
+
+        # The contract. CI has no org, so telemetry is mock and the gate must
+        # refuse. A pass here means the gate was weakened.
+        if derived["provenance"]["telemetry_source"] != "mock":
+            fail(
+                "expected telemetry_source='mock' in CI (there is no org here), "
+                f"got {derived['provenance']['telemetry_source']!r}"
+            )
+        if derived["evidence_is_real"] is not False:
+            fail("a mock-telemetry run reported evidence_is_real=True")
+        if derived["passed"] is not False:
+            fail(
+                "CONTRACT VIOLATION: a spec built from MOCK telemetry passed the "
+                "quality gate over MCP. The gate has been weakened; that is a "
+                "defect, not a fix."
+            )
+        if not derived["blocking_issues"]:
+            fail("a blocked run reported no blocking issues")
+        print("  contract holds: mock telemetry is refused by the gate")
+
+        missing = _payload(
+            await session.call_tool(
+                "derive_spec", {"capture_path": "/nonexistent/capture.jsonl"}
+            )
+        )
+        if missing.get("ok") is not False or missing["error"]["code"] != "NOT_FOUND":
+            fail(f"a missing file should return a NOT_FOUND envelope, got {missing}")
+        print("  error path returns structured data, not a crash")
+
+        names_preview = _payload(
+            await session.call_tool(
+                "preview_api_names", {"process_description": "Update Case Status"}
+            )
+        )
+        expected_router = f"go_to_{names_preview['subagentName']}"
+        if names_preview["routerActionName"] != expected_router:
+            fail(
+                "router action name diverged from the subagent name: "
+                f"{names_preview['routerActionName']!r} != {expected_router!r}"
+            )
+        print("  cross-artifact naming stays consistent")
 
 
 def main() -> None:

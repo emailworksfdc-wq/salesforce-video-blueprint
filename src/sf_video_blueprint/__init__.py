@@ -32,11 +32,11 @@ __all__ = [
     "DerivedEntity",
     "PipelineResult",
     "SpecScore",
+    "__version__",
     "build_agent_spec",
     "run_pipeline",
     "score_spec",
     "score_spec_file",
-    "__version__",
 ]
 
 # Import eagerly under a type checker so `from sf_video_blueprint import X`
