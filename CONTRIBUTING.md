@@ -17,24 +17,28 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-You should see `1367 passed, 2 skipped` (the count grows as fixes land). No
+You should see `1386 passed, 1 skipped` (the count grows as fixes land). No
 Salesforce org, network access, or credentials are needed — every test is
 hermetic and offline.
 
-Omit the `mcp` extra and you get `1327 passed, 3 skipped` instead: the MCP server
+Omit the `mcp` extra and you get `1346 passed, 2 skipped` instead: the MCP server
 tests `importorskip` the optional dependency. **Keep it that way** — a plain
 `pip install -e ".[dev]"` must not produce a red suite. CI runs both
 configurations for exactly this reason.
 
-Two skips are expected on a green run.
+One skip is expected on a green run.
 `test_real_e2e_artifacts_validate_against_new_schemas` validates artifacts from a
 real pipeline run against the JSON schemas; point `SF_BLUEPRINT_E2E_DIR` at a
 directory containing a `dom_capture.jsonl` and `blueprint.agent-spec.json` to
-enable it. `test_c11_on_lane_02_real_capture_when_available` asserts the score gate
-does not accuse its own builder of padding on a *real* recorded capture; it stays
-skipped until such a capture is committed to `examples/` and survives ingest.
-Both are skips by design, not gaps to paper over — if you make either pass by
-weakening what it asserts, you have removed a check rather than satisfied it.
+enable it. It is a skip by design, not a gap to paper over — if you make it pass
+by weakening what it asserts, you have removed a check rather than satisfied it.
+
+`test_c11_on_lane_02_real_capture_when_available` used to be a second skip: it
+asserts the score gate does not accuse its own builder of padding on a *real*
+recorded capture, and there was no such capture to run it against. There is now
+(`examples/case_creation_aft3.dom_capture.jsonl`), and it parses cleanly, so the
+test runs. That is the right way to retire a skip — supply the evidence it was
+waiting for, not relax the assertion.
 
 ### Working on the MCP server
 
