@@ -57,6 +57,11 @@
     .sim-foot { color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
     .badge-sim { background: #fef2f2; color: #b91c1c; border-color: #fca5a5; }
     .prov { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+    .conf-high { color: #0f766e; font-weight: 600; }
+    .conf-temporal { color: #b45309; }
+    .conf-asserted { color: #b45309; font-style: italic; }
+    .conf-ambiguous { color: #b91c1c; font-weight: 600; }
+    .conf-note { font-size: 12px; color: var(--muted); margin-left: 8px; }
   </style>
 </head>
 <body>
@@ -128,7 +133,7 @@
     </div>
   </div>
   <div class="callout">
-    This blueprint is designed as a production handoff artifact: every UI action should be traceable to backend execution and data changes, then mapped to conversational agent behavior.
+    This blueprint is a derived, locally-validated proposal. It correlates observed UI actions with backend telemetry and data changes using a 5-second timestamp window. Correlation confidence varies per event (HIGH when timestamp and caller-assertion agree, TEMPORAL when only timestamp matches, ASSERTED when only caller matches, AMBIGUOUS when multiple candidates exist). The generated agent spec is a starting point requiring org validation: no authoring bundle has been deployed, no generated test has been executed against a live agent, and the closed improvement loop (deploy → test → analyze → refine) does not yet exist.
   </div>
 
   <h2 id="step-trace">Step-by-Step Action Trace</h2>
@@ -138,11 +143,19 @@
       <p><strong>Target:</strong> {{ analysis.action_target }}</p>
       <p><strong>Replay status:</strong> {{ analysis.replay_status.value if analysis.replay_status else "not_replayed" }}</p>
       <p><strong>Replay message:</strong> {{ analysis.replay_message or "n/a" }}</p>
-      <p><strong>Triggered layers:</strong>
-        {% if analysis.triggered_layers %}
-          {{ analysis.triggered_layers | map(attribute='value') | join(", ") }}
+      <p><strong>Correlated telemetry:</strong>
+        {% if analysis.correlated_events %}
+          <ul>
+          {% for ce in analysis.correlated_events %}
+            <li>
+              <span class="conf-{{ ce.confidence.value }}">{{ ce.event.layer.value }}</span>
+              [confidence: <span class="conf-{{ ce.confidence.value }}">{{ ce.confidence.value }}</span>]
+              <span class="conf-note">{{ ce.note }}</span>
+            </li>
+          {% endfor %}
+          </ul>
         {% else %}
-          none
+          none (no telemetry events matched within the 5-second correlation window)
         {% endif %}
       </p>
       <p><strong>Failure layer:</strong> {{ analysis.failure_layer.value if analysis.failure_layer else "none" }}</p>
@@ -165,8 +178,12 @@
   {% endfor %}
 
   <h2 id="data-ledger">Data Impact Ledger</h2>
+  <p class="prov">
+    Data changes are correlated to UI actions via timestamp window (5 seconds after action).
+    Confidence levels: HIGH (timestamp + caller agree), TEMPORAL (timestamp only), ASSERTED (caller only, clock skew suspected), AMBIGUOUS (multiple candidates, closest chosen).
+  </p>
   {% for analysis in analyses %}
-    {% if analysis.data_changes %}
+    {% if analysis.correlated_snapshots %}
       <div class="card">
         <h3>{{ analysis.step_id }}</h3>
         <table>
@@ -175,14 +192,19 @@
               <th>Object</th>
               <th>Record</th>
               <th>Changed fields</th>
+              <th>Correlation confidence</th>
             </tr>
           </thead>
           <tbody>
-            {% for change in analysis.data_changes %}
+            {% for cs in analysis.correlated_snapshots %}
               <tr>
-                <td>{{ change.object_api_name }}</td>
-                <td>{{ change.record_id }}</td>
-                <td>{{ change.changed_fields | join(", ") }}</td>
+                <td>{{ cs.snapshot.object_api_name }}</td>
+                <td>{{ cs.snapshot.record_id }}</td>
+                <td>{{ cs.snapshot.changed_fields | join(", ") }}</td>
+                <td>
+                  <span class="conf-{{ cs.confidence.value }}">{{ cs.confidence.value }}</span>
+                  <span class="conf-note">{{ cs.note }}</span>
+                </td>
               </tr>
             {% endfor %}
           </tbody>

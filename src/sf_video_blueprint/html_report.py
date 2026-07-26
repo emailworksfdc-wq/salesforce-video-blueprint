@@ -36,18 +36,23 @@ class DataProvenance:
     replay_source: str = "noop"         # "noop" | "browser"
     agent_spec_source: str = "static-example"  # "static-example" | "derived"
 
+    # Positive list of extraction sources that represent real, non-simulated data
+    # Fail-safe design: an unrecognised source is treated as simulated/unknown rather
+    # than silently trusted. This is the correct failure mode for an audit artifact.
+    _REAL_EXTRACTION_SOURCES = frozenset({"dom-capture", "cv"})
+
     @property
     def is_simulated(self) -> bool:
         return (
             self.telemetry_source == "mock"
-            or self.extraction_source == "stub"
+            or self.extraction_source not in self._REAL_EXTRACTION_SOURCES
             or self.replay_source == "noop"
         )
 
     @property
     def simulated_parts(self) -> list[str]:
         parts: list[str] = []
-        if self.extraction_source == "stub":
+        if self.extraction_source not in self._REAL_EXTRACTION_SOURCES:
             parts.append("action extraction (video is not decoded; steps are placeholders)")
         if self.replay_source == "noop":
             parts.append("replay (no browser drove the org; every step auto-succeeds)")

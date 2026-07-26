@@ -3,11 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 from uuid import uuid4
 
 import typer
 
 from .correlation import correlate_all
+from .dom_capture import parse_capture_file, validate_trace
+from .dom_extractor import DomCaptureExtractor
 from .extractor import HeuristicVideoExtractor
 from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
 from .models import ActionType, ExtractedAction
@@ -18,6 +21,22 @@ from .spec_builder import build_agent_spec, write_spec
 from .telemetry import CorrelationKey, ObjectSnapshot, TelemetryCollector, TelemetryEvent, TelemetryLayer, TelemetryRegistry
 
 app = typer.Typer(help="Generate Salesforce process blueprint from video inputs.")
+
+
+def _redact_sensitive_url(url: str) -> str:
+    """Redact session IDs and access tokens from URLs before persisting or displaying.
+
+    Standing rule: never log or persist a token, session id, or frontdoor.jsp URL.
+    The report is an audit artifact that may be shared; secrets must be redacted
+    rather than omitted so the audit trail shows a URL was used.
+    """
+    # Redact frontdoor.jsp sid parameter
+    url = re.sub(r'(\?|&)(sid)=([^&]+)', r'\1\2=[REDACTED]', url, flags=re.IGNORECASE)
+    # Redact access_token parameter (sometimes seen in OAuth flows)
+    url = re.sub(r'(\?|&)(access_token)=([^&]+)', r'\1\2=[REDACTED]', url, flags=re.IGNORECASE)
+    # Redact session parameter variants
+    url = re.sub(r'(\?|&)(session|sessionId|session_id)=([^&]+)', r'\1\2=[REDACTED]', url, flags=re.IGNORECASE)
+    return url
 
 
 def _parse_tracked_records(values: list[str]) -> list[tuple[str, str]]:
@@ -66,7 +85,18 @@ class MockTelemetryCollector(TelemetryCollector):
 
 @app.command()
 def run(
-    video_path: Path = typer.Argument(..., exists=True, help="Path to recording file."),
+    video_path: Path = typer.Argument(
+        None,
+        exists=True,
+        help="Path to recording file. Uses the stub extractor, which does NOT "
+        "decode video — prefer --capture.",
+    ),
+    capture: Path | None = typer.Option(
+        None,
+        exists=True,
+        help="Path to a dom_capture.jsonl produced by capture/inject.py. This is "
+        "real observed evidence and is preferred over the video path.",
+    ),
     org_url: str = typer.Option(..., help="Target Salesforce org URL."),
     username: str = typer.Option("analyst@example.com", help="Replay username for trace metadata."),
     profile_name: str = typer.Option("System Administrator", help="Replay profile name."),
@@ -89,14 +119,82 @@ def run(
         help="Record to monitor for field diffs; format ObjectApiName:RecordId. Repeatable.",
     ),
 ) -> None:
-    extractor = HeuristicVideoExtractor()
-    extraction = extractor.extract(video_path)
-    # HeuristicVideoExtractor does not decode the video; it emits placeholder
-    # steps. Track that so the report can never present them as observed.
-    extraction_source = "stub"
+    if capture is not None:
+        # Real observed evidence: a DOM trace recorded click-by-click from the org.
+        # CRITICAL SECURITY BOUNDARY: validate_trace must run BEFORE extraction
+        # to detect redaction leaks and integrity violations.
+        trace = parse_capture_file(capture)
+        findings = validate_trace(trace)
+
+        # Categorize findings by severity
+        security_critical = [f for f in findings if f.startswith("SECURITY CRITICAL:")]
+        data_loss = [f for f in findings if f.startswith("DATA LOSS:")]
+        security_warnings = [f for f in findings if f.startswith("SECURITY:")]
+        other = [f for f in findings if not any(f.startswith(p) for p in ["SECURITY CRITICAL:", "DATA LOSS:", "SECURITY:"])]
+
+        # FAIL CLOSED: Any security-critical finding (especially redaction leaks) aborts the run
+        if security_critical:
+            typer.secho("CAPTURE VALIDATION FAILED — SECURITY CRITICAL ISSUES DETECTED:", fg=typer.colors.RED, bold=True)
+            for finding in security_critical:
+                typer.secho(f"  {finding}", fg=typer.colors.RED)
+            typer.secho(
+                "\nThe capture contains a REDACTION LEAK: a value was flagged as sensitive "
+                "but was not actually redacted by the recorder. This is a recorder bug that "
+                "leaks sensitive data (card numbers, passwords) into the capture file.",
+                fg=typer.colors.RED,
+            )
+            typer.secho(
+                "ABORTING: Cannot build a spec from a capture with confirmed redaction leaks. "
+                "Fix the recorder and re-record. No spec JSON file will be emitted.",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            raise typer.Exit(code=1)
+
+        # FAIL CLOSED: Data loss findings also abort (100% loss or >50% loss)
+        if data_loss:
+            typer.secho("CAPTURE VALIDATION FAILED — DATA LOSS DETECTED:", fg=typer.colors.RED, bold=True)
+            for finding in data_loss:
+                typer.secho(f"  {finding}", fg=typer.colors.RED)
+            typer.secho(
+                "\nABORTING: Cannot build a spec from a capture with material data loss. "
+                "Check for recorder/parser version drift or schema mismatch.",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            raise typer.Exit(code=1)
+
+        # Surface all other findings as warnings (non-blocking)
+        for finding in security_warnings + other:
+            typer.secho(f"CAPTURE VALIDATION: {finding}", fg=typer.colors.YELLOW)
+
+        extraction = DomCaptureExtractor().extract(capture)
+        extraction_source = "dom-capture"
+        source_path = capture
+    elif video_path is not None:
+        # HeuristicVideoExtractor does not decode the video; it emits one
+        # placeholder step for any input. Track that so the report can never
+        # present it as observed.
+        extraction = HeuristicVideoExtractor().extract(video_path)
+        extraction_source = "stub"
+        source_path = video_path
+    else:
+        raise typer.BadParameter(
+            "Provide --capture <dom_capture.jsonl> (real evidence) or a video path "
+            "(stub extraction, produces placeholder steps)."
+        )
+
+    for warning in extraction.warnings:
+        typer.secho(f"EXTRACTION: {warning}", fg=typer.colors.YELLOW)
+
+    # Redact secrets from org_url before persisting in metadata/report
+    # The ORIGINAL org_url (with sid) is used for REST API calls, but the REDACTED
+    # version goes into the audit artifact.
+    redacted_org_url = _redact_sensitive_url(org_url)
+
     run_metadata = ReplayRunMetadata(
         run_id=f"run-{uuid4().hex[:8]}",
-        org_url=org_url,
+        org_url=redacted_org_url,
         username=username,
         profile_name=profile_name,
         role_name=None,
@@ -159,6 +257,9 @@ def run(
             "replay_source": provenance.replay_source,
             "run_id": run_metadata.run_id,
             "recording_id": extraction.recording_id,
+            # Which file the steps were actually read from, so a spec can be traced
+            # back to its evidence rather than just to a run id.
+            "source_path": str(source_path),
         },
     )
 
