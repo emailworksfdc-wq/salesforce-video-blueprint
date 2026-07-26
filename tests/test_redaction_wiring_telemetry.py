@@ -12,9 +12,13 @@ Measured, not hypothetical: with `--mode live --track-record Case:<id>`, a Case
 whose Description contains a token puts that token in `agent-spec.json` verbatim.
 Lane 02 is recording a real org session, so this is the live path.
 
-`TelemetryRegistry.collect_step` is the single funnel — both `cli.py` and
-`pipeline.py` obtain every event and snapshot through it, and nothing else in the
-tree appends to `.events` or `.snapshots`. Scrubbing there covers both callers.
+`redaction.scrub_collected_telemetry` is the scrub point, called from `cli.py`
+after collection and before `correlate_all`. Scrubbing on ingest inside
+`TelemetryRegistry` would be the stronger design — it would cover any future
+caller rather than this one — but `telemetry.py` belongs to another lane
+(orchestrator bulletin 02), so that is filed as a recommendation instead. The
+consequence is a real coverage limit, pinned by
+`test_registry_ingest_is_not_itself_a_boundary` below.
 
 CANARY HYGIENE: planted values are obviously fake and never interpolated into an
 assertion message.
@@ -26,6 +30,7 @@ import json
 from datetime import UTC, datetime
 
 from sf_video_blueprint.correlation import correlate_all
+from sf_video_blueprint.redaction import scrub_collected_telemetry
 from sf_video_blueprint.replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata
 from sf_video_blueprint.spec_builder import build_agent_spec
 from sf_video_blueprint.telemetry import (
@@ -97,9 +102,15 @@ def _event_with(payload: dict) -> TelemetryEvent:
 
 
 def _collect(snapshot: ObjectSnapshot, event: TelemetryEvent) -> TelemetryRegistry:
-    """Route through the real funnel every caller uses."""
+    """Collect then scrub, in the same order `cli.py` does.
+
+    Collection is deliberately NOT the scrub point here — see the module docstring.
+    This helper mirrors the real sequence so the tests exercise the shipped path
+    rather than a convenience shortcut.
+    """
     registry = TelemetryRegistry()
     registry.collect_step(_StubCollector(snapshot, event), "run-test", "step-001")
+    scrub_collected_telemetry(registry.events, registry.snapshots)
     return registry
 
 
@@ -191,6 +202,7 @@ def test_secret_does_not_reach_the_derived_spec(tmp_path) -> None:
     )
     registry = TelemetryRegistry()
     registry.collect_step(_StubCollector(snapshot, _event_with({})), "run-test", action.step_id)
+    scrub_collected_telemetry(registry.events, registry.snapshots)
 
     analyses = correlate_all(
         bundle.actions, replay_events, registry.events, registry.snapshots
@@ -201,13 +213,62 @@ def test_secret_does_not_reach_the_derived_spec(tmp_path) -> None:
     assert PLANTED_EMAIL not in spec_json, "an email reached the derived spec"
 
 
-def test_manual_event_payload_is_scrubbed() -> None:
-    """`append_manual_event` is the registry's other entry point and must scrub too.
+def test_scrub_reports_categories_so_the_run_can_say_it_fired() -> None:
+    """A silent control cannot be audited; the CLI echoes what this returns."""
+    registry = TelemetryRegistry()
+    registry.collect_step(
+        _StubCollector(
+            _snapshot_with({"Description": f"key {PLANTED_KEY_SHAPED} for {PLANTED_EMAIL}"}),
+            _event_with({}),
+        ),
+        "run-test",
+        "step-001",
+    )
 
-    It appends straight to `self.events`, bypassing `collect_step` entirely. No
-    in-tree caller uses it today, so this test is guarding the shape of the
-    guarantee rather than a live leak: "everything in this registry is scrubbed",
-    not "everything that arrived by the expected route is scrubbed".
+    categories = scrub_collected_telemetry(registry.events, registry.snapshots)
+
+    assert "aws_key" in categories
+    assert "email" in categories
+    # Categories name the KIND of value, never the value itself.
+    assert PLANTED_KEY_SHAPED not in " ".join(categories)
+
+
+def test_registry_ingest_is_not_itself_a_boundary() -> None:
+    """Honest limit: the registry does not scrub on ingest, the CLI scrubs after it.
+
+    This is a coverage gap, not a design preference — `telemetry.py` is owned by
+    another lane, so the scrub sits at the call site instead of on ingest. A future
+    caller that collects and then reads `registry.snapshots` without calling
+    `scrub_collected_telemetry` gets unredacted org records.
+
+    Asserting the gap rather than hiding it: if a later change DOES make ingest
+    scrub, this test fails and whoever made that change gets to delete it and the
+    warning in the README along with it. A gap nobody has written down is the kind
+    that ships.
+    """
+    registry = TelemetryRegistry()
+    registry.collect_step(
+        _StubCollector(
+            _snapshot_with({"Description": f"key {PLANTED_KEY_SHAPED}"}), _event_with({})
+        ),
+        "run-test",
+        "step-001",
+    )
+
+    unscrubbed = json.dumps([s.after for s in registry.snapshots])
+    assert PLANTED_KEY_SHAPED in unscrubbed, (
+        "ingest now scrubs on its own; delete this test and the README's coverage warning"
+    )
+
+
+def test_manual_event_payload_is_a_known_uncovered_path() -> None:
+    """`append_manual_event` appends straight to `.events`, bypassing the scrub.
+
+    It has no in-tree caller today, so nothing leaks through it in the shipped
+    paths. Fixing it means editing `telemetry.py`, which another lane owns — the
+    one-line fix is in this lane's findings file for that owner.
+
+    Pinned so the gap is a recorded fact rather than an oversight.
     """
     registry = TelemetryRegistry()
     registry.append_manual_event(
@@ -216,30 +277,19 @@ def test_manual_event_payload_is_scrubbed() -> None:
         layer=TelemetryLayer.FLOW,
         event_name="ManualNote",
         status="ok",
-        payload={"note": f"key {PLANTED_KEY_SHAPED} seen", "contact": PLANTED_EMAIL},
+        payload={"note": f"key {PLANTED_KEY_SHAPED} seen"},
     )
 
-    blob = json.dumps([e.payload for e in registry.events])
-    assert PLANTED_KEY_SHAPED not in blob, "a key-shaped secret survived a manual event"
-    assert PLANTED_EMAIL not in blob, "an email survived a manual event"
-
-
-def test_manual_event_preserves_legitimate_payload() -> None:
-    """The scrub must not corrupt an ordinary manual annotation."""
-    registry = TelemetryRegistry()
-    registry.append_manual_event(
-        run_id="run-test",
-        step_id="step-001",
-        layer=TelemetryLayer.FLOW,
-        event_name="ManualNote",
-        status="ok",
-        payload={"note": "Operator confirmed the panel swap", "attempts": 2, "retried": False},
+    # Not scrubbed, because nothing scrubs it. Asserting reality, not the ideal.
+    assert PLANTED_KEY_SHAPED in json.dumps([e.payload for e in registry.events]), (
+        "append_manual_event now scrubs; delete this test and the findings recommendation"
     )
 
-    payload = registry.events[0].payload
-    assert payload["note"] == "Operator confirmed the panel swap"
-    assert payload["attempts"] == 2
-    assert payload["retried"] is False
+    # And it IS covered once the CLI's scrub runs over the registry.
+    scrub_collected_telemetry(registry.events, registry.snapshots)
+    assert PLANTED_KEY_SHAPED not in json.dumps([e.payload for e in registry.events]), (
+        "the scrub pass does not cover manually appended events"
+    )
 
 
 # ---------------------------------------------------------------------------

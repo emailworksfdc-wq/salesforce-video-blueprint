@@ -334,7 +334,7 @@ including where the gaps are. It is self-contained; no server needed.
 | `iterate.py` | Versioned offline refinement loop |
 | `pipeline.py` | Shared in-process API (`run_pipeline`) the CLI, library, and MCP server all call |
 | `mcp_server.py` | MCP server (`sf-blueprint-mcp`) — 7 offline, read-only tools over stdio |
-| `redaction.py` | Secret/PII redaction, called from extraction and report rendering |
+| `redaction.py` | Secret/PII redaction primitives (**no production callers yet**) |
 | `markers.py` | Provenance vocabulary — which sources count as real evidence |
 
 ### Why the score gate exists
@@ -392,58 +392,8 @@ export SF_BLUEPRINT_PLAYWRIGHT=1
 - **Never pass a token as a command-line argument** — argv is world-readable via
   `ps`. Use `SF_ACCESS_TOKEN`.
 - **Every output artifact is sensitive.** `outputs/` and `inputs/` are
-  gitignored. Keep them that way. Redaction now runs on the way out — secrets
-  (tokens, API keys, cards, SSNs), emails, and credential-bearing URL parameters
-  are stripped before anything is written. **Record IDs and ordinary field values
-  are still written verbatim, by design:** they are the audit trail, and a
-  blueprint that cannot name the record a step touched is not evidence. So the
-  artifacts remain org-confidential — redaction narrows the blast radius of a
-  leaked file, it does not make one safe to publish. See
-  [Redaction](#redaction-what-is-and-is-not-stripped).
-
-### Redaction — what is and is not stripped
-
-Redaction runs at three choke points, all **after** the integrity gate. That order
-is deliberate: `dom_capture.validate_trace` exists to make a recorder redaction
-*failure* visible, and scrubbing first would launder that bug so the operator never
-learns their recorder is leaking. Detection reads raw bytes; redaction cleans what
-gets written.
-
-| Choke point | Covers |
-| --- | --- |
-| `DomCaptureExtractor._redact_actions` | Everything derived from the capture: action values, targets, inferred intents, and `ui_context` URLs/labels. Inherited by the HTML report, the spec JSON, the extraction bundle, and every stage-6 emitter. |
-| `MasterBlueprintRenderer._redact_analyses` | Org-authored text that never passes extraction: `replay_message` and `failure_reason`. A real `FIELD_CUSTOM_VALIDATION_EXCEPTION` can quote a customer email straight back. |
-| `TelemetryRegistry.collect_step` (and `append_manual_event`) | Live-org data fetched *after* extraction: `ObjectSnapshot.before`/`.after` (whole records from `get_record`) and `TelemetryEvent.payload` (raw SOQL rows). These flow into entity evidence details, so with `--mode live --track-record` a token in a Case field reached `agent-spec.json` verbatim. Both of the registry's entry points scrub, so the guarantee is "everything in the registry is clean" rather than "everything that arrived the expected way". |
-
-**Stripped:** Salesforce session tokens, JWTs, private keys, AWS/GitHub/Slack
-tokens, bearer tokens, Luhn-valid card numbers, SSNs, emails, and
-credential-bearing URL parameters (`sid`, `access_token`, `code`,
-`client_secret`, … — matched by parameter *name*, since an OAuth code has no
-detectable shape).
-
-**Deliberately NOT stripped:**
-
-- **Salesforce record IDs.** They are the audit trail. Retained so a blueprint can
-  say which record a step touched.
-- **Phone-shaped digit runs.** The phone pattern matches any ten consecutive
-  digits, so enabling it rewrites `step 1234567890` and Luhn-coincident epoch
-  timestamps. Corrupting evidence to hide digits that are usually not phone numbers
-  is a worse defect than the one it prevents.
-- **Customer names and ordinary field values.** Not detected at all. Name
-  detection without a real strategy would mangle legitimate Case text.
-
-**Coverage limit worth knowing:** these are choke points, not an enforced
-boundary. A caller that hand-builds an `ObjectSnapshot` and passes it straight to
-`correlate_all` — bypassing `TelemetryRegistry.collect_step` — is not scrubbed.
-Every in-tree caller (`cli.py`, `pipeline.py`, and therefore `mcp_server.py`) goes
-through the funnel, so the shipped paths are covered; a new caller that skips it
-would not be. Making that structurally impossible would mean scrubbing inside
-`ObjectSnapshot`/`TelemetryEvent` construction, which is a larger change than this
-lane took on.
-
-`RedactionPolicy.strict()` still enables record-ID and phone redaction for callers
-who want the maximal setting and accept the false positives. The pipeline uses
-`redaction.pipeline_policy()`.
+  gitignored because HTML blueprints embed real record IDs and field values
+  verbatim. Keep them that way.
 
 ---
 
@@ -518,10 +468,7 @@ Ordered by what unblocks the most:
 3. **Close stage 5.** Wire `sf agent test create/run/results` so a spec can
    actually be run, scored against org behaviour, and improved.
 4. **Give stage 6 a call site.** The emitters work; nothing calls them.
-5. **Extend redaction to customer names**, the one sensitive category still
-   written verbatim. Name detection needs a real strategy — a dictionary match
-   would corrupt legitimate Case text — so this is deliberately unbuilt, not
-   forgotten.
+5. **Call `redaction.py` from the pipeline** before any real recording is made.
 6. **Make correlation causal** by threading request/transaction IDs from the UI
    through to backend logs.
 

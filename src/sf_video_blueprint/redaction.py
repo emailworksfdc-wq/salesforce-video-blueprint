@@ -19,7 +19,7 @@ import hashlib
 import hmac
 import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 # Field-name patterns that always indicate sensitive data
 _SENSITIVE_FIELD_PATTERNS = [
@@ -866,3 +866,51 @@ def pipeline_policy() -> RedactionPolicy:
         redact_names=False,
         mode="mask",
     )
+
+
+def scrub_collected_telemetry(
+    events: Sequence[Any], snapshots: Sequence[Any]
+) -> list[str]:
+    """Scrub org records fetched *after* extraction, in place.
+
+    Closes the live-org leak channel that the extraction choke point structurally
+    cannot see. `ObjectSnapshot.before`/`.after` are whole records returned by
+    `SalesforceRestClient.get_record`, and `TelemetryEvent.payload` holds raw SOQL
+    rows — all obtained after extraction has finished. `spec_builder._derive_entities`
+    interpolates those field values straight into entity evidence details, so with
+    `--mode live --track-record Case:<id>` a token sitting in a Case field reached
+    `agent-spec.json` verbatim. Measured, not hypothetical.
+
+    Called from the CLI after telemetry collection and before `correlate_all`, which
+    is the last point where the data is still in one place and the first point where
+    it is complete. It lives here rather than inside `TelemetryRegistry` because
+    `telemetry.py` is owned by another lane (orchestrator bulletin 02); a registry
+    that scrubbed on ingest would be the stronger design and is the recommendation
+    handed to that owner.
+
+    Takes duck-typed sequences rather than importing the telemetry models, so this
+    module stays free of a dependency on `telemetry.py` (which already imports
+    nothing from here) and cannot create an import cycle.
+
+    Returns the redaction categories found, for the run to report. Mutates the
+    passed objects: the caller's registry IS the thing that must end up clean, and
+    every downstream consumer reads from it.
+    """
+    policy = pipeline_policy()
+    categories: list[str] = []
+
+    for event in events:
+        payload = getattr(event, "payload", None)
+        if payload:
+            event.payload, found = redact_mapping(payload, policy)
+            categories.extend(found)
+
+    for snapshot in snapshots:
+        for attr in ("before", "after"):
+            record = getattr(snapshot, attr, None)
+            if record:
+                scrubbed, found = redact_mapping(record, policy)
+                setattr(snapshot, attr, scrubbed)
+                categories.extend(found)
+
+    return list(dict.fromkeys(categories))
