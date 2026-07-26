@@ -1,0 +1,15 @@
+{
+  "capture_id": "capture-aft3-case-create-0001",
+  "org_alias": "example-org",
+  "org_instance_url": "https://example-org-dev-ed.develop.my.salesforce.com",
+  "is_sandbox": false,
+  "is_scratch": false,
+  "started_at": "2026-07-26T21:07:06Z",
+  "ended_at": "2026-07-26T21:07:27Z",
+  "event_count": 175,
+  "network_event_count": 34,
+  "sink_errors": 0,
+  "recorder_sha256": "d182a3359cda9bfff2aecaae7cd234c6fb73b273d7b49baa6b000bf47a2ca146",
+  "playwright_version": "149.0.7827.55",
+  "operator_note": "REAL capture recorded in a Developer Edition org on 2026-07-26 by lane 02. Org host, org id, username and record ids are redacted; DOM structure, event order, shadow depths and null selectors are unmodified. Recorded programmatically (agent-driven clicks), not by a human operator."
+}
