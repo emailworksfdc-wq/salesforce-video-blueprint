@@ -94,6 +94,47 @@ jobs:
           path: outputs/
           retention-days: 7
 
+  roundtrip:
+    name: round trip (no org)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run the round trip with no org
+        # Every stage except `sf agent validate` is offline, so the whole chain
+        # (derive -> derive names -> score -> emit -> report) runs here. The org
+        # stage must report SKIPPED: exit 0 means "every stage that RAN passed",
+        # never "Salesforce agreed".
+        env:
+          PY_BIN: python
+        run: bash scripts/agentforce_roundtrip.sh --out outputs/roundtrip
+
+      - name: Check the round-trip contract
+        # Reads the summary rather than the exit code. Asserts the run does not
+        # claim org validation it skipped, and that every artifact still names
+        # one agent and one topic. See the script's docstring for why each
+        # property matters.
+        run: python scripts/roundtrip_check.py outputs/roundtrip/roundtrip_summary.json
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roundtrip-output
+          path: outputs/roundtrip/
+          retention-days: 7
+
   mcp-server:
     name: MCP server over stdio
     runs-on: ubuntu-latest
