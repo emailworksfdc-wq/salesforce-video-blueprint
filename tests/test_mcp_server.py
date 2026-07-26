@@ -82,12 +82,26 @@ def test_health_reports_capabilities_and_limitations() -> None:
     assert result["capabilities"]["contactsSalesforceOrg"] is False
     assert result["capabilities"]["offline"] is True
     # The limitations list is load-bearing: an agent plans around it. Assert the
-    # two disclosures that most change how a caller should treat the output.
+    # disclosures that most change how a caller should treat the output.
     assert result["limitations"]
+    # Pinned to the *substance* rather than a sentence. This assertion used to look
+    # for "validated against a real Salesforce org", which was part of the claim
+    # that no validation had ever happened. That claim stopped being true on
+    # 2026-07-26, so matching it verbatim would have forced the disclosure to stay
+    # stale in order to keep a test green. What must never disappear is the warning
+    # that an emitted bundle may not compile.
     assert any(
-        "validated against a real Salesforce org" in item
+        "may be syntactically invalid" in item for item in result["limitations"]
+    ), "health() must warn that an emitted .agent bundle may not compile"
+    assert any(
+        "validate authoring-bundle" in item for item in result["limitations"]
+    ), "health() must name the CLI command that is the actual authority"
+    # Local validation must never be presentable as org validation: validate_locally
+    # returned zero findings on the exact file the compiler rejected with 24 errors.
+    assert any(
+        "locallyValid" in item and "not org validation" in item
         for item in result["limitations"]
-    )
+    ), "health() must disclose that locallyValid is not org validation"
     assert any("telemetry_source=mock" in item for item in result["limitations"])
 
 
