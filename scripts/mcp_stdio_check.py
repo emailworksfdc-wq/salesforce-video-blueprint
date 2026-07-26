@@ -97,8 +97,28 @@ async def run(capture: str, command: str) -> None:
         health = _payload(await session.call_tool("health", {}))
         if not health.get("ok"):
             fail(f"health returned not-ok: {health}")
-        if health.get("capabilities", {}).get("contactsSalesforceOrg") is not False:
-            fail("health must declare that this server does not contact an org")
+        contacts_org = health.get("capabilities", {}).get("contactsSalesforceOrg")
+        # This used to require exactly False. That was true until the server gained
+        # a real compile call, and asserting it now would force the server to make a
+        # *false* disclosure — the worse of the two failures. The property that still
+        # has to hold is that contacting an org is conditional and the condition is
+        # named: False (never) is fine, and so is a string that says what triggers it.
+        # An unconditional True is not, because a harness reading this needs to know
+        # that a default invocation stays offline.
+        if contacts_org is True:
+            fail(
+                "health declares contactsSalesforceOrg: true unconditionally. Every "
+                "tool but emit_agent_bundle(org_alias=...) is offline; saying "
+                "otherwise misinforms a harness about what a default call does."
+            )
+        if contacts_org is not False and not (
+            isinstance(contacts_org, str) and "org_alias" in contacts_org
+        ):
+            fail(
+                "health must say either that this server never contacts an org "
+                "(False) or exactly what makes it do so — the disclosure has to name "
+                f"the org_alias condition. Got: {contacts_org!r}"
+            )
         if not health.get("limitations"):
             fail("health must disclose the project's limitations")
         print(f"  health ok (version {health['serverVersion']})")
