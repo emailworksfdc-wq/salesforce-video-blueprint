@@ -13,12 +13,22 @@ While the major version is `0`, the public API may change in any minor release.
 
 The gate is the component that decides whether a derived spec is fit to become an
 agent, so a defect here is worse than a defect anywhere else: it grants
-permission. Six of them were found by attacking it rather than testing it.
+permission. Eleven of them were found by attacking it rather than testing it; the
+ones worth a reader's attention are below.
 
-- **Filler content scored 100/100.** A spec whose entities were `["aa", "bb",
-  "ee"]` scored higher than the real spec derived from the bundled example
-  capture (84/100). Four further ways to reach a perfect score with nothing behind
-  them are fixed in the same change.
+- **Filler instructions scored 100/100.** A spec whose `orchestration_steps` were
+  `["aa", "bb", "ee"]` and whose `guardrails` were `["cc", "ff"]` scored a perfect
+  100 with all seven dimensions at full marks, outranking the real spec derived
+  from the bundled example capture (84/100 at the time). The hollowed-out part was
+  the *narrative*, not the metadata: the attack's entities were deliberately
+  concrete and well-evidenced, which is exactly why it worked — entity metadata is
+  expensive to fabricate, prose is free, and every specificity check was a
+  blocklist of known-bad phrases that text saying nothing cannot trip. Instruction
+  text now has a length and word floor, a mostly-filler spec is blocked rather
+  than docked, and the narrative must name a field or entity the metadata claims
+  was observed. A second variant that defeated the floor with fluent-but-empty
+  prose (`["do the thing here", "then do it again"]`, 92/100, above real output's
+  90) is closed by the same coupling rule.
 - **Deleting an observed entity paid +15.** Removing evidence *raised* the score,
   which is the one gradient a refinement loop must never be able to learn — and
   `_score_evidence_grounding`'s own docstring claimed it could not happen.
@@ -31,8 +41,23 @@ permission. Six of them were found by attacking it rather than testing it.
   padding heuristic fired *only* on honest output — synthetic filler sailed past
   it. Unresolved targets are no longer collated as one field.
 - **`honesty` was unfalsifiable.** It returned 20/20 on every spec that reached
-  it, including the filler ones, so a fifth of the total was a constant. It now
-  measures something a dishonest spec can fail.
+  it, including the filler ones, so a fifth of the total was a constant —
+  `confidence` scored the same at `0.0`, `0.3`, `0.7` and `1.0`. Overclaiming past
+  the deriver's own `0.7` ceiling now costs half the dimension. This is a
+  deduction, not a blocker: an otherwise well-formed spec claiming `1.0` still
+  passes at 82, so treat it as mitigated rather than closed.
+- **Concealing a gap paid 8 points.** Declaring an honestly-labelled `inference`
+  entity *lowered* `evidence_grounding` from 30/30 to 22/30, because the coverage
+  bonus was a ratio and the declaration diluted its denominator. That is the
+  inversion `_score_honesty`'s docstring calls the worst possible outcome —
+  training the loop to hide what it does not know — reintroduced through a
+  different dimension's arithmetic. Declaring an unknown can no longer cost points
+  in any dimension.
+- **Hollowing out exactly one dimension passed the gate.** The threshold-surfing
+  check required two or more dimensions at or below 50%, so zeroing a single one
+  was free: `specificity` at 0/10 scored 82 and passed, and at 1/10 landed on
+  exactly 75 and passed. A dimension at or below 10% of its weight now blocks,
+  excepting the two that can honestly be zero.
 - **A blocked run displayed a near-passing number.** `ci_smoke_check.py` printed
   `85/100` three lines above its own `BLOCKED:` line. `SpecScore` now carries
   both `total` (the raw dimension sum, unchanged, so `iterate.py` keeps a usable
@@ -40,12 +65,20 @@ permission. Six of them were found by attacking it rather than testing it.
   band whenever a blocking issue is present). `summary()` reports the capped
   figure and discloses the raw one — e.g.
   `FAIL: 59/100 (low band), 1 blocking issue(s) [blocked: capped from raw 85]`.
-- Three dimensions measured something other than what their names and docstrings
-  claimed. They now measure the stated property.
+- Four smaller calibration defects are fixed in the same changes: an empty
+  evidence trail scored 95/100 (100 while asserting real provenance) and is now
+  blocked; the placeholder-detail floor was one character wide against a builder
+  whose shortest real detail is 41, and is now 12; `specificity` silently docked
+  the deriver's own honest closing step, so every deduction now emits a finding
+  explaining itself; and `testability` credited entities only when object *and*
+  field resolved, which honest UI-input entities never do — deleting three of them
+  from the example used to pay +5 and now costs −7.
 
 `PASS_THRESHOLD` is unchanged at 75 and `markers.py` is untouched — no fix here
-works by lowering a bar. `tests/test_gaming_resistance.py` and the new
-`tests/test_score_calibration.py` fail if any of these regress.
+works by lowering a bar, and `test_gate_constants_are_unchanged` asserts both
+marker sets at runtime so a weakening edit fails a test before it can weaken a
+run. `tests/test_gaming_resistance.py` and the new
+`tests/test_score_calibration.py` (35 tests) fail if any of these regress.
 
 ### Known gap
 
