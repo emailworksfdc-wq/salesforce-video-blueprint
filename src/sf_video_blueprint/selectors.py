@@ -1,4 +1,4 @@
-"""Selector ranking and confidence scoring for DOM capture events.
+r"""Selector ranking and confidence scoring for DOM capture events.
 
 This module is the bridge between raw capture output (dom_capture.py) and the
 replay layer (replay_browser.py). It takes selector dictionaries (either plain
@@ -358,7 +358,7 @@ def _build_text_selector(text: str) -> str:
 def _build_css_selector(
     css_path: str, element: Mapping[str, Any] | Any = None
 ) -> tuple[str, float, str]:
-    """Build CSS selector with brittleness penalties.
+    r"""Build CSS selector with brittleness penalties.
 
     Shadow DOM handling:
     The raw css_path may contain ` >>> ` between shadow boundaries. Playwright
