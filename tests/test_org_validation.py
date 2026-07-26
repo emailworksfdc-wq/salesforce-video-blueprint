@@ -21,6 +21,7 @@ import pytest
 from sf_video_blueprint.org_validation import (
     CompileOutcome,
     CompileResult,
+    org_is_forbidden,
     validate_bundle_with_org,
     write_validation_project,
 )
@@ -353,3 +354,65 @@ def test_scaffold_writes_the_agent_source_byte_for_byte(tmp_path):
     written = (bundle_dir / "SFVB_TEST_Bytes.agent").read_text(encoding="utf-8")
 
     assert written == source
+
+
+# --- the deny-list must not be reimplemented here -----------------------------
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "PPCDM",
+        "ppcdm",
+        "PpCdM",
+        " PPCDM ",
+        "ppc-dm",
+        "PPC_DM",
+        "ppc.dm",
+        "PPCaccenture",
+        "ppcaccenture",
+        "PPCACCENTURE",
+        " PPCaccenture ",
+        "ppc-accenture",
+        "PPC_Accenture",
+        "ppc accenture",
+    ],
+)
+def test_every_spelling_of_a_blocked_org_is_refused(alias):
+    """This module is a code path that CONTACTS an org, so its guard must not be weaker
+    than the canonical one.
+
+    It originally carried a third private copy of the deny-list matched with
+    `.strip().lower()`. Measured: that accepted `ppc-dm`, `PPC_DM`, `ppc.dm`,
+    `ppc-accenture`, `PPC_Accenture` and `ppc accenture` — six spellings the
+    canonical `org_denylist` refuses — and it inherited the misspelled
+    `ppaccenture` entry whose missing `c` was the original bypass.
+    """
+    assert org_is_forbidden(alias), f"{alias!r} reached an org-contacting path"
+
+
+@pytest.mark.parametrize("alias", ["AFT3", "AFTDX5", "na-dev", "TD2", "TDProj"])
+def test_permitted_dev_orgs_are_not_swept_up(alias):
+    """A guard that refuses everything is an outage, not a control."""
+    assert not org_is_forbidden(alias)
+
+
+def test_this_module_does_not_define_its_own_denylist():
+    """One normalizing implementation, not four.
+
+    Asserted on the source rather than on behaviour, because a reintroduced private
+    set would pass the parametrized tests above on the day it was written and only
+    diverge later — which is exactly how the first three copies rotted apart.
+    """
+    source = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "sf_video_blueprint"
+        / "org_validation.py"
+    ).read_text(encoding="utf-8")
+
+    assert "ppcdm" not in source.lower().replace("ppcdm`", ""), (
+        "org_validation.py names a blocked alias directly; it must delegate to "
+        "org_denylist instead of carrying its own copy."
+    )
+    assert "org_denylist import" in source, "org_validation.py must import the canonical guard"

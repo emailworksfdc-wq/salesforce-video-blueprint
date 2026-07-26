@@ -39,14 +39,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .org_denylist import is_org_blocked as _is_org_blocked
+
 # The call is a network round trip to the compile endpoint. Measured latency on
 # AFT3 was a few seconds; 120s is slack for a slow org, not an expectation.
 DEFAULT_TIMEOUT_SECONDS = 120
-
-# Same hard block as `telemetry._FORBIDDEN_ORG_ALIASES`. These two orgs are out
-# of scope entirely — not even read-only — so the alias is rejected before the
-# subprocess starts rather than being trusted to the CLI.
-_FORBIDDEN_ORG_ALIASES = frozenset({"ppcdm", "ppcaccenture", "ppaccenture"})
 
 # The CLI colourises its output even under --json, and prints notices ahead of
 # the payload. Strip the escapes and start at the first brace.
@@ -127,8 +124,17 @@ def _default_runner(cmd: list[str], *, cwd: Path, timeout: int) -> Any:
 
 
 def org_is_forbidden(org_alias: str) -> bool:
-    """True for the two orgs that are out of scope for this project entirely."""
-    return org_alias.strip().lower() in _FORBIDDEN_ORG_ALIASES
+    """True for the two orgs that are out of scope for this project entirely.
+
+    Delegates to `org_denylist`, which is the single normalizing implementation.
+    This module originally carried its own copy — a third one — that matched with
+    `.strip().lower()`. That accepted six punctuation variants the canonical guard
+    refuses (`ppc-dm`, `PPC_DM`, `ppc.dm`, `ppc-accenture`, `PPC_Accenture`,
+    `ppc accenture`), and it inherited the misspelled `ppaccenture` entry whose
+    missing `c` was the original bypass. A safety control with three
+    implementations has three chances to rot; there is now one.
+    """
+    return _is_org_blocked(org_alias)
 
 
 def write_validation_project(
