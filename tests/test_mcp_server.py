@@ -79,8 +79,13 @@ def test_health_reports_capabilities_and_limitations() -> None:
 
     assert result["ok"] is True
     assert set(result["tools"]) == EXPECTED_TOOLS
-    assert result["capabilities"]["contactsSalesforceOrg"] is False
-    assert result["capabilities"]["offline"] is True
+    # Org contact is conditional, not absent: `emit_agent_bundle` compiles against
+    # an org when given an org_alias. Claiming a flat False here would understate
+    # what the server does, which is its own kind of dishonesty.
+    assert "org_alias" in result["capabilities"]["contactsSalesforceOrg"]
+    assert "by default" in result["capabilities"]["offline"]
+    assert result["capabilities"]["readOnly"] is True
+    assert result["capabilities"]["launchesBrowser"] is False
     # The limitations list is load-bearing: an agent plans around it. Assert the
     # disclosures that most change how a caller should treat the output.
     assert result["limitations"]
@@ -102,6 +107,9 @@ def test_health_reports_capabilities_and_limitations() -> None:
         "locallyValid" in item and "not org validation" in item
         for item in result["limitations"]
     ), "health() must disclose that locallyValid is not org validation"
+    # The org-compile mechanism must be named, not just the CLI: a caller needs to
+    # know which field carries Salesforce's verdict.
+    assert any("orgValidation.compiled" in item for item in result["limitations"])
     assert any("telemetry_source=mock" in item for item in result["limitations"])
 
 
@@ -116,7 +124,10 @@ def test_server_instructions_disclose_the_mock_telemetry_constraint() -> None:
 
     assert "mock" in instructions
     assert "CANNOT pass the quality gate" in instructions
-    assert "sf agent validate authoring-bundle" in instructions
+    # The skipped-is-not-a-pass distinction has to reach the model before it reads
+    # `locallyValid: true` and calls the bundle validated.
+    assert "orgValidation" in instructions
+    assert 'skipped' in instructions and "never as a pass" in instructions
     assert "Never suggest" in instructions and "lowering a score threshold" in instructions
 
 
@@ -321,6 +332,34 @@ def test_emit_agent_bundle_tells_the_caller_to_validate_with_the_cli() -> None:
     )
 
     assert "sf agent validate authoring-bundle" in result["nextStep"]
+
+
+def test_emit_agent_bundle_reports_org_validation_as_skipped_without_an_org() -> None:
+    """With no org alias the compiler is not asked, and that is reported as SKIPPED.
+
+    The distinction is the whole point: `locallyValid: true` plus
+    `orgValidation.compiled: false` says "our checks passed, Salesforce was never
+    asked". Collapsing those two into one boolean is how output that no org has
+    accepted starts looking validated.
+    """
+    result = mcp_server.emit_agent_bundle(
+        str(EXAMPLE), developer_name="a", agent_label="A"
+    )
+
+    org = result["orgValidation"]
+    assert org["outcome"] == "skipped"
+    assert org["compiled"] is False
+    assert org["errors"] == []
+
+
+def test_emit_agent_bundle_refuses_an_out_of_scope_org() -> None:
+    """PPCDM / PPCaccenture are out of scope; the tool must refuse before any call."""
+    result = mcp_server.emit_agent_bundle(
+        str(EXAMPLE), developer_name="a", agent_label="A", org_alias="PPCDM"
+    )
+
+    assert result["ok"] is False
+    assert "scope" in result["error"]["message"].lower()
 
 
 @pytest.mark.parametrize("dialect", ["legacy", "ngt"])
