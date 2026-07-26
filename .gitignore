@@ -19,7 +19,11 @@ env/
 # responses, and run output; same sensitivity as outputs/, never commit it.
 # Specifically: raw UNREDACTED org captures — org ids, tenant names, instance
 # URLs, live agent session UUIDs. Never commit it.
+# It also holds persistent browser profiles: a lane that drove Playwright will have
+# a cookie jar here with a LIVE authenticated org session, so this must stay
+# ignored even for a `git add -A`.
 .lane-tmp/
+.playwright-mcp/
 
 # Pipeline outputs — run artifacts, blueprints, screenshots, network traces.
 # These can contain real org data (record ids, field values); never commit them.
@@ -28,8 +32,9 @@ inputs/
 
 # Capture files and derived artifacts outside declared directories (may contain recorded field values)
 # Tracked JSONL fixtures under tests/ are allowed; stray captures are not.
-# examples/ holds SYNTHETIC captures only — fabricated IDs and values, safe to
-# publish. Never move a real capture there.
+# examples/ holds synthetic captures, plus real captures that have been REDACTED
+# and are guarded by a secret-scan test (see examples/README.md). Never move a
+# raw, unredacted capture there — outputs/ is gitignored for exactly that reason.
 /*.jsonl
 /**/*.jsonl
 !tests/**/*.jsonl
