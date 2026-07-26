@@ -42,13 +42,27 @@ def _analysis(
     changes: list[ObjectSnapshot] | None = None,
     failure: FailureLayer | None = None,
 ) -> StepAnalysis:
+    from sf_video_blueprint.correlation import CorrelatedSnapshot, CorrelationConfidence
+
+    # Build correlated_snapshots from changes (assume HIGH confidence for tests)
+    correlated = [
+        CorrelatedSnapshot(
+            snapshot=snap,
+            confidence=CorrelationConfidence.HIGH,
+            note="test fixture: assumed HIGH confidence"
+        )
+        for snap in (changes or [])
+    ]
+
     return StepAnalysis(
         step_id=step_id,
         action_target=target,
+        action_timestamp=NOW,
         replay_status=ReplayStatus.SUCCESS,
         replay_message="ok",
         triggered_layers=layers or [],
         data_changes=changes or [],
+        correlated_snapshots=correlated,
         failure_layer=failure,
         failure_reason="validation: Amount required" if failure else None,
     )

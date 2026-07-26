@@ -1,0 +1,179 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Derived Agent Spec",
+  "description": "Machine-readable agent specification derived from observed UI actions, telemetry, and data changes. This is the primary output of the pipeline (blueprint.agent-spec.json).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "intent",
+    "confidence",
+    "objects_touched",
+    "entities",
+    "orchestration_steps",
+    "guardrails",
+    "failure_handling",
+    "unknowns",
+    "evidence",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Spec schema version",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "intent": {
+      "type": "string",
+      "description": "Derived user intent in imperative form (e.g., 'Update Case (Status)')",
+      "minLength": 1
+    },
+    "confidence": {
+      "type": "number",
+      "description": "Confidence score [0.0, 1.0] based on evidence quality",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "objects_touched": {
+      "type": "array",
+      "description": "Salesforce objects mutated during the recording",
+      "items": {
+        "type": "string",
+        "description": "Object API name (Case, Account, etc.)"
+      }
+    },
+    "entities": {
+      "type": "array",
+      "description": "Conversational entities derived from observed fields",
+      "items": {
+        "type": "object",
+        "required": ["name", "evidence"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Entity name (camelCase, suitable for @entity.<name>)",
+            "minLength": 1
+          },
+          "object_api_name": {
+            "type": ["string", "null"],
+            "description": "Salesforce object API name (null if not grounded to an object)"
+          },
+          "field_api_name": {
+            "type": ["string", "null"],
+            "description": "Salesforce field API name (null if not grounded to a field)"
+          },
+          "evidence": {
+            "type": "array",
+            "description": "Evidence sources for this entity",
+            "items": {
+              "type": "object",
+              "required": ["source", "detail"],
+              "properties": {
+                "source": {
+                  "type": "string",
+                  "description": "Evidence source type",
+                  "enum": ["data-delta", "data-delta-asserted", "ui-action", "inference"]
+                },
+                "detail": {
+                  "type": "string",
+                  "description": "Human-readable evidence detail"
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    "orchestration_steps": {
+      "type": "array",
+      "description": "Sequence of steps derived from the recording",
+      "items": {
+        "type": "string",
+        "description": "Step description (human-readable)"
+      }
+    },
+    "guardrails": {
+      "type": "array",
+      "description": "Security and validation guardrails derived from observations",
+      "items": {
+        "type": "string",
+        "description": "Guardrail statement (imperative form)"
+      }
+    },
+    "failure_handling": {
+      "type": "array",
+      "description": "Observed failure paths (or explicit statement that none were observed)",
+      "items": {
+        "type": "string",
+        "description": "Failure handling statement"
+      }
+    },
+    "unknowns": {
+      "type": "array",
+      "description": "Explicit gaps in the recording (redactions, missing telemetry, etc.)",
+      "items": {
+        "type": "string",
+        "description": "Unknown/missing information statement"
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "description": "Top-level evidence summary",
+      "items": {
+        "type": "object",
+        "required": ["source", "detail"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Evidence category",
+            "enum": ["extraction", "telemetry", "data-delta", "replay"]
+          },
+          "detail": {
+            "type": "string",
+            "description": "Evidence detail"
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Provenance metadata tracking data sources and run identity",
+      "required": [
+        "extraction_source",
+        "telemetry_source",
+        "replay_source",
+        "run_id"
+      ],
+      "properties": {
+        "extraction_source": {
+          "type": "string",
+          "description": "Extraction source type",
+          "enum": ["video", "dom-capture", "stub", "mock"]
+        },
+        "telemetry_source": {
+          "type": "string",
+          "description": "Telemetry source type",
+          "enum": ["live-org", "event-monitoring", "mock", "none"]
+        },
+        "replay_source": {
+          "type": "string",
+          "description": "Replay source type",
+          "enum": ["playwright", "noop", "mock"]
+        },
+        "run_id": {
+          "type": "string",
+          "description": "Unique run identifier",
+          "minLength": 1
+        },
+        "recording_id": {
+          "type": "string",
+          "description": "Recording session identifier (optional)"
+        },
+        "source_path": {
+          "type": "string",
+          "description": "Source file path (optional)"
+        }
+      }
+    }
+  }
+}
