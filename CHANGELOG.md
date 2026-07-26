@@ -65,7 +65,9 @@ While the major version is `0`, the public API may change in any minor release.
   single run** (`test_agent` in the `.agent` config, `RoundtripTestAgent` in the
   CLI flags, `TestAgent` in both test specs), so the emitted test suite targeted an
   agent no stage had produced and the round trip could never have completed. Every
-  name is now derived from `naming.py`; the script spells none itself.
+  name is now derived from `naming.py`; the script spells none itself. The round
+  trip does now complete: `--org <dev-org>` reaches
+  `sf agent validate authoring-bundle` and exits 0 with `{"success": true}`.
 - The same script printed `All executed stages PASSED` and wrote
   `{"pass": true}` while both org-dependent stages were skipped. Skipped stages are
   now reported as `SKIPPED`, the summary records `salesforce_validated`, and the
@@ -73,12 +75,22 @@ While the major version is `0`, the public API may change in any minor release.
 - The script's org stages were controlled by `DRY_RUN=1`, i.e. org calls were the
   default and required a positional org alias to run at all. It now runs offline by
   default and org work is opt-in behind `--org <alias>`.
+- `roundtrip_lib.derive_identity` folded its `SFVB TEST` org-artifact prefix into
+  the intent before truncation, so the prefix competed with the intent for one
+  length budget and won: both `"A" * 90` and `"!!!"` derived the bare name
+  `SFVB_TEST`, and two unrelated recordings collided on one agent.
+  `naming.prefixed_api_name` now holds the prefix out of the budget. Note that
+  `assert_coherent` *passed* on the colliding name — every dialect agreed, on a
+  name that identified no recording.
 
 ### Planned
 
-- Fix the `.agent` grammar defect that the first real validation exposed: the
-  derived subagent's `instructions` block emits a bare `->` opener, which the
-  compiler rejects. `validate_locally()` does not catch it.
+- Teach `validate_locally()` the two grammar rules the compiler taught us, so a
+  bare `->` opener and same-column `|` lines fail locally instead of only in an
+  org. It reported zero findings on the file Salesforce rejected with 24 errors.
+- Validate a bundle that is not the single-topic router: another intent shape, and
+  one carrying `@apex.*`/`@flow.*` actions. One passing bundle confirms one
+  grammar path, not the emitter.
 - Fix the four ingest defects that allow a capture to be silently truncated
   while still being stamped as real evidence (see `docs/DEFECT_LEDGER.md`).
 - Wire `sf agent test create/run/results` so stage 5 (iterate) exists.
@@ -189,10 +201,8 @@ Carried forward deliberately, not overlooked:
   cross-check is disabled, and a UTF-8 BOM eats the first event.
 - The leak detector inspects only one of the eight field-identity signals the
   recorder captures.
-- The emitted `.agent` file does not compile. `sf agent validate
-  authoring-bundle` against a real org rejects the derived subagent's
-  `instructions` block with 24 syntax errors, and `validate_locally()` sees none
-  of them. `scripts/agentforce_roundtrip.sh --org <alias>` reproduces it.
+- `scripts/agentforce_roundtrip.sh` refers to three different agent names in a
+  single run. *(Fixed in Unreleased.)*
 - Video extraction is a stub: `HeuristicVideoExtractor` never decodes video and
   returns one placeholder step for any input. Use `--capture`.
 - No MCP server exists, despite `docs/mcp-product-spec.md`. *(Added in

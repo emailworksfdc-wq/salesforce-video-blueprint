@@ -289,7 +289,13 @@ LOCAL ROUND TRIP COMPLETE — NOTHING WAS VALIDATED BY SALESFORCE.
 bash scripts/agentforce_roundtrip.sh --org my-sandbox --out ./outputs/roundtrip
 ```
 
-Adds S5. As of the last measured run this **fails**, and that is the current honest state of the repo: the real Agent Script compiler rejects the emitted `.agent` with 24 `CompilationError`s starting at the derived subagent's `instructions` block, while `validate_locally()` reports zero findings on the same file. See [Known defects](../README.md#known-defects).
+Adds S5. Measured against a Developer Edition org on 2026-07-26: exit 0, `{"success": true}`, and the run ends with
+
+```
+ROUND TRIP COMPLETE — Salesforce validated SFVB_TEST_Update_Case_Status in org AFT3.
+```
+
+The first time this ran it did **not** pass — the compiler returned 24 `CompilationError`s in the derived subagent's `instructions` block while `validate_locally()` reported zero findings on the same file. That emitter defect is fixed (see §9); the lesson that local validation is not a verdict is not. What S5 passing licenses is narrow: one bundle, one intent, one org, one CLI version, syntax only. It says nothing about whether the agent behaves correctly, and nothing has been published.
 
 ### Outputs
 
@@ -463,7 +469,9 @@ From `agent_script.py` (B2) line 12:
 
 > CRITICAL: This module emits actual code in a grammar owned by Salesforce. The ONLY authoritative reference for Agent Script syntax is: `@salesforce/agents/lib/templates/agentScriptTemplate.js`. Do not invent syntax.
 
-**Reality (updated — this has now been measured):** validation has run. `sf agent validate authoring-bundle -o AFT3` on an emitted bundle exits 1 with 24 `CompilationError`s, the first being ``Syntax error: unexpected `->` [Ln 108, Col 8]`` in the derived subagent's `instructions` block. `validate_locally()` reports **zero** findings on that same file, so local structural checks are not merely "not a substitute" for CLI validation — they are demonstrably blind to this entire class of error. Reproduce with `bash scripts/agentforce_roundtrip.sh --org <alias>` (S5).
+**Reality (updated — this has now been measured, and the first result was a failure):** validation has run. The first submission exited 1 with 24 `CompilationError`s, the first being ``Syntax error: unexpected `->` [Ln 108, Col 8]`` in the derived subagent's `instructions` block: `->` is only legal as a key's value (`instructions: ->`), and the `|` continuation lines must indent one level deeper than that key. Both facts are now compiler-verified rather than inferred from the template. After the emitter fix the same bundle compiles — exit 0, `{"success": true}`.
+
+`validate_locally()` reported **zero** findings on the rejected file, before and after. So local structural checks are not merely "not a substitute" for CLI validation — they were demonstrably blind to the entire error class that the only real test found. Reproduce either result with `bash scripts/agentforce_roundtrip.sh --org <alias>` (S5).
 
 ### Three Emitters Derive Topic API Names Independently (Coupling Risk)
 
