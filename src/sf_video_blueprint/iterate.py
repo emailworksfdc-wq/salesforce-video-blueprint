@@ -102,7 +102,11 @@ def refine(
 
     # Import dependencies defensively (other agents writing them concurrently)
     try:
-        from .agentforce_spec import build_agent_spec_yaml, write_agent_spec_yaml, InsufficientEvidenceError
+        from .agentforce_spec import (
+            InsufficientEvidenceError,
+            build_agent_spec_yaml,
+            write_agent_spec_yaml,
+        )
     except ImportError as e:
         raise RuntimeError(
             "iterate.py depends on agentforce_spec.py (owned by B1). "
@@ -110,7 +114,7 @@ def refine(
         ) from e
 
     try:
-        from .spec_score import score_spec, compare, PASS_THRESHOLD
+        from .spec_score import PASS_THRESHOLD, compare, score_spec
     except ImportError as e:
         raise RuntimeError(
             "iterate.py depends on spec_score.py (owned by B4). "
@@ -281,7 +285,6 @@ def refine(
             # (1) round-trip YAML -> DerivedAgentSpec (requires a parser agent), OR
             # (2) keep iterating on the YAML directly and score YAML only.
             # For this prototype, we'll apply offline improvements instead when use_cli=False.
-            pass
         else:
             # Offline improvement: apply deterministic refinements (no invention)
             current_spec, last_improvement_summary = _apply_offline_improvements(current_spec, score)
@@ -311,6 +314,100 @@ def refine(
         stop_reason=stop_reason,
         rounds_run=len(versions),
     )
+
+
+def refine_with_org_feedback(
+    spec: DerivedAgentSpec,
+    *,
+    out_dir: Path,
+    org_alias: str,
+    agent_api_name: str,
+    test_spec_name: str,
+    rounds: int = 1,
+    provenance: dict[str, str] | None = None,
+    runner: Any = None,
+) -> list[Any]:
+    """Stage 5: the refinement loop that actually learns from a real agent.
+
+    :func:`refine` re-scores the same spec offline and calls it converged after
+    three identical scores. It cannot learn anything a live agent knows, so its
+    "converged" says only that the offline scorer stopped changing its mind.
+
+    Each round here is: emit a test spec -> run it against the agent in the org ->
+    parse the real per-case verdicts -> fold them into the spec as added
+    observations -> re-score. Rounds are written to ``out_dir/round-N/`` and a
+    round is never overwritten.
+
+    Only the legacy dialect is emitted, because that is the only one
+    ``sf agent test run-eval`` executes (measured; see :mod:`stage5`).
+
+    Args:
+        rounds: How many round trips to run. Each one costs real org LLM calls.
+        runner: Injected subprocess runner, for tests. Cannot forge provenance:
+                passing one stamps the feedback ``injected-runner``, which is not a
+                real source, so every such round is refused by
+                ``stage5.feedback_blocking_issues`` and never carried forward.
+
+    Returns:
+        The list of :class:`stage5.Stage5Round`, in order.
+
+    Raises:
+        ValueError: If ``rounds < 1``.
+        Stage5Error: If a round's org call fails; the real stderr is attached.
+                     A stage-5 round that degraded to synthetic results silently
+                     would be worse than one that stopped.
+    """
+    if rounds < 1:
+        raise ValueError(f"rounds must be >= 1, got {rounds}")
+
+    from .eval_spec import build_legacy_test_spec, write_test_spec
+    from .stage5 import (
+        RUN_EVAL_DIALECT,
+        assert_round_unwritten,
+        run_agent_eval,
+        stage5_round,
+        write_round,
+    )
+
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[Any] = []
+    current = spec
+
+    for round_num in range(1, rounds + 1):
+        # Refuse BEFORE writing a spec or spending real org LLM calls. write_round
+        # also refuses, but by then testSpec.yaml would already be overwritten and
+        # the org already billed for a result we would then throw away.
+        round_dir = assert_round_unwritten(out_dir, round_num)
+        round_dir.mkdir(parents=True, exist_ok=True)
+
+        test_spec, _derivations = build_legacy_test_spec(
+            current, name=f"{test_spec_name}_r{round_num}", subject_name=agent_api_name
+        )
+        spec_path = write_test_spec(round_dir / "testSpec.yaml", test_spec)
+
+        feedback = run_agent_eval(
+            spec_path,
+            org_alias=org_alias,
+            api_name=agent_api_name,
+            dialect=RUN_EVAL_DIALECT,
+            runner=runner,
+        )
+
+        round_result = stage5_round(
+            current, feedback, round_number=round_num, provenance=provenance
+        )
+        write_round(out_dir, round_result)
+        results.append(round_result)
+
+        # Carry the adjusted spec forward only when a real org answered. Feeding a
+        # synthetic round's output into the next round would launder it into the
+        # audit trail as though the org had spoken.
+        if round_result.trustworthy:
+            current = round_result.spec_after
+
+    return results
 
 
 def _initial_role(spec: DerivedAgentSpec) -> str:
@@ -407,7 +504,7 @@ def _apply_offline_improvements(spec: DerivedAgentSpec, score: Any) -> tuple[Der
     new_spec.intent = ' '.join(new_spec.intent.split())
     if new_spec.intent != old_intent:
         changed = True
-        improvements.append(f"removed vague terms from intent")
+        improvements.append("removed vague terms from intent")
 
     # 2. Normalise entity names using naming.py helpers (if available)
     try:
