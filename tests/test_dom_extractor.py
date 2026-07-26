@@ -1170,7 +1170,11 @@ def test_extractor_uses_the_hardened_pattern_list_not_a_stale_copy() -> None:
     Asserts on the SHARED constant rather than a hardcoded list, so the two
     cannot drift apart again.
     """
-    from sf_video_blueprint.dom_capture import RawDomEvent, CaptureTrace, SENSITIVE_PATTERNS
+    from sf_video_blueprint.dom_capture import (
+        SENSITIVE_PATTERNS,
+        CaptureTrace,
+        RawDomEvent,
+    )
 
     canary = "CANARY-MUST-NOT-APPEAR"
     extractor = DomCaptureExtractor()
