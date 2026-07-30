@@ -714,6 +714,148 @@ def _sensitive_signal_hits(event: RawDomEvent) -> list[str]:
 
 
 # ============================================================================
+# Org-specific leak detection (REDACTION AUDIT)
+# ============================================================================
+#
+# The existing sensitive-field detector catches credential-shaped values (cards,
+# passwords, tokens) via field-name signals. It does NOT scan for Salesforce
+# org-specific patterns that should never appear unredacted in a capture:
+#
+#   - Record Ids (15/18-char alphanum starting with known object-key prefixes)
+#   - Usernames in the form @*.salesforce.com
+#   - Org instance / My Domain URLs (*.salesforce.com) outside the allowed host
+#
+# RULE: findings must report the key path and, for Ids, the 3-char prefix — but
+# NEVER echo the matched value. The finding goes into reports that outlive the
+# capture; repeating the Id there would be the leak we are trying to detect.
+
+#: Known Salesforce object-key prefixes (first three characters of a record Id).
+_SF_ID_PREFIXES: tuple[str, ...] = (
+    "500",  # Case
+    "001",  # Account
+    "003",  # Contact
+    "005",  # User
+    "006",  # Opportunity
+    "00D",  # Organization (org id itself)
+    "00E",  # Profile
+    "00G",  # Group
+    "00Q",  # Lead
+    "00T",  # Task
+    "00U",  # Event
+    "012",  # Record Type
+    "0D5",  # Site
+    "0Ho",  # Apex class
+    "0Q0",  # Quote
+    "0WO",  # Work Order
+    "701",  # Campaign
+    "800",  # Contract
+)
+
+#: Matches a 15 or 18-char alphanumeric token that STARTS with a known prefix.
+#: The word boundary \b anchors the match so partial fragments in URLs are caught.
+_SF_RECORD_ID_RE: re.Pattern[str] = re.compile(
+    r"\b(?:"
+    + "|".join(re.escape(p) for p in _SF_ID_PREFIXES)
+    + r")[A-Za-z0-9]{12,15}\b"
+)
+
+#: Salesforce username pattern: word@something.salesforce.com
+_SF_USERNAME_RE: re.Pattern[str] = re.compile(
+    r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.salesforce\.com\b",
+    re.IGNORECASE,
+)
+
+#: Salesforce instance / My Domain URL: a hostname whose rightmost two labels
+#: are salesforce.com. Suppressed for the known capture host (every event URL
+#: starts with it, so it would fire on every event if not excluded).
+_SF_URL_RE: re.Pattern[str] = re.compile(
+    r"https?://[A-Za-z0-9.\-]+\.salesforce\.com(?:/[^\s\"']*)?",
+    re.IGNORECASE,
+)
+
+
+def _extract_capture_host(trace: CaptureTrace) -> str | None:
+    """Return the base salesforce.com hostname the session was recorded on.
+
+    Used to suppress REDACTION AUDIT findings for the legitimate capture host
+    itself — every event's URL starts with it, so it would produce a finding on
+    every single event if not excluded.
+
+    Returns None when the host cannot be determined.
+    """
+    if trace.manifest and trace.manifest.org_instance_url:
+        url = trace.manifest.org_instance_url
+        for scheme in ("https://", "http://"):
+            if url.lower().startswith(scheme):
+                url = url[len(scheme):]
+        return url.split("/")[0].split("?")[0].lower()
+
+    # Fall back to the first event's URL host
+    for event in trace.events:
+        raw_url = event.url or ""
+        for scheme in ("https://", "http://"):
+            if raw_url.lower().startswith(scheme):
+                host = raw_url[len(scheme):].split("/")[0].split("?")[0].lower()
+                if host.endswith(".salesforce.com"):
+                    return host
+    return None
+
+
+def _org_leak_hits(
+    event: RawDomEvent,
+    allowed_host: str | None,
+) -> list[tuple[str, str]]:
+    """Scan event text and attribute values for unredacted org-specific patterns.
+
+    Returns a list of (key_path, tag) tuples — never the matched value itself.
+    Each tuple names WHERE the match was found and WHAT kind of org pattern it
+    was, without revealing the actual sensitive string.
+
+    Scanned fields (text/attribute values only — NOT field-identity signals):
+    - event.value
+    - element.text, element.aria_label, element.modal_label
+    - selectors.text, selectors.aria, selectors.label_for
+    - event.url  (only for non-capture-host salesforce.com URLs)
+    - sf.record_id  (recorder writes the bare id here)
+    """
+    hits: list[tuple[str, str]] = []
+
+    def _check(key_path: str, text: str | None) -> None:
+        if not text:
+            return
+        # Record Id check — report only the 3-char prefix, not the full id
+        m = _SF_RECORD_ID_RE.search(text)
+        if m:
+            prefix = m.group(0)[:3]
+            hits.append((key_path, f"sf_record_id[prefix={prefix}]"))
+            return  # one hit per field is enough to flag the finding
+        # Username check
+        if _SF_USERNAME_RE.search(text):
+            hits.append((key_path, "sf_username"))
+            return
+        # URL check — suppressed for the known capture host
+        for url_match in _SF_URL_RE.finditer(text):
+            matched_url = url_match.group(0)
+            matched_host = matched_url.split("//", 1)[-1].split("/")[0].split("?")[0].lower()
+            if allowed_host and matched_host == allowed_host:
+                continue
+            hits.append((key_path, "sf_instance_url"))
+            return
+
+    _check("event.value", event.value)
+    _check("event.url", event.url)
+    _check("element.text", event.element.text)
+    _check("element.aria_label", event.element.aria_label)
+    _check("element.modal_label", event.element.modal_label)
+    _check("selectors.text", event.selectors.text)
+    _check("selectors.aria", event.selectors.aria)
+    _check("selectors.label_for", event.selectors.label_for)
+    _check("sf.record_id", event.sf.record_id)
+
+    return hits
+
+
+# ============================================================================
 # Validation (integrity checks, NOT input validation)
 # ============================================================================
 
@@ -732,8 +874,13 @@ def validate_trace(trace: CaptureTrace) -> list[str]:
     - All events have identical t (broken clock or synthetic data)
     - Zero events (empty trace)
     - Material data loss (zero events parsed while lines were skipped, or substantial fraction skipped)
+    - REDACTION AUDIT: org-specific patterns (record Ids, usernames, non-capture URLs) in event text/attrs
     """
     findings = []
+
+    # Determine the capture host once — used by the REDACTION AUDIT check below
+    # to suppress findings for URLs that are the legitimate session origin.
+    _capture_host = _extract_capture_host(trace)
 
     # Zero events
     if not trace.events:
@@ -802,6 +949,19 @@ def validate_trace(trace: CaptureTrace) -> list[str]:
             findings.append(
                 f"Event {i} (seq={event.seq}): has non-empty frame_path but "
                 f"missing _frame_url (driver metadata)."
+            )
+
+        # REDACTION AUDIT: scan text and attribute values for org-specific
+        # patterns that the recorder does not redact by default (record Ids,
+        # usernames, instance URLs outside the capture host).
+        #
+        # RULE: only the key_path and prefix/tag are reported — never the value.
+        org_hits = _org_leak_hits(event, _capture_host)
+        for key_path, tag in org_hits:
+            findings.append(
+                f"REDACTION AUDIT: Event {i} (seq={event.seq}): "
+                f"{key_path} contains an unredacted org-specific pattern "
+                f"({tag}). Value deliberately not shown."
             )
 
     # Monotonicity check on ingest_seq
