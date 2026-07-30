@@ -49,6 +49,7 @@ EXPECTED_TOOLS = {
     "preview_api_names",
     "run_stage5_round",
     "run_iterate",
+    "run_pipeline_full",
 }
 
 

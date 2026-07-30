@@ -265,6 +265,7 @@ def health() -> dict[str, Any]:
             "run_stage5_round",
             "run_iterate",
             "run_deploy",
+            "run_pipeline_full",
         ],
         capabilities={
             # Most tools are offline. Three tools contact an org when given an
@@ -1276,6 +1277,194 @@ def run_deploy(
             "before any CLI call."
         ),
     )
+
+
+def main() -> None:
+    """Entry point for the `sf-blueprint-mcp` console script."""
+    _configure_logging()
+    log.info(
+        json.dumps(
+            {
+                "event": "starting",
+                "server": SERVER_NAME,
+                "version": SERVER_VERSION,
+                "transport": "stdio",
+            }
+        )
+    )
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
+
+@mcp.tool()
+def run_pipeline_full(
+    capture_path: str,
+    org_url: str = "https://example.my.salesforce.com",
+    output_dir: str | None = None,
+    refine_rounds: int = 3,
+    skip_refine: bool = False,
+) -> dict[str, Any]:
+    """Run the full offline pipeline: derive spec, score it, and optionally refine.
+
+    This is the single-call version of the pipeline for agents that want to go from
+    a capture file to a refined agent spec in one tool call. It chains:
+
+    1. **derive_spec** — parse the capture, build and score the spec.
+    2. **offline refinement** (skippable via `skip_refine`) — run the scoring loop
+       for `refine_rounds` rounds to find the best offline version.
+
+    Telemetry is always mocked here, so `evidence_is_real` is always false and the
+    spec will not pass the quality gate. That is the expected and correct outcome for
+    an offline-only run; do not treat it as a bug to work around.
+
+    The result includes the raw pipeline output, the refinement summary (when run),
+    and the final scored spec.
+
+    Args:
+        capture_path: Path to a dom_capture.jsonl trace.
+        org_url: The org the recording came from. Metadata only; never contacted.
+        output_dir: Optional directory to write the final spec JSON and HTML report.
+            Nothing is written when omitted.
+        refine_rounds: Maximum number of offline refinement rounds. Default 3.
+        skip_refine: When true, skip refinement and return the raw derived spec.
+    """
+    request_id = uuid4().hex[:12]
+    started = time.monotonic()
+    tool = "run_pipeline_full"
+
+    path = _resolve(capture_path)
+    if not path.is_file():
+        return _err(tool, request_id, started, ERROR_NOT_FOUND, f"No file at {path}")
+
+    if refine_rounds < 1:
+        return _err(
+            tool, request_id, started, ERROR_VALIDATION,
+            f"refine_rounds must be >= 1, got {refine_rounds}"
+        )
+
+    # Step 1: run the core pipeline
+    try:
+        result = run_pipeline(path, org_url=org_url)
+    except CaptureRejected as exc:
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            str(exc),
+            findings=exc.findings,
+            remedy=(
+                "The capture failed integrity validation, so no spec was built. "
+                "Run validate_capture for detail. Re-record rather than trying to "
+                "force this file through."
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(tool, request_id, started, ERROR_INTERNAL, f"Pipeline failed: {exc}")
+
+    # Step 2: offline refinement
+    refinement_summary: dict[str, Any] | None = None
+    final_spec = result.spec
+    final_score = result.score
+
+    if not skip_refine:
+        try:
+            with tempfile.TemporaryDirectory(prefix="sfvb-refine-") as scratch:
+                from .iterate import refine, write_iteration_report
+
+                refine_out = Path(scratch) / "iterations"
+                refine_result = refine(
+                    result.spec,
+                    out_dir=refine_out,
+                    company_name="",
+                    company_description="",
+                    max_rounds=refine_rounds,
+                    use_cli=False,
+                )
+                refinement_summary = {
+                    "rounds_run": refine_result.rounds_run,
+                    "stop_reason": refine_result.stop_reason,
+                    "best_version": refine_result.best.version,
+                    "best_score": refine_result.best.score.total,
+                    "best_max_score": refine_result.best.score.max_total,
+                    "best_passed": refine_result.best.score.passed,
+                }
+                final_spec = refine_result.best.spec
+                final_score = refine_result.best.score
+        except Exception as exc:  # noqa: BLE001
+            # Refinement failure is non-fatal: we still return the raw result.
+            log.warning(json.dumps({"event": "refine_failed", "error": str(exc)}))
+            refinement_summary = {"error": str(exc), "rounds_run": 0}
+
+    # Step 3: optional write
+    written: dict[str, str] = {}
+    if output_dir:
+        target = _resolve(output_dir)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            from .spec_builder import write_spec
+
+            spec_file = target / "agent-spec.json"
+            write_spec(spec_file, final_spec, result.provenance)
+            written["spec"] = str(spec_file)
+        except Exception as exc:  # noqa: BLE001
+            return _err(
+                tool, request_id, started, ERROR_DEPENDENCY, f"Could not write output: {exc}"
+            )
+
+    base_summary = result.summary()
+    return _ok(
+        tool,
+        request_id,
+        started,
+        spec=_jsonable(final_spec),
+        intent=final_spec.intent,
+        confidence=final_spec.confidence,
+        score=final_score.total,
+        displayScore=final_score.display_total,
+        maxScore=final_score.max_total,
+        band=final_score.band,
+        passed=final_score.passed,
+        passThreshold=PASS_THRESHOLD,
+        blockingIssues=list(final_score.blocking_issues),
+        recommendations=list(final_score.recommendations),
+        evidenceIsReal=base_summary["evidence_is_real"],
+        provenance=result.provenance,
+        eventsParsed=result.events_parsed,
+        actionsExtracted=result.actions_extracted,
+        skippedLineCount=len(result.skipped_lines),
+        lossRatio=round(result.loss_ratio, 4),
+        manifestGap=result.manifest_gap,
+        refinement=refinement_summary,
+        writtenTo=written or None,
+        note=(
+            "Telemetry is always mocked here, so evidence_is_real is always false "
+            "and the gate will block this spec. That is correct — a spec cannot be "
+            "called evidence-backed without observed server-side behaviour."
+        ),
+    )
+
+
+def main() -> None:
+    """Entry point for the `sf-blueprint-mcp` console script."""
+    _configure_logging()
+    log.info(
+        json.dumps(
+            {
+                "event": "starting",
+                "server": SERVER_NAME,
+                "version": SERVER_VERSION,
+                "transport": "stdio",
+            }
+        )
+    )
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
 
 
 def main() -> None:

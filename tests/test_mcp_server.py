@@ -41,6 +41,7 @@ EXPECTED_TOOLS = {
     "run_stage5_round",
     "run_iterate",
     "run_deploy",
+    "run_pipeline_full",
 }
 
 

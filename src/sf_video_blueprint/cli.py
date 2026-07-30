@@ -890,6 +890,337 @@ def deploy(
     typer.echo(f"Outcome: {outcome.value} — {deploy_result.detail}")
 
 
+@app.command()
+def pipeline(
+    org_alias: str = typer.Option(..., help="Salesforce org alias for capture and live iteration."),
+    org_url: str = typer.Option(..., help="Target Salesforce org URL for the run step."),
+    process_name: str = typer.Option(
+        ...,
+        help="Slug for the process being recorded (e.g. case-status-update). "
+        "Used as the capture output filename prefix.",
+    ),
+    out_dir: Path = typer.Option(
+        Path("./outputs"),
+        help="Root output directory. Capture goes to <out_dir>/capture/, "
+        "run artifacts to <out_dir>/run/, and refinement to <out_dir>/iterations/.",
+    ),
+    skip_capture: bool = typer.Option(
+        False,
+        "--skip-capture",
+        help="Skip the capture step and use --capture-file instead. "
+        "Requires --capture-file.",
+    ),
+    capture_file: Path | None = typer.Option(
+        None,
+        help="Path to an existing dom_capture.jsonl. Used only when --skip-capture is set.",
+    ),
+    skip_refine: bool = typer.Option(
+        False,
+        "--skip-refine",
+        help="Skip the offline refinement step (iterate sub-command). "
+        "Useful when you want the raw spec without offline improvement rounds.",
+    ),
+    refine_rounds: int = typer.Option(
+        3,
+        help="Number of offline refinement rounds. Has no effect when --skip-refine is set.",
+    ),
+    agent_api_name: str | None = typer.Option(
+        None,
+        help="API name of a deployed Agentforce agent to run live iteration against. "
+        "When omitted, only offline refinement runs.",
+    ),
+    test_spec_name: str | None = typer.Option(
+        None,
+        help="Prefix for generated AiEvaluationDefinition test specs. "
+        "Required when --agent-api-name is set.",
+    ),
+    live_rounds: int = typer.Option(
+        1,
+        help="Number of live org refinement rounds. Has no effect unless "
+        "--agent-api-name is set.",
+        min=1,
+    ),
+) -> None:
+    """One-click pipeline: capture → run → refine (offline) → iterate (live, optional).
+
+    Chains the capture, run, refine, and (optionally) iterate sub-commands into a
+    single command so an operator can record a process and get a scored agent spec
+    without switching between sub-commands.
+
+    Steps:
+
+    1. **capture** — launch a headed browser against `--org-alias`, inject the DOM
+       recorder, and collect events to `<out_dir>/capture/<process_name>_*.dom_capture.jsonl`.
+       Skipped when `--skip-capture` is set; `--capture-file` supplies the existing file.
+
+    2. **run** — parse the capture, derive and score the spec, write the HTML report
+       and `agent-spec.json` to `<out_dir>/run/`.
+
+    3. **refine** (offline, skippable) — run the offline scoring loop for
+       `--refine-rounds` rounds, writing versioned sub-directories under
+       `<out_dir>/iterations/`.
+
+    4. **iterate** (live, optional) — if `--agent-api-name` is given, run
+       `--live-rounds` of live org evaluation via `sf agent test run-eval`, folding
+       real per-case verdicts back into the spec.
+
+    Exits non-zero if any step fails or if the final score is below the pass
+    threshold (PASS_THRESHOLD={PASS_THRESHOLD}).
+    """
+    if org_is_forbidden(org_alias):
+        typer.secho(
+            "ERROR: org alias " + repr(org_alias) + " is strictly out of scope for this project. "
+            "PPCDM and PPCaccenture may not be targeted by this tool.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    if skip_capture and capture_file is None:
+        typer.secho(
+            "ERROR: --skip-capture requires --capture-file to be set.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    if agent_api_name and not test_spec_name:
+        typer.secho(
+            "ERROR: --agent-api-name requires --test-spec-name.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    out_dir = out_dir.resolve()
+    capture_out = out_dir / "capture"
+    run_out = out_dir / "run"
+    iter_out = out_dir / "iterations"
+
+    # ------------------------------------------------------------------
+    # Step 1: capture
+    # ------------------------------------------------------------------
+    if skip_capture:
+        if not capture_file or not capture_file.exists():
+            typer.secho(
+                f"ERROR: --capture-file {str(capture_file)!r} not found.",
+                fg=typer.colors.RED, bold=True,
+            )
+            raise typer.Exit(code=1)
+        selected_capture = capture_file
+        typer.echo(f"pipeline: step 1/4 skipped (--skip-capture), using {selected_capture}")
+    else:
+        typer.secho("pipeline: step 1/4 — capture", bold=True)
+        import importlib as _importlib
+
+        try:
+            _importlib.import_module("playwright.sync_api")
+        except ModuleNotFoundError:
+            typer.secho(
+                "ERROR: playwright is not installed. The capture step requires it.\n"
+                "Install it with:\n"
+                "    pip install playwright\n"
+                "    playwright install chromium",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            raise typer.Exit(code=1)
+
+        try:
+            _inject = _importlib.import_module("capture.inject")
+        except ModuleNotFoundError as exc:
+            typer.secho(
+                f"ERROR: Could not import the capture module: {exc}\n"
+                "Ensure capture/inject.py is present in the project root.",
+                fg=typer.colors.RED,
+                bold=True,
+            )
+            raise typer.Exit(code=1) from exc
+
+        _inject.main(
+            org_alias=org_alias,
+            out_dir=capture_out,
+            start_url=None,
+            note=process_name,
+        )
+
+        # After capture, find the file that was just written.
+        selected_capture = find_last_capture(capture_out)
+        if selected_capture is None:
+            typer.secho(
+                f"ERROR: capture step completed but no *.dom_capture.jsonl found under {capture_out}.",
+                fg=typer.colors.RED, bold=True,
+            )
+            raise typer.Exit(code=1)
+        event_count = _read_event_count_from_manifest(selected_capture)
+        count_msg = f" ({event_count} events)" if event_count is not None else ""
+        typer.echo(f"pipeline: capture written to {selected_capture}{count_msg}")
+
+    # ------------------------------------------------------------------
+    # Step 2: run
+    # ------------------------------------------------------------------
+    typer.secho("pipeline: step 2/4 — run", bold=True)
+    run_out.mkdir(parents=True, exist_ok=True)
+    report_path = run_out / f"{process_name}_blueprint.html"
+    spec_path = run_out / f"{process_name}_agent-spec.json"
+
+    from .pipeline import CaptureRejected, run_pipeline
+
+    try:
+        result = run_pipeline(selected_capture, org_url=org_url)
+    except CaptureRejected as exc:
+        typer.secho(
+            "CAPTURE VALIDATION FAILED — cannot build a spec:\n" + "\n".join(exc.findings),
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    for warning in result.warnings:
+        typer.secho(f"EXTRACTION: {warning}", fg=typer.colors.YELLOW)
+
+    from .spec_builder import write_spec
+    from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
+    from .replay import ReplayRunMetadata
+    from .correlation import correlate_all
+    from .dom_extractor import DomCaptureExtractor
+    from .telemetry import MockTelemetryCollector, TelemetryRegistry
+
+    provenance_obj = DataProvenance(
+        extraction_source=result.provenance["extraction_source"],
+        telemetry_source=result.provenance["telemetry_source"],
+        replay_source=result.provenance["replay_source"],
+        agent_spec_source="derived",
+    )
+    ai_sections = [
+        AgentBlueprintSection(
+            intent=result.spec.intent,
+            required_entities=[item.name for item in result.spec.entities],
+            orchestration_steps=result.spec.orchestration_steps,
+            guardrails=result.spec.guardrails,
+            failure_handling=result.spec.failure_handling,
+            derived=True,
+        )
+    ]
+    run_metadata = ReplayRunMetadata(
+        run_id=result.provenance["run_id"],
+        org_url=_redact_sensitive_url(org_url),
+        username="analyst@example.com",
+        profile_name="System Administrator",
+        role_name=None,
+        environment="mock",
+    )
+    extraction = DomCaptureExtractor().extract(selected_capture)
+    registry = TelemetryRegistry()
+    collector = MockTelemetryCollector()
+    for action in extraction.actions:
+        registry.collect_step(collector, run_metadata.run_id, action.step_id)
+    analyses = correlate_all(extraction.actions, [], registry.events, registry.snapshots)
+
+    renderer = MasterBlueprintRenderer()
+    renderer.write_html(report_path, extraction, run_metadata, analyses, ai_sections, provenance_obj)
+
+    written_spec = write_spec(
+        spec_path,
+        result.spec,
+        result.provenance,
+    )
+    typer.echo(f"pipeline: run artifacts written to {run_out}")
+    typer.echo(f"  spec: {written_spec}")
+    typer.echo(f"  report: {report_path}")
+
+    # ------------------------------------------------------------------
+    # Step 3: offline refine
+    # ------------------------------------------------------------------
+    if skip_refine:
+        typer.echo("pipeline: step 3/4 skipped (--skip-refine)")
+        best_spec = result.spec
+    else:
+        typer.secho("pipeline: step 3/4 — offline refinement", bold=True)
+        iter_out.mkdir(parents=True, exist_ok=True)
+        from .iterate import refine, write_iteration_report
+
+        refine_result = refine(
+            result.spec,
+            out_dir=iter_out,
+            company_name="",
+            company_description="",
+            max_rounds=refine_rounds,
+            use_cli=False,
+        )
+        write_iteration_report(iter_out / "iteration_report", refine_result)
+        typer.echo(
+            f"pipeline: offline refinement done — {refine_result.rounds_run} round(s), "
+            f"stop reason: {refine_result.stop_reason}. "
+            f"Best version: v{refine_result.best.version} "
+            f"(score {refine_result.best.score.total}/{refine_result.best.score.max_total})."
+        )
+        # Use the best refined spec for subsequent steps
+        best_spec = refine_result.best.spec
+
+    # ------------------------------------------------------------------
+    # Step 4: live iterate (optional)
+    # ------------------------------------------------------------------
+    if agent_api_name:
+        typer.secho("pipeline: step 4/4 — live org iteration", bold=True)
+        live_out = out_dir / "live_iterations"
+        live_out.mkdir(parents=True, exist_ok=True)
+
+        if org_is_forbidden(org_alias):
+            typer.secho(
+                "ERROR: org alias " + repr(org_alias) + " is out of scope for live iteration.",
+                fg=typer.colors.RED, bold=True,
+            )
+            raise typer.Exit(code=1)
+
+        from .iterate import refine_with_org_feedback
+
+        round_results = refine_with_org_feedback(
+            best_spec,
+            out_dir=live_out,
+            org_alias=org_alias,
+            agent_api_name=agent_api_name,
+            test_spec_name=test_spec_name or f"{process_name}_test",
+            rounds=live_rounds,
+        )
+        if not round_results:
+            typer.secho("ERROR: live iteration produced no rounds.", fg=typer.colors.RED, bold=True)
+            raise typer.Exit(code=1)
+        final_round = round_results[-1]
+        final_score = final_round.score_after
+        if final_score is not None:
+            typer.echo(
+                f"pipeline: live iteration done — "
+                f"score {final_score.total}/{final_score.max_total}, "
+                f"passed={final_score.passed}"
+            )
+    else:
+        typer.echo("pipeline: step 4/4 skipped (no --agent-api-name)")
+        final_score = result.score
+
+    # ------------------------------------------------------------------
+    # Final verdict
+    # ------------------------------------------------------------------
+    if final_score is None:
+        final_score = result.score
+
+    if final_score.total < PASS_THRESHOLD:
+        typer.secho(
+            f"FAIL: final score {final_score.total}/{final_score.max_total} "
+            f"is below pass threshold ({PASS_THRESHOLD}).",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    if final_score.blocking_issues:
+        typer.secho(
+            "FAIL: final spec has blocking issue(s): " + "; ".join(final_score.blocking_issues),
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho(
+        f"PASS: final score {final_score.total}/{final_score.max_total} >= threshold ({PASS_THRESHOLD}).",
+        fg=typer.colors.GREEN, bold=True,
+    )
+
+
 if __name__ == "__main__":
     app()
 
