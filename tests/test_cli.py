@@ -483,7 +483,7 @@ def test_spec_json_source_path_is_accurate(runner: CliRunner, minimal_capture: P
 
 
 def test_help_describes_stub_vs_real_evidence(runner: CliRunner) -> None:
-    """--help must accurately describe which flags produce stub/mock data."""
+    """run --help must accurately describe which flags produce stub/mock data."""
     result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
     # Check that the run sub-command's help mentions stub vs real evidence
