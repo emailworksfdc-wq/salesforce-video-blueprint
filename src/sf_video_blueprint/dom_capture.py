@@ -205,6 +205,10 @@ class CaptureManifest(BaseModel):
     recorder_sha256: str | None = None
     playwright_version: str | None = None
     operator_note: str | None = None
+    # Enrichment fields added by inject.py --process-name
+    process_name: str | None = None
+    sf_cli_version: str | None = None
+    playwright_mcp_version: str | None = None
 
 
 # ============================================================================
