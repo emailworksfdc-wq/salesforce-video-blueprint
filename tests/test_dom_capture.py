@@ -2597,8 +2597,7 @@ def test_genuinely_sensitive_card_and_auth_fields_are_still_caught(field_name: s
 
 
 
-# ============================================================================
-# 18. selector_confidence and selector_fallback (lane B08)
+# =====================================================================# 18. selector_confidence and selector_fallback (lane B08)
 # ============================================================================
 #
 # Two new fields added to RawSelectors and to recorder.js computeSelectors():
@@ -2927,3 +2926,218 @@ def test_many_null_null_events_all_parse_correctly(tmp_path: Path) -> None:
     assert trace.skipped_lines == []
     assert all(e.selectors.selector_confidence == 0.1 for e in trace.events)
     assert all(e.selectors.selector_fallback is None for e in trace.events)
+=======
+# ============================================================================
+# 16. REDACTION AUDIT — org-specific pattern detection
+# ============================================================================
+#
+# The recorder redacts values it knows are sensitive (card numbers, passwords).
+# It does NOT scan for Salesforce org-specific patterns: record Ids (15/18-char
+# alphanum starting with known prefixes), org instance URLs, or usernames in
+# the form @*.salesforce.com.
+#
+# validate_trace must detect these and emit a "REDACTION AUDIT:" finding.
+#
+# TEST DISCIPLINE: the matched value must NOT appear in any finding.
+
+
+#: Synthetic record Ids, safe to embed in tests (never real org data).
+#: Format: <3-char prefix> + 12 alphanum chars = 15 chars total.
+_SYNTHETIC_CASE_ID = "500SYNTHETIC0001"       # Case (500), 16 chars — 3+13
+_SYNTHETIC_ACCOUNT_ID = "001SyntheticAcc01"   # Account (001), 18 chars — need checksum
+# Use a simple 15-char form for deterministic tests:
+_SYNTHETIC_CASE_ID_15 = "500SyntheticCase"    # 3+12 = 15 chars exactly
+_SYNTHETIC_USER_ID_15 = "005SyntheticUser"    # User (005), 15 chars
+_SYNTHETIC_USERNAME = "testuser@dev-synthetic.salesforce.com"
+_SYNTHETIC_INSTANCE_URL = "https://dev-synthetic-org.my.salesforce.com/lightning/page/home"
+
+
+def test_redaction_audit_fires_for_known_id_prefix_in_event_value() -> None:
+    """A record Id in event.value must produce a REDACTION AUDIT: finding.
+
+    The Id is a 500-prefixed 15-char string — a valid Salesforce Case Id shape.
+    The finding must name the key path and the prefix, never the full Id.
+    """
+    trace = synthesize_trace([
+        {
+            "value": _SYNTHETIC_CASE_ID_15,
+            "value_redacted": False,
+            "element": {"tag": "div", "type": None, "name": "CaseNumber"},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, "Known-prefix Id in event.value produced no REDACTION AUDIT finding"
+    assert any("event.value" in f for f in findings), (
+        "finding must identify the key path (event.value)"
+    )
+    assert any("prefix=500" in f for f in findings), (
+        "finding must report the 3-char prefix without echoing the full Id"
+    )
+    # The full Id must not appear in any finding
+    for f in findings:
+        assert _SYNTHETIC_CASE_ID_15 not in f, "finding echoed the raw record Id"
+
+
+def test_redaction_audit_finding_contains_key_path_not_raw_value() -> None:
+    """Findings must reference the structural path, not the matched value.
+
+    The key_path tells the operator WHERE to look; the raw Id is not needed and
+    must not appear — it would be the leak we are trying to detect.
+    """
+    trace = synthesize_trace([
+        {
+            "value": _SYNTHETIC_USER_ID_15,
+            "value_redacted": False,
+            "element": {"tag": "span", "text": _SYNTHETIC_USER_ID_15},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, "Id in element.text produced no REDACTION AUDIT finding"
+    # At least one finding must include a key path string
+    assert any("event.value" in f or "element.text" in f for f in findings)
+    # The raw Id must never appear
+    for f in findings:
+        assert _SYNTHETIC_USER_ID_15 not in f, "finding echoed the raw record Id"
+
+
+def test_redaction_audit_fires_for_sf_username_in_element_text() -> None:
+    """A @*.salesforce.com username in element.text must produce a finding."""
+    trace = synthesize_trace([
+        {
+            "element": {"tag": "span", "text": f"Logged in as {_SYNTHETIC_USERNAME}"},
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, "sf_username pattern in element.text produced no REDACTION AUDIT finding"
+    assert any("sf_username" in f for f in findings)
+    # The username itself must not appear in any finding
+    for f in findings:
+        assert _SYNTHETIC_USERNAME not in f, "finding echoed the username"
+
+
+def test_redaction_audit_fires_for_non_capture_host_url_in_value() -> None:
+    """A salesforce.com URL in event.value that differs from the capture host
+    must produce a REDACTION AUDIT finding (it is a different org's URL).
+    """
+    # The synthetic trace capture host (from synthesize_trace default) is
+    # test.my.salesforce.com — so a different URL must fire.
+    trace = synthesize_trace([
+        {
+            "value": _SYNTHETIC_INSTANCE_URL,
+            "value_redacted": False,
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, "Non-capture-host sf URL in event.value produced no REDACTION AUDIT finding"
+    assert any("sf_instance_url" in f for f in findings)
+    for f in findings:
+        assert _SYNTHETIC_INSTANCE_URL not in f, "finding echoed the URL"
+
+
+def test_redaction_audit_silent_for_clean_capture() -> None:
+    """A capture with no org-specific patterns must produce no REDACTION AUDIT
+    findings — the signal must not be noisy on ordinary captures.
+    """
+    trace = synthesize_trace([
+        {
+            "value": "Printer is broken",
+            "value_redacted": False,
+            "element": {"tag": "input", "type": "text", "name": "Subject", "text": "Printer is broken"},
+        },
+        {
+            "value": None,
+            "element": {"tag": "button", "text": "Save"},
+        },
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings == [], f"Clean capture produced spurious REDACTION AUDIT findings: {findings}"
+
+
+def test_redaction_audit_suppresses_capture_host_url() -> None:
+    """The capture host URL (in event.url) must NOT fire a REDACTION AUDIT.
+
+    Every event's URL starts with the session origin; flagging it would make
+    every single event produce a finding and drown the signal entirely.
+    """
+    # synthesize_trace sets url="https://test.my.salesforce.com" by default
+    trace = synthesize_trace([
+        {
+            "value": None,
+            "url": "https://test.my.salesforce.com/lightning/r/Case/500SyntheticCase/view",
+        }
+    ])
+
+    # The event.url IS the capture host, so only the record Id in the path
+    # could fire. The Id is in the URL path, not a scanned attribute value —
+    # we only scan event.url for URL-pattern hits, not record Id hits in the
+    # path. Confirm no false-positive for the capture host hostname.
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+    # Findings may or may not fire on the Id embedded in the URL path —
+    # the key invariant is that the capture host HOSTNAME does not produce
+    # an sf_instance_url finding.
+    sf_url_findings = [f for f in findings if "sf_instance_url" in f and "event.url" in f]
+    assert sf_url_findings == [], (
+        "Capture host URL in event.url produced a spurious sf_instance_url finding"
+    )
+
+
+def test_redaction_audit_fires_on_sf_record_id_in_sf_context() -> None:
+    """An Id in sf.record_id (the recorder's own reference field) must fire."""
+    trace = synthesize_trace([
+        {
+            "sf": {
+                "object": "Case",
+                "record_id": _SYNTHETIC_CASE_ID_15,
+                "page_type": "record",
+                "app": None,
+            }
+        }
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, "Id in sf.record_id produced no REDACTION AUDIT finding"
+    assert any("sf.record_id" in f for f in findings)
+    for f in findings:
+        assert _SYNTHETIC_CASE_ID_15 not in f, "finding echoed the raw record Id"
+
+
+@pytest.mark.parametrize(
+    "prefix,description",
+    [
+        ("500", "Case"),
+        ("001", "Account"),
+        ("003", "Contact"),
+        ("005", "User"),
+        ("006", "Opportunity"),
+        ("00D", "Org"),
+    ],
+)
+def test_redaction_audit_fires_for_all_known_prefixes(prefix: str, description: str) -> None:
+    """Every known object-key prefix must be detected, not just Case (500).
+
+    A false negative on any prefix would leave that object type unprotected.
+    """
+    synthetic_id = f"{prefix}SyntheticId012"  # 3 + 12 = 15 chars
+    trace = synthesize_trace([
+        {"value": synthetic_id, "value_redacted": False}
+    ])
+
+    findings = [f for f in validate_trace(trace) if f.startswith("REDACTION AUDIT:")]
+
+    assert findings, f"Prefix {prefix!r} ({description}) Id produced no REDACTION AUDIT finding"
+    assert any(f"prefix={prefix}" in f for f in findings), (
+        f"finding for prefix {prefix!r} did not report the prefix"
+    )
+    for f in findings:
+        assert synthetic_id not in f, f"finding echoed the raw Id for prefix {prefix!r}"
