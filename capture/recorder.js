@@ -232,6 +232,57 @@
   }
 
   /**
+   * Score selector quality: 1.0 = named role+name, 0.5 = role only or data-id, 0.1 = null/null.
+   *
+   * LWC shadow elements frequently have role=null and name=null because they carry
+   * no ARIA role or label. This score makes it explicit at capture time that such
+   * events will be harder to replay deterministically.
+   *
+   * @param {object} roleNameObj  - { role: string|null, name: string|null }
+   * @param {Element} element     - The DOM element being captured
+   * @returns {number} 0.0-1.0 confidence score
+   */
+  function computeSelectorConfidence(roleNameObj, element) {
+    // 1.0: both role and accessible name are present — highest-quality get_by_role selector
+    if (roleNameObj.role && roleNameObj.name) return 1.0;
+
+    // 0.5: role-only (icon button, unlabelled control), or a stable data-id attribute
+    if (roleNameObj.role) return 0.5;
+    const dataId = element.getAttribute('data-id')
+      || element.getAttribute('data-testid')
+      || element.getAttribute('data-qa');
+    if (dataId) return 0.5;
+
+    // 0.1: no role, no name, no data-id — bare LWC shadow element, CSS-path only
+    return 0.1;
+  }
+
+  /**
+   * Best non-null fallback selector string for elements with role=null/name=null.
+   * Priority: aria-label > data-id > innerText[:40] > null.
+   *
+   * When both role and name are present the primary selector is already strong;
+   * this field adds a human-readable backup for debugging and replay heuristics.
+   *
+   * @param {Element} element     - The DOM element being captured
+   * @param {string|null} ariaLabel - Pre-extracted aria-label (avoids double getAttribute)
+   * @returns {string|null}
+   */
+  function computeSelectorFallback(element, ariaLabel) {
+    if (ariaLabel) return ariaLabel;
+
+    const dataId = element.getAttribute('data-id')
+      || element.getAttribute('data-testid')
+      || element.getAttribute('data-qa');
+    if (dataId) return dataId;
+
+    const innerText = (element.textContent || '').trim();
+    if (innerText) return innerText.substring(0, 40);
+
+    return null;
+  }
+
+  /**
    * Compute all selectors from contract section 2.1.
    * Returns null for any selector that cannot be derived.
    */
@@ -264,7 +315,9 @@
       sf_field: sfField,
       css_path: buildCssPath(element),
       text: text || null,
-      xpath: buildXPath(element)
+      xpath: buildXPath(element),
+      selector_confidence: computeSelectorConfidence(roleNameObj, element),
+      selector_fallback: computeSelectorFallback(element, ariaLabel)
     };
   }
 
@@ -597,6 +650,39 @@
           page_type: 'unknown',
           app: null
         };
+      },
+
+      computeSelectorConfidence: function(roleNameObj, elementMock) {
+        // 1.0: both role and accessible name are present — highest-quality get_by_role selector
+        if (roleNameObj.role && roleNameObj.name) return 1.0;
+
+        // 0.5: role-only (icon button, unlabelled control), or a stable data-id attribute
+        if (roleNameObj.role) return 0.5;
+        const dataId = (elementMock.getAttribute && (
+          elementMock.getAttribute('data-id') ||
+          elementMock.getAttribute('data-testid') ||
+          elementMock.getAttribute('data-qa')
+        )) || elementMock['data-id'] || elementMock['data-testid'] || elementMock['data-qa'] || null;
+        if (dataId) return 0.5;
+
+        // 0.1: no role, no name, no data-id — bare LWC shadow element, CSS-path only
+        return 0.1;
+      },
+
+      computeSelectorFallback: function(elementMock, ariaLabel) {
+        if (ariaLabel) return ariaLabel;
+
+        const dataId = (elementMock.getAttribute && (
+          elementMock.getAttribute('data-id') ||
+          elementMock.getAttribute('data-testid') ||
+          elementMock.getAttribute('data-qa')
+        )) || elementMock['data-id'] || elementMock['data-testid'] || elementMock['data-qa'] || null;
+        if (dataId) return dataId;
+
+        const innerText = (elementMock.textContent || '').trim();
+        if (innerText) return innerText.substring(0, 40);
+
+        return null;
       }
     };
   }

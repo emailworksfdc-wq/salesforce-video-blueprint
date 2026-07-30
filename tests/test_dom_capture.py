@@ -2594,3 +2594,336 @@ def test_genuinely_sensitive_card_and_auth_fields_are_still_caught(field_name: s
 
     assert findings, f"{field_name!r} is sensitive but produced NO finding"
     assert not any(_CANARY in f for f in findings), "finding echoed the value"
+
+
+
+# ============================================================================
+# 18. selector_confidence and selector_fallback (lane B08)
+# ============================================================================
+#
+# Two new fields added to RawSelectors and to recorder.js computeSelectors():
+#
+#   selector_confidence: float 0.0-1.0
+#     1.0 = role+name both present (high-quality get_by_role selector)
+#     0.5 = role only, OR no role but a stable data-id/testid/qa attribute
+#     0.1 = role=null AND name=null AND no data-id (bare LWC shadow element)
+#
+#   selector_fallback: str | None
+#     Best non-null alternative: aria-label > data-id > innerText[:40] > null
+#
+# Both fields are OPTIONAL: a capture made before this patch still parses.
+# None means "capture pre-dates this field"; treat as unknown quality.
+
+
+def test_selector_confidence_and_fallback_fields_are_optional() -> None:
+    """A capture without selector_confidence/selector_fallback must still parse.
+
+    These fields are new — old captures do not have them. Making them required
+    would break every existing capture in production.
+    """
+    trace = synthesize_trace([
+        {
+            "seq": 1,
+            "type": "click",
+            "selectors": {
+                "role_name": {"role": "button", "name": "Save"},
+                "css_path": "button.slds-button",
+                # No selector_confidence or selector_fallback
+            },
+        }
+    ])
+    event = trace.events[0]
+    assert event.selectors.selector_confidence is None
+    assert event.selectors.selector_fallback is None
+
+
+def test_selector_confidence_parses_when_present(tmp_path: Path) -> None:
+    """selector_confidence and selector_fallback are stored and retrievable."""
+    jsonl_path = tmp_path / "capture.jsonl"
+    payload = {
+        "v": 1,
+        "seq": 1,
+        "t": 1000,
+        "type": "click",
+        "url": "https://test.my.salesforce.com",
+        "frame_path": [],
+        "selectors": {
+            "role_name": {"role": "button", "name": "New Case"},
+            "css_path": "button.new-case",
+            "selector_confidence": 1.0,
+            "selector_fallback": "New Case",
+        },
+        "element": {"tag": "button", "classes": [], "shadow_depth": 0},
+        "value": None,
+        "value_redacted": False,
+        "sf": {},
+    }
+    jsonl_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 1
+    assert trace.events[0].selectors.selector_confidence == 1.0
+    assert trace.events[0].selectors.selector_fallback == "New Case"
+
+
+def test_selector_confidence_rejects_out_of_range_values(tmp_path: Path) -> None:
+    """selector_confidence must be in [0.0, 1.0]; values outside are rejected.
+
+    The recorder.js always emits 0.1, 0.5, or 1.0; any other value signals a
+    broken recorder or tampered capture and must land in skipped_lines.
+    """
+    def _make_event(seq: int, confidence: float) -> str:
+        return json.dumps({
+            "v": 1, "seq": seq, "t": 1000 + seq, "type": "click",
+            "url": "https://test.my.salesforce.com",
+            "frame_path": [],
+            "selectors": {"css_path": "div.foo", "selector_confidence": confidence},
+            "element": {"tag": "div", "classes": [], "shadow_depth": 0},
+            "value": None, "value_redacted": False, "sf": {},
+        })
+
+    jsonl_path = tmp_path / "capture.jsonl"
+    # 1.5 and -0.1 are both out of [0.0, 1.0]
+    jsonl_path.write_text(
+        _make_event(1, 1.5) + "\n" + _make_event(2, -0.1) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 0, "Out-of-range selector_confidence must be rejected"
+    assert len(trace.skipped_lines) == 2
+
+
+def test_selector_confidence_boundary_values_are_accepted(tmp_path: Path) -> None:
+    """selector_confidence accepts 0.0 and 1.0 (inclusive bounds), plus 0.5 and 0.1."""
+    def _make_event(seq: int, confidence: float) -> str:
+        return json.dumps({
+            "v": 1, "seq": seq, "t": 1000 + seq, "type": "click",
+            "url": "https://test.my.salesforce.com",
+            "frame_path": [],
+            "selectors": {
+                "css_path": f"div.item{seq}",
+                "selector_confidence": confidence,
+            },
+            "element": {"tag": "div", "classes": [], "shadow_depth": 0},
+            "value": None, "value_redacted": False, "sf": {},
+        })
+
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        _make_event(1, 0.0) + "\n"
+        + _make_event(2, 1.0) + "\n"
+        + _make_event(3, 0.5) + "\n"
+        + _make_event(4, 0.1) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 4, f"Valid confidences rejected: {trace.skipped_lines}"
+    confidences = [e.selectors.selector_confidence for e in trace.events]
+    assert confidences == [0.0, 1.0, 0.5, 0.1]
+
+
+def test_selector_confidence_scores_for_known_cases() -> None:
+    """Verify the three score levels (1.0, 0.5, 0.1) are stored faithfully.
+
+    The recorder.js computeSelectorConfidence produces exactly these three
+    values. Python must accept and preserve all three.
+    """
+    trace = synthesize_trace([
+        # 1.0: role + name — strongest get_by_role selector
+        {
+            "seq": 1,
+            "selectors": {
+                "role_name": {"role": "button", "name": "Save"},
+                "selector_confidence": 1.0,
+                "selector_fallback": "Save",
+            },
+        },
+        # 0.5: role only (icon button with no accessible name)
+        {
+            "seq": 2,
+            "selectors": {
+                "role_name": {"role": "button", "name": None},
+                "selector_confidence": 0.5,
+                "selector_fallback": None,
+            },
+        },
+        # 0.1: null/null — bare LWC shadow element, hardest to replay
+        {
+            "seq": 3,
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": "c-case-list-item >>> div",
+                "selector_confidence": 0.1,
+                "selector_fallback": None,
+            },
+        },
+    ])
+
+    assert trace.events[0].selectors.selector_confidence == 1.0
+    assert trace.events[0].selectors.selector_fallback == "Save"
+    assert trace.events[1].selectors.selector_confidence == 0.5
+    assert trace.events[1].selectors.selector_fallback is None
+    assert trace.events[2].selectors.selector_confidence == 0.1
+    assert trace.events[2].selectors.selector_fallback is None
+
+
+def test_selector_fallback_priority_aria_label() -> None:
+    """selector_fallback prefers aria-label over innerText.
+
+    The recorder evaluates: aria-label > data-id > innerText[:40] > null.
+    Here aria-label is present so it wins over the element's innerText.
+    """
+    trace = synthesize_trace([
+        {
+            "seq": 1,
+            "element": {
+                "tag": "div",
+                "aria_label": "Close dialog",
+                "classes": [],
+                "shadow_depth": 2,
+                "text": "X",
+            },
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": "div.close",
+                "selector_confidence": 0.1,
+                "selector_fallback": "Close dialog",
+            },
+        }
+    ])
+    assert trace.events[0].selectors.selector_fallback == "Close dialog"
+
+
+def test_selector_fallback_priority_data_id() -> None:
+    """selector_fallback falls back to data-id when no aria-label is present."""
+    trace = synthesize_trace([
+        {
+            "seq": 1,
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": "c-nav-item",
+                "selector_confidence": 0.5,
+                "selector_fallback": "nav-item-home",
+            },
+        }
+    ])
+    assert trace.events[0].selectors.selector_fallback == "nav-item-home"
+
+
+def test_selector_fallback_innertext_capped_at_40_chars() -> None:
+    """selector_fallback from innerText is capped at 40 characters by the recorder.
+
+    The Python model must accept a 40-char string without truncating it further.
+    """
+    forty_chars = "A" * 40
+    trace = synthesize_trace([
+        {
+            "seq": 1,
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": "div.row",
+                "selector_confidence": 0.1,
+                "selector_fallback": forty_chars,
+            },
+        }
+    ])
+    assert trace.events[0].selectors.selector_fallback == forty_chars
+    assert len(trace.events[0].selectors.selector_fallback) == 40
+
+
+def test_selector_fallback_null_when_no_alternatives() -> None:
+    """selector_fallback is null for a fully anonymous element with no text."""
+    trace = synthesize_trace([
+        {
+            "seq": 1,
+            "element": {
+                "tag": "div",
+                "classes": ["slds-icon-container"],
+                "shadow_depth": 3,
+            },
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": "div.slds-icon-container",
+                "selector_confidence": 0.1,
+                "selector_fallback": None,
+            },
+        }
+    ])
+    assert trace.events[0].selectors.selector_fallback is None
+
+
+def test_old_capture_without_new_fields_parses_and_defaults_none(tmp_path: Path) -> None:
+    """Backward-compat: a capture that pre-dates B08 must parse without the
+    new fields. Both selector_confidence and selector_fallback default to None.
+
+    This is the hardest constraint: we must not break existing pipelines.
+    """
+    payload = {
+        "v": 1, "seq": 1, "t": 1000, "type": "click",
+        "url": "https://test.my.salesforce.com",
+        "frame_path": [],
+        "selectors": {
+            "role_name": {"role": None, "name": None},
+            "css_path": "div.lwc-shadow",
+            # No selector_confidence, no selector_fallback
+        },
+        "element": {"tag": "div", "classes": [], "shadow_depth": 2},
+        "value": None, "value_redacted": False, "sf": {},
+    }
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 1, f"Old capture was rejected: {trace.skipped_lines}"
+    assert trace.events[0].selectors.selector_confidence is None, (
+        "selector_confidence must default to None on old captures"
+    )
+    assert trace.events[0].selectors.selector_fallback is None, (
+        "selector_fallback must default to None on old captures"
+    )
+
+
+def test_many_null_null_events_all_parse_correctly(tmp_path: Path) -> None:
+    """End-to-end: 170 events with role=null/name=null (real AFT3 capture shape).
+
+    The spec notes that 170 of 175 real AFT3 capture events had null/null.
+    All must parse, and when the recorder emits selector_confidence=0.1 it must
+    be preserved faithfully on all events.
+    """
+    rows = []
+    for i in range(1, 171):
+        rows.append({
+            "v": 1, "seq": i, "t": 1000 + i, "type": "click",
+            "url": "https://test.my.salesforce.com/lightning/o/Case/list",
+            "frame_path": [],
+            "selectors": {
+                "role_name": {"role": None, "name": None},
+                "css_path": f"c-case-row >>> div.cell-{i}",
+                "selector_confidence": 0.1,
+                "selector_fallback": None,
+            },
+            "element": {"tag": "div", "classes": [f"cell-{i}"], "shadow_depth": 3},
+            "value": None, "value_redacted": False,
+            "sf": {"object": "Case", "record_id": None, "page_type": "list", "app": None},
+        })
+
+    jsonl_path = tmp_path / "capture.jsonl"
+    jsonl_path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    trace = parse_capture_file(jsonl_path)
+
+    assert len(trace.events) == 170, (
+        f"Expected 170 events, got {len(trace.events)}: {trace.skipped_lines}"
+    )
+    assert trace.skipped_lines == []
+    assert all(e.selectors.selector_confidence == 0.1 for e in trace.events)
+    assert all(e.selectors.selector_fallback is None for e in trace.events)

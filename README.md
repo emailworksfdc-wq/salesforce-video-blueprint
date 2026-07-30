@@ -148,7 +148,7 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 1386 passed, 1 skipped
+.venv/bin/python -m pytest -q          # 1397 passed, 1 skipped
 ```
 
 Without the `mcp` extra you get `1346 passed, 2 skipped` — the MCP server tests

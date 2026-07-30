@@ -85,6 +85,11 @@ class RawSelectors(BaseModel):
     All fields are nullable — the recorder emits null when it cannot compute
     a given selector type. The downstream selector ranking layer (selectors.py)
     will filter nulls and rank what's present.
+
+    selector_confidence and selector_fallback are added by the recorder's
+    computeSelectorConfidence / computeSelectorFallback functions (recorder.js).
+    They are optional so that captures made before these fields were added
+    still parse without errors.
     """
 
     test_id: str | None = None
@@ -95,6 +100,12 @@ class RawSelectors(BaseModel):
     css_path: str | None = None
     text: str | None = None
     xpath: str | None = None
+    # Selector quality scoring (added in recorder.js v1 patch).
+    # 1.0 = named role+name, 0.5 = role only or data-id, 0.1 = null/null.
+    # None means the capture pre-dates this field; treat as unknown quality.
+    selector_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Best non-null fallback: aria-label > data-id > innerText[:40] > null.
+    selector_fallback: str | None = None
 
 
 class RawElement(BaseModel):
