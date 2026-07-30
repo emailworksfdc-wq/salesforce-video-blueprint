@@ -246,6 +246,60 @@ backwards is a semantic decision about what may be claimed as caused.
 `test_c11_on_lane_02_real_capture_when_available` now runs against the committed
 artifact instead of skipping.)*
 
+### Added — iterate loop: sf agent test integration hardened
+
+`iterate.refine_with_org_feedback` closes the offline loop against a live
+Agentforce agent. Each round emits a test spec, runs it via `sf agent test
+run-eval`, parses the real per-case verdicts, folds them into the spec as added
+observations, and re-scores. Every round is written to its own `round-N/`
+directory under the caller-supplied output path; `write_round` refuses to
+overwrite an existing round before writing a byte or spending an org LLM call.
+
+**`sf agent test run-eval` is the only command that executes.** Measured against
+AFT3: `sf agent test create` is refused by the Metadata API with "Not available
+for deploy for this organization", so the deploy-then-run path is unavailable on
+Developer Edition. `run-eval` accepts only the legacy `AiEvaluationDefinition`
+dialect. `select_dialect_for_run_eval()` enforces this locally — a caller
+supplying an NGT spec gets a precise error before any org call is made.
+
+**Stopping conditions.** `iterate.refine` (offline loop) stops when: (a) score
+≥ `PASS_THRESHOLD` with no blocking issues — reported as `"threshold"`; (b)
+score regresses — best version is preserved and the loop stops immediately; (c)
+improvement < `epsilon` for two consecutive rounds — reported as `"converged"`;
+or (d) `max_rounds` is exhausted. `refine_with_org_feedback` runs exactly
+`rounds` round-trips; the caller supplies the budget. In both cases the final
+`stop_reason` string in the report names which condition fired.
+
+**Provenance enforcement.** An injected test runner (for tests) stamps feedback
+`"injected-runner"`, which is not in `REAL_FEEDBACK_SOURCES` and is refused by
+`feedback_blocking_issues`. Fabricated org results cannot be carried forward into
+the loop: only feedback stamped `"run-eval"` is `trustworthy`, and only
+trustworthy rounds advance the spec.
+
+**Report format.** `write_iteration_report(path, result)` writes two files:
+`iteration_report.json` — a machine-readable audit trail with `rounds_run`,
+`converged`, `stop_reason`, `best_version`, and a per-version array of scores,
+bands, blocking issues, and recommendations — and `iteration_report.md`, a
+Markdown table with one row per round, a delta column, and a final
+Recommendations section. Per-round org call output is written to
+`round-N/round.json` (and the emitted `testSpec.yaml` to `round-N/testSpec.yaml`
+as a round-scoped artifact). Session IDs are redacted before any file is written.
+
+**What the loop can and cannot learn.** `apply_feedback` may only ADD
+observations derived from real agent verdicts — it never deletes an unknown,
+never raises confidence, and never invents an entity or topic. A loop allowed to
+delete caveats would optimise straight to a meaningless 100; the constraint is
+structural, not advisory. One counter-intuitive consequence, recorded rather than
+hidden: a failing round can raise the score, because the rubric awards honesty
+points for each declared unknown and a failed case adds one. `stage5_round`
+emits an explicit note in `round.json` whenever the score rises on a round that
+carried failures.
+
+**`emit_test_spec` MCP tool.** The MCP server's existing `emit_test_spec` tool
+produces either dialect offline. The `note` field in its response discloses that
+`sf agent test create/run/results` is not invoked by the server — the tool
+emits the spec but does not run it.
+
 ## [0.1.1] — 2026-07-26
 
 A release whose main job is to be installable. `v0.1.0` cannot be installed on

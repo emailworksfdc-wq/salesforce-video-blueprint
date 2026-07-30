@@ -53,6 +53,31 @@ It launches the installed `sf-blueprint-mcp` executable as a subprocess and driv
 it over real JSON-RPC. It is what catches a broken entry point, a stray `print()`
 on stdout (which corrupts the transport), or a non-serializable tool return.
 
+
+### Working on the iterate loop
+
+The iterate loop lives in two modules: `iterate.py` (offline refinement via
+`refine`, and org-feedback rounds via `refine_with_org_feedback`) and
+`stage5.py` (the `sf agent test run-eval` subprocess wrapper, per-case
+verdict parsing, and provenance stamping).
+
+To run a real org round you need a published agent and an org alias with
+`sf agent test run-eval` access. Developer Edition orgs support `run-eval`
+but not `sf agent test create` (which is refused with "Not available for deploy
+for this organization"). Measured against `AFT3`.
+
+The MCP server exposes `emit_test_spec` to produce the legacy
+`AiEvaluationDefinition` or NGT `AiTestingDefinition` YAML offline. It does
+not invoke `sf agent test run-eval` — that step is opt-in and requires an org.
+See `docs/mcp-install.md` for per-harness configuration.
+
+Provenance is enforced structurally: feedback from an injected runner (used in
+tests) is stamped `"injected-runner"` and refused by
+`stage5.feedback_blocking_issues`. Only `"run-eval"` feedback is
+`trustworthy` and can advance the spec. Tests verify this; if your change
+makes `test_injected_runner_is_never_stamped_as_a_real_org_run` fail, the
+change is wrong.
+
 ## Ground rules
 
 ### 1. Never weaken a gate to make a number go up

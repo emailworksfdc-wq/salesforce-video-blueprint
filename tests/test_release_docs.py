@@ -347,13 +347,23 @@ class TestStatusTableHonesty:
                 return line
         pytest.fail(f"no status-table row for stage {stage}")
 
-    def test_stage_5_is_still_absent(self) -> None:
-        """No lane has built stage 5; the row must not be upgraded."""
+    def test_stage_5_is_partial(self) -> None:
+        """Stage 5 is now partial: run-eval is wired but no published-agent round exists.
+
+        Changing this row to 🟢 Works requires: (a) a round run against a published
+        agent, (b) sf agent test create working (not just run-eval), and (c) the
+        loop exposed as a CLI sub-command. None of those are true yet.
+        """
         row = self._stage_row("5")
-        assert "🔴 Absent" in row, (
-            "Stage 5 (iterate) is still absent — `sf agent test create/run/"
-            "results` appear nowhere in src/. Do not upgrade this row without "
-            "measured evidence that a spec is run against a real agent."
+        assert "🟡 Partial" in row, (
+            "Stage 5 row should be Partial — sf agent test run-eval is wired via "
+            "stage5.run_agent_eval and iterate.refine_with_org_feedback. Upgrade "
+            "to Absent only if the wiring is removed; upgrade to Works only when "
+            "a published-agent round completes and a CLI sub-command exists."
+        )
+        # The partial status must be honest: name what is actually missing
+        assert "run-eval" in row or "run_agent_eval" in row, (
+            "Stage 5 partial row must name sf agent test run-eval as the wired command."
         )
 
     def test_stage_5_claim_matches_the_code(self) -> None:
