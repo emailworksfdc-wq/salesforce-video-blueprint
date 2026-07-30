@@ -2,8 +2,8 @@
 
 This module launches a headed browser, authenticates with a Salesforce org via
 frontdoor (bypassing MFA/SSO), injects the JavaScript recorder into every page
-and iframe, and collects raw DOM events to `dom_capture.jsonl` while a human
-operator performs a business process.
+and iframe, and collects raw DOM events to a timestamped JSONL file while a
+human operator performs a business process.
 
 Design rationale:
 - **Human-driven**: A synthetic clicker cannot know the business process. The
@@ -12,25 +12,29 @@ Design rationale:
 - **Frontdoor authentication**: Automating the Salesforce login form is fragile
   and violates policy. Instead, `sf org open --url-only` returns a signed
   `frontdoor.jsp` URL that bypasses MFA/SSO legitimately.
-- **Network sidecar**: The network trace (`dom_capture.network.jsonl`) records
-  the exact timestamps of Salesforce API calls, providing the correlation layer
-  with causal evidence instead of heuristic step_id matching.
+- **Network sidecar**: The network trace records the exact timestamps of
+  Salesforce API calls, providing the correlation layer with causal evidence
+  instead of heuristic step_id matching.
 - **Persistent context**: Using `launch_persistent_context` with an
   org-specific `--user-data-dir` keeps cookies between recordings, so the
   operator does not have to sign in again if the session is still valid.
   **Constraint**: A persistent profile can only be used by one browser instance
   at a time; never combine with `--isolated`.
+- **Process-scoped filenames**: Output files are prefixed with `process_name`
+  and a timestamp so two captures of different processes in the same out_dir
+  do not collide.
 
-Output artifacts:
-- `dom_capture.jsonl` — one JSON line per DOM event (clicks, inputs, navigation)
-- `dom_capture.network.jsonl` — network trace of Salesforce API calls
-- `dom_capture.manifest.json` — capture metadata and provenance
+Output artifacts (prefix = ``<process_name>_<timestamp>``):
+- ``<prefix>.dom_capture.jsonl`` — one JSON line per DOM event
+- ``<prefix>.dom_capture.network.jsonl`` — network trace of Salesforce API calls
+- ``<prefix>.dom_capture.manifest.json`` — capture metadata and provenance
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -51,6 +55,89 @@ SF_API_PATTERNS = {
     "/webruntime/",
     "/services/apexrest/",
 }
+
+# Slug pattern: letters, digits, and hyphens only.
+_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
+
+
+def validate_process_name(process_name: str) -> str:
+    """Validate and return a slug-safe process name.
+
+    A valid process name contains only ASCII letters, digits, and hyphens,
+    and must start with a letter or digit (not a hyphen).
+
+    Args:
+        process_name: The process name to validate.
+
+    Returns:
+        The validated process name (unchanged).
+
+    Raises:
+        ValueError: If the name contains spaces, slashes, or other disallowed
+            characters.
+
+    Examples:
+        >>> validate_process_name("case-creation")
+        'case-creation'
+        >>> validate_process_name("case update")
+        Traceback (most recent call last):
+            ...
+        ValueError: ...
+    """
+    if not process_name:
+        raise ValueError("process_name must not be empty.")
+    if not _SLUG_RE.match(process_name):
+        raise ValueError(
+            f"process_name {process_name!r} is not slug-safe. "
+            "Use only ASCII letters, digits, and hyphens (e.g. 'case-creation')."
+        )
+    return process_name
+
+
+def capture_sf_cli_version() -> str | None:
+    """Return the Salesforce CLI version string from ``sf --version --json``.
+
+    Returns:
+        A version string such as ``"@salesforce/cli/2.x.y darwin-arm64 node-v20.x.y"``
+        or ``None`` if the CLI is not installed or the command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["sf", "--version", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(result.stdout)
+        # The JSON output contains a "cliVersion" key.
+        return data.get("cliVersion") or data.get("version") or result.stdout.strip()
+    except Exception:
+        # Non-fatal — missing CLI version does not block recording.
+        return None
+
+
+def capture_playwright_mcp_version() -> str | None:
+    """Return the playwright-mcp package version if detectable.
+
+    Attempts to read the version from the installed package metadata.
+
+    Returns:
+        A version string such as ``"1.50.0"`` or ``None`` if not detectable.
+    """
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("playwright-mcp")
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("mcp-playwright")
+    except Exception:
+        pass
+    return None
 
 
 def resolve_org_info(alias: str) -> dict[str, Any]:
@@ -176,12 +263,29 @@ def main(
         None,
         help="Operator description of the process being recorded",
     ),
+    process_name: str = typer.Option(
+        ...,
+        help=(
+            "Short slug identifying the business process being recorded "
+            "(e.g. 'case-creation', 'case-update'). "
+            "Must contain only ASCII letters, digits, and hyphens."
+        ),
+    ),
 ) -> None:
     """Launch a headed browser, inject the DOM recorder, and collect events to JSONL.
 
     A human operator performs the business process. Press Enter in the terminal
     when done.
+
+    Output files are named ``<process_name>_<timestamp>.dom_capture.jsonl`` so
+    captures of different processes in the same out_dir never overwrite each other.
     """
+    # 0. Validate process_name at startup before any side-effects.
+    try:
+        process_name = validate_process_name(process_name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--process-name") from exc
+
     # 1. Safety checks.
     print(f"[inject] Resolving org metadata for '{org_alias}'...")
     org_info = resolve_org_info(org_alias)
@@ -199,11 +303,13 @@ def main(
     frontdoor_url = parse_frontdoor_url(result.stdout)
     print("[inject] ✓ Frontdoor URL obtained.")
 
-    # 3. Prepare output directory.
+    # 3. Prepare output directory and build timestamped, process-scoped filenames.
     out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / "dom_capture.jsonl"
-    network_jsonl_path = out_dir / "dom_capture.network.jsonl"
-    manifest_path = out_dir / "dom_capture.manifest.json"
+    timestamp = int(time.time())
+    file_stem = f"{process_name}_{timestamp}"
+    jsonl_path = out_dir / f"{file_stem}.dom_capture.jsonl"
+    network_jsonl_path = out_dir / f"{file_stem}.dom_capture.network.jsonl"
+    manifest_path = out_dir / f"{file_stem}.dom_capture.manifest.json"
 
     # Recorder path.
     recorder_path = Path(__file__).parent / "recorder.js"
@@ -225,6 +331,17 @@ def main(
     # Open output files.
     jsonl_file = jsonl_path.open("a", encoding="utf-8")
     network_jsonl_file = network_jsonl_path.open("a", encoding="utf-8")
+
+    # Write a header record so the JSONL file is self-describing.
+    header = {
+        "_record_type": "header",
+        "capture_id": capture_id,
+        "process_name": process_name,
+        "org_alias": org_alias,
+        "started_at": started_at,
+    }
+    jsonl_file.write(json.dumps(header) + "\n")
+    jsonl_file.flush()
 
     # 5. Launch browser.
     print("[inject] Launching browser (headed mode)...")
@@ -322,6 +439,7 @@ def main(
     # 12. Write manifest.
     manifest = {
         "capture_id": capture_id,
+        "process_name": process_name,
         "org_alias": org_alias,
         "org_instance_url": org_info.get("instanceUrl"),
         "is_sandbox": org_info.get("isSandbox", False),
@@ -333,6 +451,8 @@ def main(
         "sink_errors": sink_errors,
         "recorder_sha256": recorder_sha256,
         "playwright_version": p.chromium.version,  # type: ignore[unreachable]
+        "sf_cli_version": capture_sf_cli_version(),
+        "playwright_mcp_version": capture_playwright_mcp_version(),
         "operator_note": note,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
