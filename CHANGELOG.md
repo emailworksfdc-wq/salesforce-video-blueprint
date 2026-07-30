@@ -150,6 +150,39 @@ marker sets at runtime so a weakening edit fails a test before it can weaken a
 run. `tests/test_gaming_resistance.py` and the new
 `tests/test_score_calibration.py` (35 tests) fail if any of these regress.
 
+### Added — Deploy
+
+`sf-blueprint deploy` closes the last manual step in the pipeline: emitting a
+bundle was already automated; getting Salesforce to accept it still required a
+copy-paste. The new sub-command (and matching MCP tool) wraps the two-step
+workflow into one call.
+
+- **`sf-blueprint deploy` sub-command.** Emits an Agentforce bundle from a
+  capture and runs two CLI calls in sequence:
+  `sf agent validate authoring-bundle` (compile check), then
+  `sf project deploy start` (deploy). Prints a clear VALIDATED / DEPLOYED /
+  REJECTED / DRY_RUN status line. Exits non-zero on any failure.
+- **`deploy.py`: `DeployResult` dataclass and `deploy_bundle()` function.**
+  `DeployResult` carries `outcome` (a `DeployOutcome` enum), `validation_errors`,
+  `deploy_errors`, `compiled`, `deployed`, `dry_run`, and both CLI argvs for
+  reproduction. `deploy_bundle()` is the single callable that drives the full
+  sequence: skip when no org alias, block on forbidden orgs, validate, then
+  conditionally deploy.
+- **Validate-then-deploy:** `sf agent validate authoring-bundle` always runs
+  first. A compiler rejection stops the flow immediately and returns `REJECTED`
+  with the verbatim error strings; `sf project deploy start` is never called on a
+  known-broken bundle.
+- **`--validate-only` flag.** Run the compile check without deploying. Returns
+  `VALIDATED` on success. Useful in CI to confirm the emitter is still producing
+  compilable Agent Script before spending a deploy quota.
+- **`--dry-run` flag.** Passes `--dry-run` to `sf project deploy start`. Checks
+  permissions and metadata without committing. Returns `DRY_RUN` on success.
+- **`run_deploy` MCP tool.** Exposes the full deploy workflow to any MCP-capable
+  AI harness. Accepts `validate_only` and `dry_run` parameters. Refuses PPCDM and
+  PPCaccenture before any CLI call is made. Returns a structured envelope with
+  `outcome`, `compiled`, `deployed`, `validationErrors`, `deployErrors`, and both
+  command strings so the caller can reproduce or audit every step.
+
 ### Added — `telemetry_source: live-org` is earnable for the first time
 
 Until now the score gate required `telemetry_source` to be `live-org` and the
