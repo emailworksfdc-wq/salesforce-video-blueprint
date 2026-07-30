@@ -72,7 +72,7 @@ deploy as an Agentforce agent* — the honest grade is roughly **58%**:
 | 2 · Ingest | 🟡 Partial | Parses and validates capture traces. **Silently discards events in three known cases** — see [Known defects](#known-defects). |
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
-| 5 · Iterate | 🔴 Absent | `sf agent test create/run/results` appear **nowhere** in this repo. The offline loop scores 79/79/79 and reports `converged=true` — a loop that cannot change its input is not a loop. |
+| 5 · Iterate | 🟡 Partial | `sf agent test run-eval` is wired end-to-end via `stage5.run_agent_eval` and `iterate.refine_with_org_feedback`. Measured against AFT3: real per-case verdicts fold back as added observations and the score shifts. Still partial: `sf agent test create` is unavailable on Developer Edition, no round has been run against a published agent, and the loop has no CLI sub-command. |
 | 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and reachable from the MCP server. One emitted bundle (`SFVB_TEST_Case_Triage`, 2026-07-26) now **compiles** (`sf agent validate authoring-bundle` → exit 0) and **deploys** as `AiAuthoringBundle` metadata to a DE org, round-tripping byte-identically. Still partial: one intent shape only, no agent has been published, and nothing checks the compiled agent's behaviour — compilation is syntax, not semantics. |
 
 The two stages nearest to zero are the two the end goal names explicitly. This
