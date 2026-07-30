@@ -54,7 +54,7 @@ sf-blueprint-mcp = "sf_video_blueprint.mcp_server:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
