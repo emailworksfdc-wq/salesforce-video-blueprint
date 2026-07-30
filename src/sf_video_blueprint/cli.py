@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ from .redaction import scrub_collected_telemetry
 from .replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
-from .spec_builder import build_agent_spec, write_spec
+from .spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence, build_agent_spec, write_spec
 from .telemetry import (
     MockTelemetryCollector,
     TelemetryCollector,
@@ -306,6 +307,114 @@ def run(
         )
     for unknown in spec.unknowns:
         typer.secho(f"UNKNOWN: {unknown}", fg=typer.colors.YELLOW)
+
+
+def _load_spec_from_json(spec_path: Path) -> DerivedAgentSpec:
+    """Load a DerivedAgentSpec from an agent-spec.json produced by the pipeline.
+
+    Raises:
+        typer.BadParameter: if the file is missing, invalid JSON, or missing
+                            required fields.
+    """
+    try:
+        raw = json.loads(spec_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise typer.BadParameter(f"Spec file not found: {spec_path}")
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Spec file is not valid JSON: {spec_path} — {exc}")
+
+    def _evidence(items: list[dict]) -> list[SpecEvidence]:
+        return [SpecEvidence(source=e["source"], detail=e["detail"]) for e in (items or [])]
+
+    try:
+        entities = [
+            DerivedEntity(
+                name=ent["name"],
+                object_api_name=ent["object_api_name"],
+                field_api_name=ent["field_api_name"],
+                evidence=_evidence(ent.get("evidence", [])),
+            )
+            for ent in raw.get("entities", [])
+        ]
+        return DerivedAgentSpec(
+            intent=raw["intent"],
+            confidence=float(raw.get("confidence", 0.5)),
+            objects_touched=raw.get("objects_touched", []),
+            entities=entities,
+            orchestration_steps=raw.get("orchestration_steps", []),
+            guardrails=raw.get("guardrails", []),
+            failure_handling=raw.get("failure_handling", []),
+            unknowns=raw.get("unknowns", []),
+            evidence=_evidence(raw.get("evidence", [])),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(
+            f"Spec JSON at {spec_path} is missing required fields or has wrong types: {exc}"
+        )
+
+
+@app.command()
+def iterate(
+    spec_json: Path = typer.Argument(
+        ...,
+        help="Path to an agent-spec.json produced by the 'run' command.",
+        exists=True,
+    ),
+    out_dir: Path = typer.Option(
+        Path("./outputs/iterations"),
+        help="Output directory. Each round is written to a versioned sub-directory (v1/, v2/, ...).",
+    ),
+    company_name: str = typer.Option("Acme Corp", help="Company name for the agent spec YAML."),
+    company_description: str = typer.Option(
+        "A company using Salesforce.",
+        help="Company description for the agent spec YAML.",
+    ),
+    max_rounds: int = typer.Option(5, help="Maximum number of refinement rounds."),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="Write a human-readable Markdown summary to <out_dir>/iteration_summary.md.",
+    ),
+) -> None:
+    """Iteratively refine an agent spec using the offline scoring loop.
+
+    Reads an agent-spec.json, scores it, applies deterministic improvements, and
+    writes versioned outputs to <out_dir>/v1/, v2/, etc.  Stops when the spec
+    passes the quality gate, converges, or reaches --max-rounds.
+
+    Use --summary to also write <out_dir>/iteration_summary.md with a
+    human-readable view of what happened across all rounds.
+    """
+    from .iterate import refine, write_iteration_report, write_iteration_summary
+
+    spec = _load_spec_from_json(spec_json)
+
+    typer.echo(f"Loaded spec: {spec_json}")
+    typer.echo(f"Intent: {spec.intent}")
+    typer.echo(f"Output dir: {out_dir}")
+
+    result = refine(
+        spec,
+        out_dir=out_dir,
+        company_name=company_name,
+        company_description=company_description,
+        max_rounds=max_rounds,
+        use_cli=False,
+    )
+
+    # Always write the JSON report (machine-readable contract)
+    report_path = write_iteration_report(out_dir / "iteration_report", result)
+    typer.echo(f"Iteration report: {report_path}")
+
+    # Optionally write a human-readable Markdown summary
+    if summary:
+        summary_path = write_iteration_summary(out_dir / "iteration_summary.md", result)
+        typer.echo(f"Iteration summary: {summary_path}")
+
+    typer.echo(
+        f"Done — {result.rounds_run} round(s), stop reason: {result.stop_reason}. "
+        f"Best version: v{result.best.version} (score {result.best.score.total}/{result.best.score.max_total})."
+    )
 
 
 if __name__ == "__main__":

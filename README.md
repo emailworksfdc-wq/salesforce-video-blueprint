@@ -151,7 +151,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q          # 1397 passed, 1 skipped
 ```
 
-Without the `mcp` extra you get `1346 passed, 2 skipped` — the MCP server tests
+Without the `mcp` extra you get `1357 passed, 2 skipped` — the MCP server tests
 skip rather than fail when the optional dependency is absent.
 
 One skip is expected: an opt-in check that validates artifacts from a real
