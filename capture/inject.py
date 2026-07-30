@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -39,10 +40,32 @@ from typing import Any
 import typer
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, sync_playwright
 
+# Allow capture/inject.py to be run standalone (outside the installed package)
+# by resolving the src tree from the repo root.
+_repo_root = Path(__file__).resolve().parent.parent
+_src_path = _repo_root / "src"
+if str(_src_path) not in sys.path:
+    sys.path.insert(0, str(_src_path))
+
+from sf_video_blueprint.org_denylist import blocked_org_message, is_org_blocked  # noqa: E402
+
 app = typer.Typer()
 
-# Hard-blocked org aliases per INTERFACE_CONTRACT.md §2.1 (rule 6).
+# Hard-blocked org aliases per INTERFACE_CONTRACT.md S2.1 (rule 6).
+# Kept for external callers that imported this constant directly; the guard
+# itself now delegates to org_denylist.is_org_blocked so case variants,
+# punctuation forms, and URL/username shapes are all caught.
 BLOCKED_ORG_ALIASES = {"PPCDM", "PPCaccenture"}
+
+# Instance-URL substrings that identify non-production Salesforce orgs.
+# develop.my.salesforce.com is the subdomain pattern for Developer Edition
+# orgs -- isSandbox is absent from sf org display output as of CLI 2.143.6
+# but the URL pattern is stable and sufficient.
+_SAFE_URL_MARKERS: tuple[str, ...] = (
+    "develop.my.salesforce.com",
+    ".sandbox.my.salesforce.com",
+    ".scratch.my.salesforce.com",
+)
 
 # Salesforce API URL patterns for network trace.
 SF_API_PATTERNS = {
@@ -82,24 +105,37 @@ def assert_org_is_safe(org_info: dict[str, Any]) -> None:
     """Fail-closed production safety guard.
 
     Refuses to proceed if the org looks like production. Refuses when:
-    - `isSandbox` is false AND `isScratch` is false AND the instance URL does
-      not contain a dev/sandbox/scratch marker.
-    - Username contains `@salesforce.com` without a sandbox suffix.
-    - Org alias is in the permanently blocked list.
+    - Any of alias, username, or instanceUrl names a permanently blocked org
+      (PPCDM / PPCaccenture), using the canonical normalising matcher in
+      org_denylist.is_org_blocked. This runs BEFORE any CLI call so a
+      blocked alias cannot reach the network.
+    - Username contains @salesforce.com without a sandbox suffix.
+    - The org is neither a sandbox nor a scratch org, AND the instance URL
+      does not contain a recognised dev/sandbox/scratch marker.
+
+    The isSandbox / isScratch flags are consulted first when present.
+    When absent (e.g. sf org display CLI 2.143.6 no longer emits isSandbox),
+    the guard falls back to URL-pattern matching.  Developer Edition orgs carry
+    develop.my.salesforce.com in their instance URL and are treated as safe.
 
     Args:
-        org_info: Output of `resolve_org_info`.
+        org_info: Output of resolve_org_info.
 
     Raises:
         ValueError: If the org is production or blocked.
     """
     alias = org_info.get("alias") or org_info.get("username")
-    if alias in BLOCKED_ORG_ALIASES:
-        raise ValueError(
-            f"Org alias '{alias}' is permanently out of scope per project rules."
-        )
-
     username = org_info.get("username", "")
+    instance_url = org_info.get("instanceUrl", "")
+
+    # --- Gap 1 fix: deny-list check before any CLI call ---------------------
+    # Check every available identifier so derived aliases, username forms, and
+    # instance-URL forms are all caught by the canonical normalising matcher.
+    for identifier in (alias, username, instance_url):
+        if is_org_blocked(identifier):
+            raise ValueError(blocked_org_message(identifier))
+
+    # --- Username heuristic -------------------------------------------------
     if "@salesforce.com" in username and not any(
         suffix in username for suffix in [".sandbox", ".scratch", ".dev"]
     ):
@@ -108,21 +144,27 @@ def assert_org_is_safe(org_info: dict[str, Any]) -> None:
             "Refusing to proceed."
         )
 
+    # --- Sandbox / scratch / dev-org detection ------------------------------
+    # Gap 2 fix: isSandbox may be absent from CLI 2.143.6+ output.  Fall back
+    # to URL-pattern matching when neither flag is True (absent or False).
     is_sandbox = org_info.get("isSandbox", False)
     is_scratch = org_info.get("isScratch", False)
-    instance_url = org_info.get("instanceUrl", "")
 
-    if not is_sandbox and not is_scratch:
-        # Must have a dev/sandbox/scratch marker in the instance URL.
-        if not any(
-            marker in instance_url
-            for marker in [".develop.my.salesforce.com", ".sandbox.my.salesforce.com", ".scratch.my.salesforce.com"]
-        ):
-            raise ValueError(
-                f"Org '{alias}' is neither a sandbox nor a scratch org, and the "
-                f"instance URL '{instance_url}' does not contain a dev/sandbox/scratch "
-                f"marker. Refusing to proceed (production safety)."
-            )
+    if is_sandbox or is_scratch:
+        # Explicit flag present and true -- safe.
+        return
+
+    # Neither flag was True (either absent or explicitly False).  Fall back to
+    # URL-pattern matching.  develop.my.salesforce.com is the Developer
+    # Edition pattern; .sandbox. and .scratch. cover the other safe tiers.
+    if any(marker in instance_url for marker in _SAFE_URL_MARKERS):
+        return
+
+    raise ValueError(
+        f"Org '{alias}' is neither a sandbox nor a scratch org, and the "
+        f"instance URL '{instance_url}' does not contain a dev/sandbox/scratch "
+        f"marker. Refusing to proceed (production safety)."
+    )
 
 
 def parse_frontdoor_url(json_str: str) -> str:
