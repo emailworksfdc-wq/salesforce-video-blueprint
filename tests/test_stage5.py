@@ -101,6 +101,41 @@ def _real_feedback() -> AgentFeedback:
     )
 
 
+def _make_below_threshold_spec() -> DerivedAgentSpec:
+    """A spec that scores well below PASS_THRESHOLD=75 so the gate-pass stop never fires.
+
+    Uses only inference-sourced evidence (no dom-capture / telemetry) which scores
+    low on evidence_grounding, keeping the total safely under 75. This lets tests
+    that need to run multiple rounds do so without being cut short by gate_pass.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case Status field value in the record",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("inference", "inferred from recording context")],
+            )
+        ],
+        orchestration_steps=[
+            "Navigate to the Case record by record identifier",
+            "Locate the Status field on the Case detail layout",
+            "Update the Status field to the desired new value",
+            "Submit the form to persist the Status change",
+        ],
+        guardrails=[
+            "Require explicit confirmation before writing Status field",
+            "Enforce field-level security on Case.Status",
+        ],
+        failure_handling=["Observed validation error: Status value was rejected by the server"],
+        unknowns=["Exact Action API name was not observed in the recording"],
+        evidence=[SpecEvidence("inference", "inferred from user-click sequence")],
+    )
+
+
 # --- The dialect question, which the project had never answered ---
 
 
@@ -679,7 +714,11 @@ def test_run_agent_eval_requires_an_existing_spec_file(tmp_path: Path) -> None:
 
 
 def test_iterate_org_feedback_loop_writes_one_round_per_trip(tmp_path: Path) -> None:
-    """The stage-5 loop in iterate.py must emit, run, parse, and version each round."""
+    """The stage-5 loop in iterate.py must emit, run, parse, and version each round.
+
+    Uses _make_below_threshold_spec() so the gate-pass stopping condition never fires
+    and both rounds in the budget actually execute.
+    """
     from sf_video_blueprint.iterate import refine_with_org_feedback
 
     calls: list[list[str]] = []
@@ -694,7 +733,7 @@ def test_iterate_org_feedback_loop_writes_one_round_per_trip(tmp_path: Path) -> 
         return Done()
 
     rounds = refine_with_org_feedback(
-        _make_spec(),
+        _make_below_threshold_spec(),
         out_dir=tmp_path / "stage5",
         org_alias="AFT3",
         agent_api_name="Coral_Cloud_Booking_Agent",
@@ -740,6 +779,10 @@ def test_iterate_org_feedback_loop_does_not_carry_synthetic_results_forward(tmp_
 
     No monkeypatching needed: an injected runner is synthetic by construction, so
     this exercises the real provenance path rather than a simulated one.
+
+    Uses _make_below_threshold_spec() so gate-pass does not stop the loop after
+    round 1 — both rounds need to run to verify that round 2 did not inherit
+    round 1's (synthetic) adjusted spec.
     """
     from sf_video_blueprint.iterate import refine_with_org_feedback
 
@@ -749,7 +792,7 @@ def test_iterate_org_feedback_loop_does_not_carry_synthetic_results_forward(tmp_
         stderr = ""
 
     rounds = refine_with_org_feedback(
-        _make_spec(),
+        _make_below_threshold_spec(),
         out_dir=tmp_path / "s5",
         org_alias="AFT3",
         agent_api_name="A",

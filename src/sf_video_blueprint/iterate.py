@@ -324,6 +324,7 @@ def refine_with_org_feedback(
     agent_api_name: str,
     test_spec_name: str,
     rounds: int = 1,
+    max_no_improvement: int | None = None,
     provenance: dict[str, str] | None = None,
     runner: Any = None,
 ) -> list[Any]:
@@ -341,8 +342,29 @@ def refine_with_org_feedback(
     Only the legacy dialect is emitted, because that is the only one
     ``sf agent test run-eval`` executes (measured; see :mod:`stage5`).
 
+    The loop short-circuits on any of these three stopping conditions (checked in
+    order after each round):
+
+    1. **Gate pass**: ``score_after.total >= PASS_THRESHOLD`` with no blocking issues.
+       The spec has satisfied the gate; further rounds would only bill more org LLM
+       calls for no actionable gain.
+
+    2. **Identical-score plateau**: three consecutive rounds all produced the same
+       ``score_after.total``. The org keeps returning the same signal; the loop is
+       not converging further.
+
+    3. **No-improvement budget**: if ``max_no_improvement`` is set, the loop stops
+       when that many consecutive rounds pass without the score going up. A round
+       that scores the same as or lower than the previous is a "no-improvement" round.
+
+    In every case, the terminal round's :attr:`stage5.Stage5Round.stop_reason` is
+    set so the audit trail explains why the loop ended.
+
     Args:
-        rounds: How many round trips to run. Each one costs real org LLM calls.
+        rounds: Maximum round trips to run. Each one costs real org LLM calls.
+        max_no_improvement: If given, stop after this many consecutive rounds that
+            did not raise ``score_after.total`` above the highest seen so far.
+            ``None`` (the default) disables this condition.
         runner: Injected subprocess runner, for tests. Cannot forge provenance:
                 passing one stamps the feedback ``injected-runner``, which is not a
                 real source, so every such round is refused by
@@ -352,15 +374,18 @@ def refine_with_org_feedback(
         The list of :class:`stage5.Stage5Round`, in order.
 
     Raises:
-        ValueError: If ``rounds < 1``.
+        ValueError: If ``rounds < 1`` or ``max_no_improvement < 1`` when provided.
         Stage5Error: If a round's org call fails; the real stderr is attached.
                      A stage-5 round that degraded to synthetic results silently
                      would be worse than one that stopped.
     """
     if rounds < 1:
         raise ValueError(f"rounds must be >= 1, got {rounds}")
+    if max_no_improvement is not None and max_no_improvement < 1:
+        raise ValueError(f"max_no_improvement must be >= 1 when provided, got {max_no_improvement}")
 
     from .eval_spec import build_legacy_test_spec, write_test_spec
+    from .spec_score import PASS_THRESHOLD
     from .stage5 import (
         RUN_EVAL_DIALECT,
         assert_round_unwritten,
@@ -374,6 +399,12 @@ def refine_with_org_feedback(
 
     results: list[Any] = []
     current = spec
+
+    # Stopping-condition state
+    consecutive_identical: int = 0  # rounds where score_after == previous score_after
+    last_score_total: int | None = None  # score_after.total from the previous round
+    best_score_seen: int | None = None  # highest score_after.total seen so far
+    no_improvement_streak: int = 0  # consecutive rounds without score increase
 
     for round_num in range(1, rounds + 1):
         # Refuse BEFORE writing a spec or spending real org LLM calls. write_round
@@ -398,6 +429,58 @@ def refine_with_org_feedback(
         round_result = stage5_round(
             current, feedback, round_number=round_num, provenance=provenance
         )
+
+        # Evaluate stopping conditions BEFORE writing, so the terminal round's
+        # stop_reason is on disk. write_round refuses to overwrite, so the reason
+        # must be stamped on the object before the file is created.
+        current_score = round_result.score_after.total if round_result.score_after is not None else None
+        stop_reason: str | None = None
+
+        # 1. Gate pass: score >= PASS_THRESHOLD with no blocking issues
+        if (
+            round_result.score_after is not None
+            and current_score is not None
+            and current_score >= PASS_THRESHOLD
+            and not round_result.score_after.blocking_issues
+        ):
+            stop_reason = (
+                f"gate_pass: score {current_score} >= PASS_THRESHOLD {PASS_THRESHOLD} "
+                "with no blocking issues"
+            )
+
+        # 2. Three consecutive identical scores
+        if stop_reason is None and current_score is not None:
+            if current_score == last_score_total:
+                consecutive_identical += 1
+            else:
+                consecutive_identical = 0
+            # We need 3 consecutive identical scores, meaning:
+            # - round N-2 = S, round N-1 = S, round N = S -> consecutive_identical == 2
+            # (first identical is count=1, second is count=2, so >= 2 means 3 in a row)
+            if consecutive_identical >= 2:
+                stop_reason = (
+                    f"identical_score_plateau: score {current_score} unchanged for "
+                    "3 consecutive rounds"
+                )
+
+        # 3. max_no_improvement budget
+        if stop_reason is None and max_no_improvement is not None and current_score is not None:
+            if best_score_seen is None or current_score > best_score_seen:
+                best_score_seen = current_score
+                no_improvement_streak = 0
+            else:
+                no_improvement_streak += 1
+            if no_improvement_streak >= max_no_improvement:
+                stop_reason = (
+                    f"max_no_improvement: {no_improvement_streak} consecutive round(s) "
+                    f"without score increase (best={best_score_seen}, "
+                    f"current={current_score}, limit={max_no_improvement})"
+                )
+
+        # Stamp stop_reason before writing so the audit trail includes the reason.
+        if stop_reason is not None:
+            round_result.stop_reason = stop_reason
+
         write_round(out_dir, round_result)
         results.append(round_result)
 
@@ -406,6 +489,13 @@ def refine_with_org_feedback(
         # audit trail as though the org had spoken.
         if round_result.trustworthy:
             current = round_result.spec_after
+
+        # Update state for the next round's stopping checks
+        last_score_total = current_score
+
+        # Early exit when a stopping condition was triggered
+        if stop_reason is not None:
+            break
 
     return results
 
