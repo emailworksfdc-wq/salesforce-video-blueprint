@@ -47,6 +47,8 @@ EXPECTED_TOOLS = {
     "emit_agent_bundle",
     "emit_test_spec",
     "preview_api_names",
+    "run_stage5_round",
+    "run_iterate",
 }
 
 
@@ -107,9 +109,9 @@ async def run(capture: str, command: str) -> None:
         # that a default invocation stays offline.
         if contacts_org is True:
             fail(
-                "health declares contactsSalesforceOrg: true unconditionally. Every "
-                "tool but emit_agent_bundle(org_alias=...) is offline; saying "
-                "otherwise misinforms a harness about what a default call does."
+                "health declares contactsSalesforceOrg: true unconditionally. Most "
+                "tools are offline by default; saying otherwise misinforms a harness "
+                "about what a default call does."
             )
         if contacts_org is not False and not (
             isinstance(contacts_org, str) and "org_alias" in contacts_org
