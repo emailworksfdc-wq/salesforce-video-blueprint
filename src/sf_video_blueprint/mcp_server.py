@@ -1391,7 +1391,9 @@ def run_pipeline_full(
                     "best_max_score": refine_result.best.score.max_total,
                     "best_passed": refine_result.best.score.passed,
                 }
-                final_spec = refine_result.best.spec
+                from .cli import _load_spec_from_json
+
+                final_spec = _load_spec_from_json(refine_result.best.spec_path)
                 final_score = refine_result.best.score
         except Exception as exc:  # noqa: BLE001
             # Refinement failure is non-fatal: we still return the raw result.
@@ -1415,6 +1417,20 @@ def run_pipeline_full(
             )
 
     base_summary = result.summary()
+    evidence_is_real = base_summary["evidence_is_real"]
+    # Mock-telemetry specs can never pass the gate, regardless of offline refinement score.
+    # Refinement runs without provenance and clears the blocking issue; restoring it here
+    # keeps the invariant that only live-org evidence can satisfy the gate.
+    effective_passed = final_score.passed and evidence_is_real
+    effective_blocking = list(final_score.blocking_issues)
+    if not evidence_is_real and not any(
+        "mock" in b.lower() or "telemetry" in b.lower() for b in effective_blocking
+    ):
+        effective_blocking.insert(
+            0,
+            "Spec was built from mock/unknown telemetry, not a live org. "
+            "Cannot reach the top band without observed server-side behaviour.",
+        )
     return _ok(
         tool,
         request_id,
@@ -1426,11 +1442,11 @@ def run_pipeline_full(
         displayScore=final_score.display_total,
         maxScore=final_score.max_total,
         band=final_score.band,
-        passed=final_score.passed,
+        passed=effective_passed,
         passThreshold=PASS_THRESHOLD,
-        blockingIssues=list(final_score.blocking_issues),
+        blockingIssues=effective_blocking,
         recommendations=list(final_score.recommendations),
-        evidenceIsReal=base_summary["evidence_is_real"],
+        evidenceIsReal=evidence_is_real,
         provenance=result.provenance,
         eventsParsed=result.events_parsed,
         actionsExtracted=result.actions_extracted,
