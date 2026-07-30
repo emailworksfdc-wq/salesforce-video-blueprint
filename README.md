@@ -68,7 +68,7 @@ deploy as an Agentforce agent* — the honest grade is roughly **58%**:
 
 | Stage | Status | Reality |
 | --- | --- | --- |
-| 1 · Record | 🟡 Partial | Real DOM recorder (`capture/recorder.js`, ~604 lines). Never run against a live org. Invoked by hand, not as a pipeline stage. |
+| 1 · Record | 🟢 Works | `sf-blueprint capture --org-alias <alias> --process-name <slug>` drives a headed browser, injects `capture/recorder.js`, streams a live event counter, runs `validate_trace` automatically on stop, and writes a timestamped JSONL with process-scoped filenames. First real capture (`case_creation_aft3.dom_capture.jsonl`) committed and verified through ingest. Safety: org deny-list enforced via `org_denylist.is_org_blocked` before any CLI call; `selector_confidence` field (0.1 / 0.5 / 1.0) and `selector_fallback` in every event. Requires `playwright install chromium`. |
 | 2 · Ingest | 🟡 Partial | Parses and validates capture traces. **Silently discards events in three known cases** — see [Known defects](#known-defects). |
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
@@ -160,6 +160,27 @@ The score-gate assertion against a real recorded capture used to be the second
 skip; `examples/case_creation_aft3.dom_capture.jsonl` is now committed and
 survives ingest, so it runs. Everything else is hermetic — no org, no network,
 no credentials.
+
+### One-click capture from a real org
+
+If you have a Salesforce org authenticated with the CLI, the three-step flow is:
+
+```bash
+# Step 1: record a process (requires playwright install chromium first)
+sf-blueprint capture --org-alias <alias> --process-name case-creation
+
+# Step 2: run the pipeline on the just-recorded capture
+sf-blueprint run --last-capture \
+  --org-url "https://your-org.develop.my.salesforce.com"
+
+# Step 3: refine iteratively against the score gate
+sf-blueprint iterate --spec outputs/capture/case-creation_*.agent-spec.json
+```
+
+`--last-capture` scans `./outputs/capture/` for the most recently modified
+`*.dom_capture.jsonl` — no need to remember the timestamped filename.
+
+### Offline pipeline (bundled example)
 
 Then run the pipeline on the bundled example capture — **no Salesforce org, no
 network, no credentials required**:
