@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -39,7 +40,91 @@ from typing import Any
 import typer
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, sync_playwright
 
+# Import validation layer -- same logic used by cli.py so operators see the same
+# diagnostics immediately after recording, not hours later when the pipeline runs.
+from sf_video_blueprint.dom_capture import parse_capture_file, validate_trace
+
 app = typer.Typer()
+
+# _ABORT_PREFIXES mirrors the logic used by cli.py so the two surfaces agree on
+# which findings are fatal.  "SECURITY CRITICAL:" catches redaction leaks;
+# "DATA LOSS:" catches 100%-loss and >=50%-loss captures.  Both require the
+# operator to fix the recorder and re-record -- they must not be silently
+# ignored until the pipeline runs hours later.
+_ABORT_PREFIXES: tuple[str, ...] = ("SECURITY CRITICAL:", "DATA LOSS:")
+
+# "EVIDENCE INCOMPLETE:" is non-fatal: the capture parsed, it is just not a
+# complete record.  Printed as a warning so the operator can decide whether to
+# re-record, but does not abort.
+_WARN_PREFIX = "EVIDENCE INCOMPLETE:"
+
+
+def run_capture_validation(jsonl_path: Path) -> int:
+    """Validate a written capture JSONL and print findings.
+
+    This is the "did the recording work?" check that previously only ran inside
+    the pipeline CLI.  By running it immediately after the capture session ends,
+    operators learn about problems before they leave the terminal -- not when the
+    pipeline fails hours later.
+
+    Severity rules (mirror cli.py so the two surfaces agree):
+
+    - ``SECURITY CRITICAL:`` or ``DATA LOSS:`` findings -> print error, return 1.
+      The caller (``main``) must abort with a non-zero exit so CI and manual
+      runs both catch the failure.
+    - ``EVIDENCE INCOMPLETE:`` findings -> print warning, continue (return 0).
+      The capture parsed; it may just be missing some events.
+    - No findings -> print the success message and return 0.
+
+    Args:
+        jsonl_path: Path to the JSONL file that was just written.
+
+    Returns:
+        0 on success (clean or incomplete-only), 1 on critical/data-loss finding.
+    """
+    print("\n[inject] Validating capture...")
+    try:
+        trace = parse_capture_file(jsonl_path)
+    except Exception as exc:
+        print(f"[inject] ERROR: Could not parse capture file: {exc}")
+        return 1
+
+    findings = validate_trace(trace)
+
+    if not findings:
+        print("[inject] ✓ capture validated — no issues found.")
+        return 0
+
+    # Partition by severity.
+    abort_findings = [f for f in findings if any(f.startswith(p) for p in _ABORT_PREFIXES)]
+    warn_findings = [f for f in findings if f.startswith(_WARN_PREFIX)]
+    other_findings = [
+        f for f in findings
+        if not any(f.startswith(p) for p in _ABORT_PREFIXES) and not f.startswith(_WARN_PREFIX)
+    ]
+
+    # Print non-fatal informational findings first (least alarming).
+    for finding in other_findings:
+        print(f"[inject]   {finding}")
+
+    # Print warnings (EVIDENCE INCOMPLETE) -- non-fatal.
+    if warn_findings:
+        print("[inject] WARNING: capture is incomplete -- evidence was lost:")
+        for finding in warn_findings:
+            print(f"[inject]   {finding}")
+
+    # Print fatal findings last so they are the last thing the operator sees.
+    if abort_findings:
+        print("[inject] CAPTURE VALIDATION FAILED -- recording cannot be used:")
+        for finding in abort_findings:
+            print(f"[inject]   {finding}")
+        print(
+            "[inject] ABORTING: Fix the recorder and re-record. "
+            "No pipeline run should use this capture."
+        )
+        return 1
+
+    return 0
 
 # Hard-blocked org aliases per INTERFACE_CONTRACT.md §2.1 (rule 6).
 BLOCKED_ORG_ALIASES = {"PPCDM", "PPCaccenture"}
@@ -347,6 +432,14 @@ def main(
     print(f"[inject]   JSONL: {jsonl_path}")
     print(f"[inject]   Network JSONL: {network_jsonl_path}")
     print(f"[inject]   Manifest: {manifest_path}")
+
+    # 14. Validate the capture immediately so the operator knows whether the
+    #     recording worked before they leave the terminal -- not when the pipeline
+    #     fails hours later.  Fatal findings (SECURITY CRITICAL, DATA LOSS) abort
+    #     with a non-zero exit; EVIDENCE INCOMPLETE is a non-fatal warning.
+    exit_code = run_capture_validation(jsonl_path)
+    if exit_code != 0:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
