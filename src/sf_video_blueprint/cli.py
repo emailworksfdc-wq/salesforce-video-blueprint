@@ -172,6 +172,57 @@ def _load_spec_from_json(spec_path: Path) -> DerivedAgentSpec:
         evidence=evidence,
     )
 
+def find_last_capture(capture_dir: Path) -> "Path | None":
+    """Find the most recently modified ``*.dom_capture.jsonl`` file under *capture_dir*.
+
+    The function scans only the immediate children of *capture_dir* and returns
+    the file with the highest ``st_mtime``.  If the directory does not exist or
+    contains no matching files, ``None`` is returned.
+
+    Args:
+        capture_dir: Directory to search (e.g. ``./outputs/capture``).
+
+    Returns:
+        The most recently modified ``.dom_capture.jsonl`` file, or ``None`` if
+        the directory is empty or does not exist.
+    """
+    if not capture_dir.exists():
+        return None
+    candidates = sorted(
+        capture_dir.glob("*.dom_capture.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _read_event_count_from_manifest(capture_path: Path) -> "int | None":
+    """Read the ``event_count`` field from the companion manifest, if it exists.
+
+    The manifest is expected to be a JSON file whose name is derived from the
+    capture file by replacing ``.dom_capture.jsonl`` with
+    ``.dom_capture.manifest.json``.
+
+    Args:
+        capture_path: Path to the ``.dom_capture.jsonl`` capture file.
+
+    Returns:
+        The integer ``event_count`` from the manifest, or ``None`` if the
+        manifest is absent or unparseable.
+    """
+    # The companion manifest lives next to the capture file.
+    # Naming convention (B01): <stem>.dom_capture.manifest.json
+    # where <stem>.dom_capture.jsonl is the capture.
+    stem = capture_path.name.removesuffix(".dom_capture.jsonl")
+    manifest_path = capture_path.parent / f"{stem}.dom_capture.manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        count = data.get("event_count")
+        return int(count) if count is not None else None
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
 
 @app.command()
 def run(
@@ -186,6 +237,18 @@ def run(
         exists=True,
         help="Path to a dom_capture.jsonl produced by capture/inject.py. This is "
         "real observed evidence and is preferred over the video path.",
+    ),
+    last_capture: bool = typer.Option(
+        False,
+        "--last-capture",
+        help="Use the most recently modified *.dom_capture.jsonl found under "
+        "--capture-dir (default: ./outputs/capture). Ignored (with a warning) "
+        "if --capture is also specified.",
+    ),
+    capture_dir: Path = typer.Option(
+        Path("./outputs/capture"),
+        help="Directory searched by --last-capture. Has no effect unless "
+        "--last-capture is also given.",
     ),
     org_url: str = typer.Option(..., help="Target Salesforce org URL."),
     username: str = typer.Option("analyst@example.com", help="Replay username for trace metadata."),
@@ -209,6 +272,32 @@ def run(
         help="Record to monitor for field diffs; format ObjectApiName:RecordId. Repeatable.",
     ),
 ) -> None:
+    # --last-capture resolution: find the most recent *.dom_capture.jsonl in
+    # capture_dir and use it as --capture, unless --capture was already given.
+    if last_capture:
+        if capture is not None:
+            typer.secho(
+                "WARNING: --last-capture is ignored because --capture was also specified. "
+                "Using explicit --capture path.",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            found = find_last_capture(capture_dir)
+            if found is None:
+                typer.secho(
+                    f"ERROR: --last-capture found no *.dom_capture.jsonl files under "
+                    f"{capture_dir}. Run 'sf-blueprint capture' first, or pass an "
+                    "explicit path with --capture.",
+                    fg=typer.colors.RED,
+                    bold=True,
+                )
+                raise typer.Exit(code=1)
+            event_count = _read_event_count_from_manifest(found)
+            count_msg = f" ({event_count} events)" if event_count is not None else ""
+            typer.echo(f"--last-capture: using {found}{count_msg}")
+            capture = found
+    
+    
     if capture is not None:
         # Real observed evidence: a DOM trace recorded click-by-click from the org.
         # CRITICAL SECURITY BOUNDARY: validate_trace must run BEFORE extraction
