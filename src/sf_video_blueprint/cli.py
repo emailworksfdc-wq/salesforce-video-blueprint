@@ -29,6 +29,77 @@ from .telemetry import (
 app = typer.Typer(help="Generate Salesforce process blueprint from video inputs.")
 
 
+# ---------------------------------------------------------------------------
+# capture sub-command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def capture(
+    org_alias: str = typer.Option(..., help="Salesforce org alias or username"),
+    out_dir: Path = typer.Option(
+        Path("./outputs/capture"),
+        help="Output directory for JSONL and manifest",
+    ),
+    start_url: str | None = typer.Option(
+        None,
+        help="Optional starting URL (defaults to org home after frontdoor)",
+    ),
+    note: str | None = typer.Option(
+        None,
+        help="Operator description of the process being recorded",
+    ),
+) -> None:
+    """Launch a headed browser, inject the DOM recorder, and collect events to JSONL.
+
+    A human operator performs the business process in the browser. Press Enter
+    in the terminal when done. Requires playwright to be installed:
+
+        pip install playwright && playwright install chromium
+
+    The output artifacts (dom_capture.jsonl, dom_capture.network.jsonl,
+    dom_capture.manifest.json) can then be passed to 'sf-blueprint run
+    --capture <out_dir>/dom_capture.jsonl'.
+    """
+    # Guard: confirm playwright is importable before we attempt anything else.
+    # This must be a lazy import -- importing playwright at module load time would
+    # make the entire CLI un-importable on machines that only have the base package.
+    import importlib as _importlib
+
+    try:
+        _importlib.import_module("playwright.sync_api")
+    except ModuleNotFoundError:
+        typer.secho(
+            "ERROR: playwright is not installed. The 'capture' sub-command requires it.\n"
+            "Install it with:\n"
+            "    pip install playwright\n"
+            "    playwright install chromium",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Lazy-import the capture module so this file stays importable without playwright.
+    # Try the project-root package path (normal development / installed layout).
+    try:
+        _inject = _importlib.import_module("capture.inject")
+    except ModuleNotFoundError as exc:
+        typer.secho(
+            f"ERROR: Could not import the capture module: {exc}\n"
+            "Ensure capture/inject.py is present in the project root.",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    _inject.main(
+        org_alias=org_alias,
+        out_dir=out_dir,
+        start_url=start_url,
+        note=note,
+    )
+
+
+
 def _redact_sensitive_url(url: str) -> str:
     """Redact session IDs and access tokens from URLs before persisting or displaying.
 

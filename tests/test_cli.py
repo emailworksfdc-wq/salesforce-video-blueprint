@@ -170,6 +170,7 @@ def test_exit_zero_on_successful_run(runner: CliRunner, minimal_capture: Path, t
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -186,6 +187,7 @@ def test_exit_nonzero_on_missing_capture(runner: CliRunner, tmp_path: Path) -> N
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(tmp_path / "does_not_exist.jsonl"),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "out.html"),
@@ -202,6 +204,7 @@ def test_exit_nonzero_on_malformed_capture(runner: CliRunner, tmp_path: Path) ->
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(bad_cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "out.html"),
@@ -224,6 +227,7 @@ def test_provenance_stamped_correctly_dom_capture(minimal_capture: Path, tmp_pat
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -245,6 +249,7 @@ def test_provenance_stamped_correctly_live_mode(minimal_capture: Path, tmp_path:
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -308,6 +313,7 @@ def test_warnings_surface_to_terminal(tmp_path: Path, runner: CliRunner) -> None
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -327,6 +333,7 @@ def test_no_path_traversal_in_output_path(runner: CliRunner, minimal_capture: Pa
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "../../../etc/passwd.html"),
@@ -360,6 +367,7 @@ def test_org_url_not_leaked_in_report(runner: CliRunner, tmp_path: Path) -> None
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", f"https://test.my.salesforce.com/secur/frontdoor.jsp?sid={secret_sid}",
             "--output-path", str(out),
@@ -387,6 +395,7 @@ def test_redacted_value_not_in_report(runner: CliRunner, redacted_capture: Path,
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redacted_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -412,6 +421,7 @@ def test_xss_payloads_are_escaped(runner: CliRunner, xss_capture: Path, tmp_path
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(xss_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -460,6 +470,7 @@ def test_spec_json_source_path_is_accurate(runner: CliRunner, minimal_capture: P
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -472,8 +483,8 @@ def test_spec_json_source_path_is_accurate(runner: CliRunner, minimal_capture: P
 
 
 def test_help_describes_stub_vs_real_evidence(runner: CliRunner) -> None:
-    """--help must accurately describe which flags produce stub/mock data."""
-    result = runner.invoke(app, ["--help"])
+    """run --help must accurately describe which flags produce stub/mock data."""
+    result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
     # Check that the help mentions stub vs real evidence
     help_text = result.stdout.lower()
@@ -536,6 +547,7 @@ def test_redaction_leak_aborts_run(runner: CliRunner, redaction_leak_capture: Pa
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redaction_leak_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -571,6 +583,7 @@ def test_redaction_leak_canary_not_in_any_output(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redaction_leak_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -594,6 +607,7 @@ def test_clean_capture_no_regression(runner: CliRunner, minimal_capture: Path, t
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -625,6 +639,7 @@ def test_validate_trace_is_actually_invoked(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -705,6 +720,7 @@ def test_sub_threshold_loss_is_announced_in_the_terminal(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -727,6 +743,7 @@ def test_clean_capture_says_nothing_about_loss(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -749,6 +766,7 @@ def test_loss_at_the_threshold_still_aborts(runner: CliRunner, tmp_path: Path) -
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -768,6 +786,7 @@ def test_incomplete_notice_is_not_duplicated_as_a_generic_warning(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
