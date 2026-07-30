@@ -2926,7 +2926,6 @@ def test_many_null_null_events_all_parse_correctly(tmp_path: Path) -> None:
     assert trace.skipped_lines == []
     assert all(e.selectors.selector_confidence == 0.1 for e in trace.events)
     assert all(e.selectors.selector_fallback is None for e in trace.events)
-=======
 # ============================================================================
 # 16. REDACTION AUDIT — org-specific pattern detection
 # ============================================================================
