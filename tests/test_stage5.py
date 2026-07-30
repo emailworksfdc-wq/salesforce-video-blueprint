@@ -391,6 +391,105 @@ def test_redact_session_ids_covers_nested_planner_state() -> None:
     assert "019f-real" not in json.dumps(scrubbed)
 
 
+# --- Parametrized coverage for the three new redaction gaps ---
+
+
+@pytest.mark.parametrize(
+    "header_key",
+    ["Authorization", "authorization"],
+    ids=["capitalized", "lowercase"],
+)
+def test_redact_session_ids_bearer_token_in_headers(header_key: str) -> None:
+    """Bearer tokens in HTTP header dicts must be redacted regardless of case."""
+    payload = {"request": {"headers": {header_key: "Bearer SYNTHETIC_TOKEN_ABCDEF1234567890"}}}
+    scrubbed = redact_session_ids(payload)
+    assert "SYNTHETIC_TOKEN_ABCDEF1234567890" not in json.dumps(scrubbed)
+    assert SESSION_ID_REDACTED in json.dumps(scrubbed)
+
+
+def test_redact_session_ids_non_bearer_headers_are_preserved() -> None:
+    """Keys that are NOT authorization headers must not be redacted (no false positives)."""
+    payload = {"request": {"headers": {"Content-Type": "application/json", "X-Request-Id": "req-abc-123"}}}
+    scrubbed = redact_session_ids(payload)
+    assert scrubbed == payload, "Non-credential headers should be left untouched"
+
+
+@pytest.mark.parametrize(
+    "url,expected_present,expected_absent",
+    [
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_SID_TOKEN&retURL=/",
+            "sid=",
+            "SYNTHETIC_SID_TOKEN",
+        ),
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_SID_ONLY",
+            "sid=",
+            "SYNTHETIC_SID_ONLY",
+        ),
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?retURL=/home&sid=SYNTHETIC_SID_MIDDLE&foo=bar",
+            "sid=",
+            "SYNTHETIC_SID_MIDDLE",
+        ),
+    ],
+    ids=["sid-with-trailing-params", "sid-at-end", "sid-in-middle"],
+)
+def test_redact_session_ids_frontdoor_sid_url(
+    url: str, expected_present: str, expected_absent: str
+) -> None:
+    """The sid= parameter value in frontdoor.jsp URLs must be redacted."""
+    payload = {"login_url": url}
+    scrubbed = redact_session_ids(payload)
+    scrubbed_url = scrubbed["login_url"]
+    assert expected_absent not in scrubbed_url
+    assert expected_present in scrubbed_url
+    assert SESSION_ID_REDACTED in scrubbed_url
+
+
+def test_redact_session_ids_plain_url_without_sid_unchanged() -> None:
+    """A URL that does NOT contain frontdoor.jsp must not be modified."""
+    url = "https://example.salesforce.com/lightning/r/Case/500abc/view"
+    payload = {"url": url}
+    scrubbed = redact_session_ids(payload)
+    assert scrubbed["url"] == url
+
+
+@pytest.mark.parametrize(
+    "depth_label,payload,secret",
+    [
+        (
+            "bearer_3_levels_deep",
+            {"level1": {"level2": {"headers": {"Authorization": "Bearer SYNTHETIC_DEEP_BEARER"}}}},
+            "SYNTHETIC_DEEP_BEARER",
+        ),
+        (
+            "frontdoor_3_levels_deep",
+            {
+                "level1": [
+                    {
+                        "level2": {
+                            "url": "https://test.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_DEEP_SID"
+                        }
+                    }
+                ]
+            },
+            "SYNTHETIC_DEEP_SID",
+        ),
+        (
+            "session_id_in_list_of_dicts_3_levels",
+            {"planner": {"steps": [{"inner": {"session_id": "SYNTHETIC_NESTED_SID"}}]}},
+            "SYNTHETIC_NESTED_SID",
+        ),
+    ],
+)
+def test_redact_session_ids_three_levels_deep(depth_label: str, payload: dict, secret: str) -> None:
+    """Each new pattern must be caught at three levels of nesting."""
+    scrubbed = redact_session_ids(payload)
+    assert secret not in json.dumps(scrubbed), f"Secret leaked at depth {depth_label}"
+    assert SESSION_ID_REDACTED in json.dumps(scrubbed)
+
+
 def test_write_round_refuses_to_overwrite_a_prior_round(tmp_path: Path) -> None:
     """The audit trail is the product; a silently replaced round is indistinguishable
     from one that never happened."""
