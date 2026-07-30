@@ -544,8 +544,12 @@ def apply_feedback(spec: DerivedAgentSpec, feedback: AgentFeedback) -> tuple[Der
     Invariants, asserted by tests:
 
     - No ``unknowns`` entry is ever removed, and none is removed to raise a score.
-    - ``confidence`` is never raised.
-    - No entity, topic, object, or orchestration step is invented.
+    - ``confidence`` is never raised, and never exceeds 0.70 after application.
+    - No entity or object is invented. Topic routing targets observed in a real
+      run-eval result ARE appended to ``orchestration_steps`` as evidence: the loop
+      must learn what the live agent actually routes to, or it can run 10 rounds and
+      never update its understanding of the routing target.
+    - ``confidence`` never exceeds 0.70 after application.
     - Synthetic feedback annotates the spec as unvalidated rather than validated.
 
     A live failure is recorded as an unknown, not silently dropped, because the
@@ -604,6 +608,26 @@ def apply_feedback(spec: DerivedAgentSpec, feedback: AgentFeedback) -> tuple[Der
     if mismatches:
         notes.append(f"recorded {len(mismatches)} topic mismatch(es) as unknowns")
 
+    # Gap 1 fix: topic routing evidence — append one observation per unique actual
+    # topic so the loop can converge on what the live agent routes to.  This is NOT
+    # an invented step: the value came verbatim from a live run-eval result.  Without
+    # this, 10 consecutive rounds could complete without the spec ever recording that
+    # the agent routes to a different topic than the derived one.
+    seen_actual_topics: set[str] = set()
+    for _case_id, _expected, actual_topic in mismatches:
+        if actual_topic not in seen_actual_topics:
+            seen_actual_topics.add(actual_topic)
+            new_spec.orchestration_steps.append(
+                f"[observed routing] Live agent {subject} routed to topic {actual_topic!r} "
+                f"(derived spec expected {_expected!r}). This is the routing target "
+                "the live agent actually selected; update the spec's intent or topic "
+                "name to match if this agent is the correct subject."
+            )
+    if seen_actual_topics:
+        notes.append(
+            f"appended {len(seen_actual_topics)} observed routing target(s) to orchestration_steps"
+        )
+
     # A live failure IS an observed error path — the one thing the recording could
     # not supply. Record it as observed behaviour of the deployed agent, and only
     # when the run was real.
@@ -635,6 +659,22 @@ def apply_feedback(spec: DerivedAgentSpec, feedback: AgentFeedback) -> tuple[Der
             f"apply_feedback must never raise confidence: {spec.confidence} -> "
             f"{new_spec.confidence}. Live verdicts are evidence about the deployed "
             "agent, not about how well the recording was understood."
+        )
+
+    # Gap 2 fix: confidence ceiling.  The deriver caps at 0.70 (see spec_builder),
+    # but apply_feedback never clamps because it received a deep copy — if the input
+    # spec already had confidence == 0.70, the deep copy starts at 0.70 and the
+    # raise-guard above only fires if something *raises* it further.  Nothing in
+    # this function should raise it, but the invariant must be asserted regardless:
+    # a spec that enters with confidence > 0.70 must not leave with it even higher.
+    # We use a raise here, not an assert, for the same reason as the guard above.
+    _CONFIDENCE_CEILING = 0.70
+    if new_spec.confidence > _CONFIDENCE_CEILING:
+        raise Stage5Error(
+            f"apply_feedback: confidence after application ({new_spec.confidence}) exceeds "
+            f"the {_CONFIDENCE_CEILING} ceiling. apply_feedback must never produce a spec "
+            "with confidence above 0.70; the recording-phase deriver is the only source "
+            "allowed to set confidence."
         )
     return new_spec, notes
 

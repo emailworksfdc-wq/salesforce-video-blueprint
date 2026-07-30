@@ -304,11 +304,26 @@ def test_apply_feedback_does_not_mutate_input_spec() -> None:
 
 
 def test_apply_feedback_invents_no_entities_or_objects() -> None:
+    """apply_feedback must not invent entities or objects.
+
+    orchestration_steps MAY grow: when a real run-eval result carries an
+    actual_topic that differs from the derived spec, apply_feedback appends an
+    observed-routing step so the iteration loop learns the live agent's real
+    routing target.  That step is evidence, not invention — its value comes
+    verbatim from the run-eval payload.
+    """
     spec = _make_spec()
     adjusted, _ = apply_feedback(spec, _real_feedback())
     assert [e.name for e in adjusted.entities] == [e.name for e in spec.entities]
     assert adjusted.objects_touched == spec.objects_touched
-    assert adjusted.orchestration_steps == spec.orchestration_steps
+    # Original steps must all still be present (nothing removed).
+    for step in spec.orchestration_steps:
+        assert step in adjusted.orchestration_steps
+    # The fixture has a topic mismatch, so exactly one [observed routing] step
+    # must have been appended.
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 1
+    assert "Booked_Activity_Management" in observed[0]
 
 
 def test_synthetic_feedback_marks_spec_unvalidated_not_validated() -> None:
@@ -327,6 +342,107 @@ def test_feedback_with_no_cases_records_an_unknown() -> None:
     adjusted, _ = apply_feedback(_make_spec(), AgentFeedback(source="run-eval", subject_name="A", cases=[]))
     assert any("no test-case results" in u for u in adjusted.unknowns)
 
+
+
+
+def test_apply_feedback_appends_observed_routing_step_for_topic_mismatch() -> None:
+    """Gap 1: when a real run-eval result routes to a different topic, the spec
+    must record it in orchestration_steps so the loop can converge."""
+    spec = _make_spec()
+    adjusted, notes = apply_feedback(spec, _real_feedback())
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    # The fixture has one topic mismatch: actual=Booked_Activity_Management, expected=Update_Case_Status
+    assert len(observed) == 1
+    assert "Booked_Activity_Management" in observed[0]
+    assert "Update_Case_Status" in observed[0]
+    assert any("appended" in n and "routing target" in n for n in notes)
+
+
+def test_apply_feedback_no_observed_routing_step_when_no_mismatch() -> None:
+    """Gap 1: if no topic mismatch, no [observed routing] step is appended."""
+    fb = AgentFeedback(
+        source="run-eval",
+        subject_name="PerfectAgent",
+        cases=[
+            CaseFeedback(
+                case_id="c0",
+                status="passed",
+                outcomes=[EvaluationOutcome("evaluator.other", "e0", True)],
+            )
+        ],
+    )
+    spec = _make_spec()
+    adjusted, notes = apply_feedback(spec, fb)
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 0
+    assert not any("routing target" in n for n in notes)
+
+
+def test_apply_feedback_deduplicates_observed_routing_steps_across_cases() -> None:
+    """Gap 1: the same actual topic seen in multiple cases must produce one step."""
+    fb = AgentFeedback(
+        source="run-eval",
+        subject_name="MultiCaseAgent",
+        cases=[
+            CaseFeedback(
+                case_id="c0",
+                status="failed",
+                outcomes=[
+                    EvaluationOutcome(
+                        "evaluator.planner_topic_assertion",
+                        "t",
+                        False,
+                        actual="SameTopic",
+                        expected="DerivedTopic",
+                    )
+                ],
+            ),
+            CaseFeedback(
+                case_id="c1",
+                status="failed",
+                outcomes=[
+                    EvaluationOutcome(
+                        "evaluator.planner_topic_assertion",
+                        "t",
+                        False,
+                        actual="SameTopic",
+                        expected="DerivedTopic",
+                    )
+                ],
+            ),
+        ],
+    )
+    spec = _make_spec()
+    adjusted, _ = apply_feedback(spec, fb)
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 1, "same actual topic from two cases should produce one observation"
+
+
+def test_apply_feedback_confidence_ceiling_0_70_never_exceeded() -> None:
+    """Gap 2: apply_feedback must never produce a spec with confidence > 0.70.
+
+    Runs 10 consecutive apply_feedback calls with a mix of passing and failing
+    feedback to simulate the iteration loop — confidence must stay at or below
+    0.70 in every round, even if the spec's starting confidence equals 0.70.
+    """
+    import pytest as _pytest
+
+    spec = _make_spec(confidence=0.70)
+    for _ in range(10):
+        spec, _ = apply_feedback(spec, _real_feedback())
+        assert spec.confidence <= 0.70, (
+            f"confidence exceeded ceiling: {spec.confidence}"
+        )
+
+
+def test_apply_feedback_raises_stage5error_if_confidence_already_above_ceiling() -> None:
+    """Gap 2: a spec that somehow enters apply_feedback with confidence > 0.70
+    must trigger a Stage5Error, not silently pass through."""
+    import pytest as _pytest
+
+    spec = _make_spec(confidence=0.75)
+    with _pytest.raises(Stage5Error, match="ceiling"):
+        apply_feedback(spec, _real_feedback())
 
 # --- A full round ---
 
