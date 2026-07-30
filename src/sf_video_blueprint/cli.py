@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -14,11 +15,19 @@ from .dom_extractor import DomCaptureExtractor
 from .extractor import HeuristicVideoExtractor
 from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
 from .models import ActionType, ExtractedAction
+from .org_validation import org_is_forbidden
 from .redaction import scrub_collected_telemetry
 from .replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
-from .spec_builder import build_agent_spec, write_spec
+from .spec_builder import (
+    DerivedAgentSpec,
+    DerivedEntity,
+    SpecEvidence,
+    build_agent_spec,
+    write_spec,
+)
+from .spec_score import PASS_THRESHOLD
 from .telemetry import (
     MockTelemetryCollector,
     TelemetryCollector,
@@ -53,6 +62,44 @@ def _parse_tracked_records(values: list[str]) -> list[tuple[str, str]]:
         object_api_name, record_id = raw.split(":", 1)
         parsed.append((object_api_name.strip(), record_id.strip()))
     return parsed
+
+
+
+
+def _load_spec_from_json(spec_path: Path) -> DerivedAgentSpec:
+    """Reconstruct a DerivedAgentSpec from a JSON file written by write_spec.
+
+    The JSON schema mirrors DerivedAgentSpec.to_dict() plus a top-level
+    provisioning key which is ignored here (it belongs to the run, not the spec).
+    """
+    data = json.loads(spec_path.read_text(encoding="utf-8"))
+    entities = [
+        DerivedEntity(
+            name=e["name"],
+            object_api_name=e.get("object_api_name"),
+            field_api_name=e.get("field_api_name"),
+            evidence=[
+                SpecEvidence(source=ev["source"], detail=ev["detail"])
+                for ev in e.get("evidence", [])
+            ],
+        )
+        for e in data.get("entities", [])
+    ]
+    evidence = [
+        SpecEvidence(source=ev["source"], detail=ev["detail"])
+        for ev in data.get("evidence", [])
+    ]
+    return DerivedAgentSpec(
+        intent=data["intent"],
+        confidence=float(data["confidence"]),
+        objects_touched=list(data.get("objects_touched", [])),
+        entities=entities,
+        orchestration_steps=list(data.get("orchestration_steps", [])),
+        guardrails=list(data.get("guardrails", [])),
+        failure_handling=list(data.get("failure_handling", [])),
+        unknowns=list(data.get("unknowns", [])),
+        evidence=evidence,
+    )
 
 
 @app.command()
@@ -307,6 +354,149 @@ def run(
     for unknown in spec.unknowns:
         typer.secho(f"UNKNOWN: {unknown}", fg=typer.colors.YELLOW)
 
+
+
+
+@app.command()
+def iterate(
+    spec: Path = typer.Option(
+        ...,
+        help="Path to agent-spec.json produced by the run command.",
+    ),
+    org_alias: str = typer.Option(
+        ...,
+        help="Salesforce org alias for running agent tests.",
+    ),
+    agent_api_name: str = typer.Option(
+        ...,
+        help="API name of the deployed Agentforce agent to test against.",
+    ),
+    test_spec_name: str = typer.Option(
+        ...,
+        help="Name prefix for the generated AiEvaluationDefinition test specs.",
+    ),
+    rounds: int = typer.Option(
+        1,
+        help="Number of refinement rounds to run. Each round costs real org LLM calls.",
+        min=1,
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        help="Output directory for round artifacts. Each round writes round-N/ sub-dirs.",
+    ),
+) -> None:
+    """Iteratively refine an agent spec by running it against a real Salesforce org.
+
+    Each round: emits a test spec, runs sf agent test run-eval against the org,
+    parses real per-case verdicts, folds them into the spec as observations, and
+    re-scores. Round artifacts are written to out-dir/round-N/ and are never
+    overwritten.
+
+    Exits non-zero if the final score is below the pass threshold
+    (PASS_THRESHOLD=75) or if a blocking issue remains in the final round.
+    """
+    if not spec.exists():
+        typer.secho(f"ERROR: spec file not found: {spec}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    if not spec.is_file():
+        typer.secho(f"ERROR: spec path is not a file: {spec}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    if org_is_forbidden(org_alias):
+        typer.secho(
+            "ERROR: org alias " + repr(org_alias) + " is strictly out of scope for this project. "
+            "PPCDM and PPCaccenture may not be targeted by this tool.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    out_dir_resolved = Path(out_dir).resolve()
+    try:
+        out_dir_resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.secho(
+            f"ERROR: cannot create output directory {str(out_dir)!r}: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    probe = out_dir_resolved / ".write_probe"
+    try:
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        typer.secho(
+            f"ERROR: output directory {str(out_dir)!r} is not writable: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        agent_spec = _load_spec_from_json(spec)
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        typer.secho(
+            f"ERROR: could not parse spec file {str(spec)!r}: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"Loaded spec: {agent_spec.intent!r} "
+        f"(confidence {agent_spec.confidence:.2f}, {len(agent_spec.entities)} entities)"
+    )
+    typer.echo(
+        f"Running {rounds} refinement round(s) against org {org_alias!r}, "
+        f"agent {agent_api_name!r}..."
+    )
+    from .iterate import refine_with_org_feedback
+    round_results = refine_with_org_feedback(
+        agent_spec,
+        out_dir=out_dir_resolved,
+        org_alias=org_alias,
+        agent_api_name=agent_api_name,
+        test_spec_name=test_spec_name,
+        rounds=rounds,
+    )
+    for r in round_results:
+        score_after = r.score_after
+        if score_after is not None:
+            score_val = score_after.total
+            passed_val = score_after.passed
+        else:
+            score_val = None
+            passed_val = None
+        stop_reason_parts: list[str] = []
+        if r.blocking_issues:
+            stop_reason_parts.append("blocking: " + "; ".join(r.blocking_issues))
+        if not r.trustworthy:
+            stop_reason_parts.append("round not trustworthy (synthetic runner or blocked)")
+        score_display = f"{score_val}/{score_after.max_total}" if score_after is not None else "n/a"
+        passed_display = "PASS" if passed_val else "FAIL"
+        stop_display = " [" + "; ".join(stop_reason_parts) + "]" if stop_reason_parts else ""
+        typer.echo(f"Round {r.round_number}: score={score_display} passed={passed_display}{stop_display}")
+    if not round_results:
+        typer.secho("ERROR: no rounds were completed.", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    final_round = round_results[-1]
+    final_score = final_round.score_after
+    if final_score is None:
+        typer.secho(
+            "ERROR: final round produced no score; cannot determine pass/fail.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    if final_score.total < PASS_THRESHOLD:
+        typer.secho(
+            f"FAIL: final score {final_score.total}/{final_score.max_total} "
+            f"is below pass threshold ({PASS_THRESHOLD}).",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    if final_round.blocking_issues:
+        typer.secho(
+            "FAIL: final round has blocking issue(s): " + "; ".join(final_round.blocking_issues),
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    typer.secho(
+        f"PASS: final score {final_score.total}/{final_score.max_total} >= threshold ({PASS_THRESHOLD}).",
+        fg=typer.colors.GREEN, bold=True,
+    )
 
 if __name__ == "__main__":
     app()
