@@ -32,12 +32,23 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import typer
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, sync_playwright
+
+# ANSI colour escapes — used only when stdout is a TTY.
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_RESET = "\033[0m"
+
+# Interval (seconds) between live-counter refreshes.
+COUNTER_INTERVAL = 5
 
 app = typer.Typer()
 
@@ -160,6 +171,71 @@ def compute_file_sha256(path: Path) -> str:
         while chunk := f.read(8192):
             sha256.update(chunk)
     return sha256.hexdigest()
+
+
+def live_counter_line(
+    event_count: int,
+    network_event_count: int,
+    sink_errors: int,
+    *,
+    use_colour: bool = True,
+) -> str:
+    """Return a single-line status string for the live recording counter.
+
+    The line is prefixed with a colour code when *use_colour* is True and
+    stdout is a TTY.  Error state (sink_errors > 0) uses yellow/red.
+
+    Args:
+        event_count: Total DOM events captured so far.
+        network_event_count: Network events captured so far.
+        sink_errors: Number of sink handler errors so far.
+        use_colour: Apply ANSI colour codes when True.
+
+    Returns:
+        A human-readable status line (no trailing newline).
+    """
+    base = (
+        f"[inject] 🔴 Recording — {event_count} events captured "
+        f"({network_event_count} network), {sink_errors} errors. "
+        "Press Enter to stop."
+    )
+    if use_colour and sink_errors > 0 and sys.stdout.isatty():
+        colour = _RED if sink_errors >= 3 else _YELLOW
+        return f"{colour}{base}{_RESET}"
+    return base
+
+
+def start_live_counter(
+    get_counts: Callable[[], tuple[int, int, int]],
+    stop_event: threading.Event,
+    interval: float = COUNTER_INTERVAL,
+) -> threading.Thread:
+    """Start a background thread that prints a live counter line every *interval* seconds.
+
+    The counter line is written to stdout, preceded by a carriage return so it
+    overwrites the previous line on TTY terminals.  On non-TTY output (pipes,
+    log files) a plain newline is used instead so each update appears on its
+    own line.
+
+    Args:
+        get_counts: Zero-argument callable returning ``(event_count,
+            network_event_count, sink_errors)`` atomically.
+        stop_event: :class:`threading.Event` — set this to stop the loop.
+        interval: Seconds between refreshes (default ``COUNTER_INTERVAL``).
+
+    Returns:
+        The started daemon :class:`threading.Thread`.
+    """
+    def _loop() -> None:
+        while not stop_event.wait(timeout=interval):
+            event_count, network_event_count, sink_errors = get_counts()
+            line = live_counter_line(event_count, network_event_count, sink_errors)
+            eol = "\r" if sys.stdout.isatty() else "\n"
+            print(line, end=eol, flush=True)
+
+    thread = threading.Thread(target=_loop, daemon=True, name="inject-live-counter")
+    thread.start()
+    return thread
 
 
 def main(
@@ -302,12 +378,28 @@ def main(
         print("  3. Return here and press Enter to stop.")
         print("=" * 70 + "\n")
 
+        # Start the live counter thread.
+        _counter_stop = threading.Event()
+
+        def _get_counts() -> tuple[int, int, int]:
+            return event_count, network_event_count, sink_errors
+
+        _counter_thread = start_live_counter(_get_counts, _counter_stop)
+
         try:
             input("Press Enter to stop recording...\n")
         except KeyboardInterrupt:
             print("\n[inject] KeyboardInterrupt received. Stopping...")
         except EOFError:
             print("\n[inject] EOFError (terminal closed?). Stopping...")
+        finally:
+            # Stop the counter and print the final summary line.
+            _counter_stop.set()
+            _counter_thread.join(timeout=1.0)
+            print(
+                f"\n[inject] ✓ Recording ended — {event_count} events total.",
+                flush=True,
+            )
 
         # Check if the operator closed the browser instead.
         if page.is_closed():
