@@ -436,12 +436,15 @@ def refine_with_org_feedback(
         current_score = round_result.score_after.total if round_result.score_after is not None else None
         stop_reason: str | None = None
 
-        # 1. Gate pass: score >= PASS_THRESHOLD with no blocking issues
+        # 1. Gate pass: score >= PASS_THRESHOLD with no blocking issues, AND the
+        #    round must be trustworthy (real org feedback). A synthetic runner cannot
+        #    satisfy the gate — the feedback is not real, so the loop must keep running.
         if (
             round_result.score_after is not None
             and current_score is not None
             and current_score >= PASS_THRESHOLD
             and not round_result.score_after.blocking_issues
+            and round_result.trustworthy
         ):
             stop_reason = (
                 f"gate_pass: score {current_score} >= PASS_THRESHOLD {PASS_THRESHOLD} "

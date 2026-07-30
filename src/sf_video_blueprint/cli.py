@@ -515,48 +515,6 @@ def run(
         typer.secho(f"UNKNOWN: {unknown}", fg=typer.colors.YELLOW)
 
 
-def _load_spec_from_json(spec_path: Path) -> DerivedAgentSpec:
-    """Load a DerivedAgentSpec from an agent-spec.json produced by the pipeline.
-
-    Raises:
-        typer.BadParameter: if the file is missing, invalid JSON, or missing
-                            required fields.
-    """
-    try:
-        raw = json.loads(spec_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise typer.BadParameter(f"Spec file not found: {spec_path}")
-    except json.JSONDecodeError as exc:
-        raise typer.BadParameter(f"Spec file is not valid JSON: {spec_path} — {exc}")
-
-    def _evidence(items: list[dict]) -> list[SpecEvidence]:
-        return [SpecEvidence(source=e["source"], detail=e["detail"]) for e in (items or [])]
-
-    try:
-        entities = [
-            DerivedEntity(
-                name=ent["name"],
-                object_api_name=ent["object_api_name"],
-                field_api_name=ent["field_api_name"],
-                evidence=_evidence(ent.get("evidence", [])),
-            )
-            for ent in raw.get("entities", [])
-        ]
-        return DerivedAgentSpec(
-            intent=raw["intent"],
-            confidence=float(raw.get("confidence", 0.5)),
-            objects_touched=raw.get("objects_touched", []),
-            entities=entities,
-            orchestration_steps=raw.get("orchestration_steps", []),
-            guardrails=raw.get("guardrails", []),
-            failure_handling=raw.get("failure_handling", []),
-            unknowns=raw.get("unknowns", []),
-            evidence=_evidence(raw.get("evidence", [])),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise typer.BadParameter(
-            f"Spec JSON at {spec_path} is missing required fields or has wrong types: {exc}"
-        )
 
 
 

@@ -211,6 +211,7 @@ def test_last_capture_selects_most_recent_file(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture-dir", str(cap_dir),
             "--org-url", "https://test.my.salesforce.com",
@@ -239,6 +240,7 @@ def test_last_capture_override_by_explicit_capture(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture", str(explicit),
             "--capture-dir", str(cap_dir),
@@ -266,6 +268,7 @@ def test_last_capture_no_files_prints_helpful_error(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture-dir", str(empty_dir),
             "--org-url", "https://test.my.salesforce.com",
@@ -288,6 +291,7 @@ def test_last_capture_nonexistent_dir_prints_helpful_error(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture-dir", str(missing_dir),
             "--org-url", "https://test.my.salesforce.com",
@@ -312,6 +316,7 @@ def test_last_capture_shows_event_count_from_manifest(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture-dir", str(cap_dir),
             "--org-url", "https://test.my.salesforce.com",
@@ -335,6 +340,7 @@ def test_last_capture_without_manifest_still_works(
     result = runner.invoke(
         app,
         [
+            "run",
             "--last-capture",
             "--capture-dir", str(cap_dir),
             "--org-url", "https://test.my.salesforce.com",

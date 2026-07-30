@@ -1095,19 +1095,21 @@ def _make_stalling_spec() -> DerivedAgentSpec:
 # --- Stopping condition 1: gate_pass ---
 
 def test_org_feedback_stops_when_gate_passes(tmp_path: Path) -> None:
-    """refine_with_org_feedback stops after the first round when the spec passes the gate.
+    """gate_pass requires trustworthy=True; an injected runner never fires it.
 
-    The fixture uses _make_passing_spec() which already scores >= PASS_THRESHOLD
-    with no blocking issues.  apply_feedback with synthetic results does not lower
-    the score, so gate_pass fires on round 1 even though rounds=5 was requested.
+    The injected runner makes feedback.is_real=False, so trustworthy=False, and
+    the gate_pass stopping condition is skipped.  With a _make_passing_spec()
+    (score 82/100, no blocking issues) the loop runs until the identical-score
+    plateau fires at round 3, which is the earliest a stopping condition can
+    trigger on a score that never changes.
 
     Assertions:
-    - Only 1 round returned (early exit, not all 5)
-    - The round's stop_reason starts with 'gate_pass:'
+    - Exactly 3 rounds (plateau, not gate_pass)
+    - The terminal round's stop_reason starts with 'identical_score_plateau:'
     - The round.json on disk contains a 'stop_reason' field
+    - round-1 and round-2 do NOT carry a stop_reason (they are non-terminal)
     """
     from sf_video_blueprint.iterate import refine_with_org_feedback
-    from sf_video_blueprint.spec_score import PASS_THRESHOLD
 
     runner, calls = _make_org_runner(_run_eval_payload_json())
     rounds = refine_with_org_feedback(
@@ -1120,27 +1122,33 @@ def test_org_feedback_stops_when_gate_passes(tmp_path: Path) -> None:
         runner=runner,
     )
 
-    # Only one round should have run (gate fired immediately)
-    assert len(rounds) == 1, (
-        f"Expected 1 round (gate_pass), got {len(rounds)}. "
+    # gate_pass is skipped for injected runners; plateau fires at round 3
+    assert len(rounds) == 3, (
+        f"Expected 3 rounds (identical_score_plateau), got {len(rounds)}. "
         f"stop_reason of last round: {rounds[-1].stop_reason!r}"
     )
-    assert len(calls) == 1, f"Expected 1 org call, got {len(calls)}"
+    assert len(calls) == 3, f"Expected 3 org calls, got {len(calls)}"
 
     # The terminal round must carry the stop_reason
     terminal = rounds[-1]
     assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
-    assert terminal.stop_reason.startswith("gate_pass:"), (
-        f"Expected stop_reason to start with 'gate_pass:', got: {terminal.stop_reason!r}"
+    assert terminal.stop_reason.startswith("identical_score_plateau:"), (
+        f"Expected stop_reason to start with 'identical_score_plateau:', got: {terminal.stop_reason!r}"
     )
-    assert str(PASS_THRESHOLD) in terminal.stop_reason
 
-    # The round.json on disk must include stop_reason
-    round_json_path = tmp_path / "stage5" / "round-1" / "round.json"
+    # The round.json on disk must include stop_reason for the terminal round
+    round_json_path = tmp_path / "stage5" / "round-3" / "round.json"
     assert round_json_path.exists()
     payload = json.loads(round_json_path.read_text(encoding="utf-8"))
-    assert "stop_reason" in payload, "round.json must contain stop_reason for gate_pass round"
-    assert payload["stop_reason"].startswith("gate_pass:"), payload["stop_reason"]
+    assert "stop_reason" in payload, "round.json must contain stop_reason for terminal round"
+    assert payload["stop_reason"].startswith("identical_score_plateau:"), payload["stop_reason"]
+
+    # Non-terminal rounds must NOT have a stop_reason
+    for n in (1, 2):
+        p = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert p.get("stop_reason") is None, f"round-{n} must not carry stop_reason"
 
 
 # --- Stopping condition 2: identical_score_plateau ---
@@ -1346,14 +1354,17 @@ def test_org_feedback_max_no_improvement_none_does_not_stop_loop(tmp_path: Path)
 
 
 def test_org_feedback_gate_pass_stop_reason_written_to_disk(tmp_path: Path) -> None:
-    """stop_reason must appear in round.json when gate_pass fires.
+    """stop_reason must appear in round.json for the terminal round (audit-trail contract).
+
+    With an injected runner (trustworthy=False) gate_pass cannot fire.  The loop
+    runs 3 rounds and stops on identical_score_plateau.  The terminal round-3
+    must have stop_reason in its JSON; rounds 1 and 2 must NOT.
 
     This is the audit-trail contract: a reader opening round.json for the
     terminal round must be able to see WHY the loop ended without reading any
     other file.
     """
     from sf_video_blueprint.iterate import refine_with_org_feedback
-    from sf_video_blueprint.spec_score import PASS_THRESHOLD
 
     runner, _ = _make_org_runner(_run_eval_payload_json())
     refine_with_org_feedback(
@@ -1362,20 +1373,27 @@ def test_org_feedback_gate_pass_stop_reason_written_to_disk(tmp_path: Path) -> N
         org_alias="AFT3",
         agent_api_name="TestAgent",
         test_spec_name="TestSpec",
-        rounds=3,
+        rounds=5,
         runner=runner,
     )
 
-    # round-1 is the terminal round; it must have stop_reason in its JSON
+    # round-3 is the terminal round (identical_score_plateau); it must have stop_reason
     payload = json.loads(
-        (tmp_path / "stage5" / "round-1" / "round.json").read_text(encoding="utf-8")
+        (tmp_path / "stage5" / "round-3" / "round.json").read_text(encoding="utf-8")
     )
     assert "stop_reason" in payload
-    assert "gate_pass" in payload["stop_reason"]
-    assert str(PASS_THRESHOLD) in payload["stop_reason"]
+    assert "identical_score_plateau" in payload["stop_reason"]
 
-    # round-2 and round-3 must NOT exist (loop stopped at 1)
-    assert not (tmp_path / "stage5" / "round-2").exists(), "No round-2 should exist after gate_pass"
+    # Non-terminal rounds must NOT carry a stop_reason
+    for n in (1, 2):
+        p = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert p.get("stop_reason") is None, f"round-{n} should not have stop_reason"
+
+    # Rounds 4 and 5 must not exist (loop stopped at 3)
+    assert not (tmp_path / "stage5" / "round-4").exists(), "round-4 must not exist"
+    assert not (tmp_path / "stage5" / "round-5").exists(), "round-5 must not exist"
 
 
 def test_org_feedback_non_terminal_rounds_have_no_stop_reason(tmp_path: Path) -> None:
