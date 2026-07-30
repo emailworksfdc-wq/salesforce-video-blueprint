@@ -98,9 +98,11 @@ change how you should interpret the output.
 
 Most tools are offline and read-only. No tool in that set contacts a Salesforce
 org, launches a browser, or modifies anything outside a path you explicitly pass.
-Two tools are exceptions: `run_stage5_round` and `run_iterate` shell out to
+Three tools are exceptions: `run_stage5_round` and `run_iterate` shell out to
 `sf agent test run-eval`, which sends test cases to a live agent in the org you
-supply. Both refuse PPCDM and PPCaccenture before any network call.
+supply. `run_deploy` validates and deploys a bundle to the org you supply; use
+`validate_only=True` for a read-only compile check. All three refuse PPCDM and
+PPCaccenture before any network call.
 
 Two things to carry into how you report results:
 
@@ -262,6 +264,7 @@ def health() -> dict[str, Any]:
             "preview_api_names",
             "run_stage5_round",
             "run_iterate",
+            "run_deploy",
         ],
         capabilities={
             # Most tools are offline. Three tools contact an org when given an
@@ -271,12 +274,17 @@ def health() -> dict[str, Any]:
             # PPCaccenture before any network call is attempted.
             "offline": (
                 "by default; emit_agent_bundle(org_alias=...) compiles against an org; "
-                "run_stage5_round and run_iterate call sf agent test run-eval against a live org"
+                "run_stage5_round and run_iterate call sf agent test run-eval against a live org; "
+                "run_deploy validates and deploys to an org when given org_alias"
             ),
-            "readOnly": True,
+            "readOnly": (
+                "mostly; run_deploy(org_alias=...) deploys metadata to the target org "
+                "when not given validate_only=True or dry_run=True"
+            ),
             "contactsSalesforceOrg": (
                 "emit_agent_bundle when given org_alias; "
-                "run_stage5_round and run_iterate always (they require org_alias)"
+                "run_stage5_round and run_iterate always (they require org_alias); "
+                "run_deploy when given org_alias"
             ),
             "launchesBrowser": False,
             "telemetry": "mock-only — collecting real telemetry needs a live org",
@@ -1136,6 +1144,137 @@ def run_iterate(
             }
             for r in round_results
         ],
+    )
+
+
+@mcp.tool()
+def run_deploy(
+    capture_path: str,
+    developer_name: str,
+    agent_label: str,
+    org_alias: str,
+    validate_only: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Validate and optionally deploy an Agentforce bundle derived from a capture.
+
+    Runs two steps when ``validate_only`` is false:
+
+    1. ``sf agent validate authoring-bundle`` — compiles the Agent Script. If the
+       compiler rejects the bundle, the deploy is skipped and the errors are
+       returned verbatim so the caller can fix the emitter rather than the output.
+    2. ``sf project deploy start`` — deploys the ``AiAuthoringBundle`` metadata.
+       Pass ``dry_run=True`` to exercise the deploy path without committing.
+
+    Forbidden org aliases (PPCDM, PPCaccenture) are refused before any network
+    call is made. No credential ever appears on argv.
+
+    Args:
+        capture_path: Path to a dom_capture.jsonl trace.
+        developer_name: Salesforce API name for the bundle, e.g. ``Case_Triage_Agent``.
+        agent_label: Human-readable label, e.g. ``Case Triage Agent``.
+        org_alias: Org alias to validate/deploy against. Required.
+        validate_only: Stop after ``sf agent validate authoring-bundle``. Reports
+            VALIDATED on success; deploy is not attempted.
+        dry_run: Pass ``--dry-run`` to ``sf project deploy start``. Checks
+            permissions and metadata without committing. Implies deploy attempt
+            (not ``validate_only``).
+    """
+    request_id = uuid4().hex[:12]
+    started = time.monotonic()
+    tool = "run_deploy"
+
+    from .org_validation import org_is_forbidden
+
+    if org_is_forbidden(org_alias):
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"Org alias {org_alias!r} is out of scope for this project and was refused.",
+            remedy="Use a Developer Edition or sandbox org you own.",
+        )
+
+    path = _resolve(capture_path)
+    if not path.is_file():
+        return _err(tool, request_id, started, ERROR_NOT_FOUND, f"No file at {path}")
+
+    try:
+        result = run_pipeline(path, org_url="https://example.my.salesforce.com")
+    except CaptureRejected as exc:
+        return _err(
+            tool, request_id, started, ERROR_VALIDATION, str(exc), findings=exc.findings
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(tool, request_id, started, ERROR_INTERNAL, f"Pipeline failed: {exc}")
+
+    try:
+        from .agent_script import InsufficientEvidenceError, build_agent_script
+
+        agent_source = build_agent_script(
+            result.spec, developer_name=developer_name, agent_label=agent_label
+        )
+    except InsufficientEvidenceError as exc:
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"Not enough observed evidence to emit a bundle: {exc}",
+            remedy="Re-record a fuller session rather than lowering the bar.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(tool, request_id, started, ERROR_INTERNAL, f"Emit failed: {exc}")
+
+    try:
+        from .deploy import DeployOutcome, deploy_bundle
+    except ImportError as exc:
+        return _err(
+            tool, request_id, started, ERROR_DEPENDENCY, f"deploy module not available: {exc}"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="sfvb-mcp-deploy-") as scratch:
+        deploy_result = deploy_bundle(
+            agent_source,
+            developer_name=developer_name,
+            org_alias=org_alias,
+            project_dir=Path(scratch),
+            validate_only=validate_only,
+            dry_run=dry_run,
+        )
+
+    outcome = deploy_result.outcome
+    succeeded = deploy_result.succeeded or outcome in (
+        DeployOutcome.VALIDATED,
+        DeployOutcome.DRY_RUN,
+        DeployOutcome.DEPLOYED,
+    )
+
+    return _ok(
+        tool,
+        request_id,
+        started,
+        outcome=outcome.value,
+        developerName=developer_name,
+        agentLabel=agent_label,
+        orgAlias=org_alias,
+        detail=deploy_result.detail,
+        compiled=deploy_result.compiled,
+        deployed=deploy_result.deployed,
+        dryRun=deploy_result.dry_run,
+        validateOnly=validate_only,
+        validationErrors=list(deploy_result.validation_errors),
+        deployErrors=list(deploy_result.deploy_errors),
+        validateCommand=deploy_result.validate_command or None,
+        deployCommand=deploy_result.deploy_command or None,
+        succeeded=succeeded,
+        note=(
+            "Deployment mutates the org. Use validate_only=True for a read-only "
+            "compile check, or dry_run=True to exercise the deploy path without "
+            "committing. Forbidden org aliases (PPCDM, PPCaccenture) are refused "
+            "before any CLI call."
+        ),
     )
 
 

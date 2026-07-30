@@ -723,6 +723,173 @@ def iterate(
         fg=typer.colors.GREEN, bold=True,
     )
 
+@app.command()
+def deploy(
+    capture: Path = typer.Option(
+        ...,
+        exists=True,
+        help="Path to a dom_capture.jsonl produced by 'sf-blueprint capture'.",
+    ),
+    developer_name: str = typer.Option(
+        ...,
+        help="Salesforce API name for the bundle, e.g. 'Case_Triage_Agent'.",
+    ),
+    agent_label: str = typer.Option(
+        ...,
+        help="Human-readable label, e.g. 'Case Triage Agent'.",
+    ),
+    org_alias: str = typer.Option(
+        ...,
+        help="Salesforce org alias or username for deployment.",
+    ),
+    validate_only: bool = typer.Option(
+        False,
+        "--validate-only",
+        help=(
+            "Run sf agent validate authoring-bundle but do not deploy. "
+            "Reports VALIDATED on success, REJECTED on compiler errors."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Pass --dry-run to sf project deploy start. Checks permissions "
+            "and metadata without committing the deploy. Implies deploy attempt."
+        ),
+    ),
+    out_dir: Path = typer.Option(
+        Path("./outputs/deploy"),
+        help="Directory for the scaffold project and emitted bundle files.",
+    ),
+) -> None:
+    """Emit an Agentforce bundle from a capture and deploy it to a sandbox org.
+
+    Runs two steps:
+
+    1. sf agent validate authoring-bundle — compiles the Agent Script and
+       reports any errors before a deploy is attempted.
+    2. sf project deploy start — deploys the AiAuthoringBundle metadata.
+
+    Use --validate-only to stop after step 1. Use --dry-run to exercise the
+    deploy path without committing. Either flag still requires --org-alias.
+
+    Refuses PPCDM and PPCaccenture before any CLI call is made.
+    """
+    if org_is_forbidden(org_alias):
+        typer.secho(
+            f"ERROR: org alias {org_alias!r} is permanently out of scope for this "
+            "project. PPCDM and PPCaccenture may not be targeted by this tool.",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    from .agent_script import (
+        InsufficientEvidenceError,
+        build_agent_script,
+    )
+    from .deploy import DeployOutcome, deploy_bundle
+    from .pipeline import CaptureRejected, run_pipeline
+
+    # Run the capture through the pipeline to get a spec.
+    try:
+        result = run_pipeline(capture, org_url="https://example.my.salesforce.com")
+    except CaptureRejected as exc:
+        typer.secho(
+            f"ERROR: capture failed integrity validation: {exc}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    # Emit the Agent Script bundle.
+    try:
+        agent_source = build_agent_script(
+            result.spec,
+            developer_name=developer_name,
+            agent_label=agent_label,
+        )
+    except InsufficientEvidenceError as exc:
+        typer.secho(
+            f"ERROR: insufficient evidence to emit a bundle: {exc}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    import tempfile as _tempfile
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with _tempfile.TemporaryDirectory(prefix="sfvb-deploy-") as scratch:
+        deploy_result = deploy_bundle(
+            agent_source,
+            developer_name=developer_name,
+            org_alias=org_alias,
+            project_dir=Path(scratch),
+            validate_only=validate_only,
+            dry_run=dry_run,
+        )
+
+    outcome = deploy_result.outcome
+
+    if outcome is DeployOutcome.BLOCKED:
+        typer.secho(
+            f"ERROR: {deploy_result.detail}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    if outcome is DeployOutcome.REJECTED:
+        typer.secho(
+            f"DEPLOY REJECTED: {deploy_result.detail}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        for err in deploy_result.validation_errors:
+            typer.secho(f"  {err}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    if outcome is DeployOutcome.ERROR:
+        typer.secho(
+            f"DEPLOY ERROR: {deploy_result.detail}",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        for err in deploy_result.deploy_errors:
+            typer.secho(f"  {err}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+    if outcome is DeployOutcome.VALIDATED:
+        typer.secho(
+            f"VALIDATED: {developer_name} compiled successfully "
+            f"(--validate-only; deploy not attempted).",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+        return
+
+    if outcome is DeployOutcome.DRY_RUN:
+        typer.secho(
+            f"DRY RUN: {developer_name} would deploy successfully (--dry-run).",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+        return
+
+    if outcome is DeployOutcome.DEPLOYED:
+        typer.secho(
+            f"DEPLOYED: {developer_name} deployed to {org_alias}.",
+            fg=typer.colors.GREEN,
+            bold=True,
+        )
+        return
+
+    # SKIPPED or unexpected outcome
+    typer.echo(f"Outcome: {outcome.value} — {deploy_result.detail}")
+
+
 if __name__ == "__main__":
     app()
 

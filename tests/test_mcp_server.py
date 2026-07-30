@@ -40,6 +40,7 @@ EXPECTED_TOOLS = {
     "preview_api_names",
     "run_stage5_round",
     "run_iterate",
+    "run_deploy",
 }
 
 
@@ -95,7 +96,10 @@ def test_health_reports_capabilities_and_limitations() -> None:
     assert "by default" in result["capabilities"]["offline"]
     # Offline disclosure must mention the stage-5 tools too.
     assert "run_stage5_round" in result["capabilities"]["offline"] or "run_iterate" in result["capabilities"]["offline"]
-    assert result["capabilities"]["readOnly"] is True
+    # readOnly is now a string (not True) since run_deploy can mutate an org.
+    # It must still be truthy and describe the qualification.
+    read_only = result["capabilities"]["readOnly"]
+    assert read_only, "readOnly capability must be present and truthy"
     assert result["capabilities"]["launchesBrowser"] is False
     # The limitations list is load-bearing: an agent plans around it. Assert the
     # disclosures that most change how a caller should treat the output.
@@ -447,6 +451,8 @@ def test_preview_api_names_keeps_the_reference_pair_consistent() -> None:
         lambda: mcp_server.emit_agent_bundle(str(EXAMPLE), "a", "A"),
         lambda: mcp_server.emit_test_spec(str(EXAMPLE), "T", "a"),
         lambda: mcp_server.preview_api_names("Update Case Status"),
+        # run_deploy with no org_alias returns a BLOCKED error — still JSON-safe
+        lambda: mcp_server.run_deploy(str(EXAMPLE), "a", "A", "PPCDM"),
     ],
 )
 def test_every_tool_result_is_json_serializable(call) -> None:
