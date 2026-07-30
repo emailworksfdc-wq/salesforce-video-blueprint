@@ -408,7 +408,7 @@ def test_the_cli_still_announces_the_redaction_it_performed(tmp_path, monkeypatc
     out = tmp_path / "report.html"
     result = CliRunner().invoke(
         cli_module.app,
-        ["--capture", str(capture), "--org-url", "https://example.my.salesforce.com",
+        ["run", "--capture", str(capture), "--org-url", "https://example.my.salesforce.com",
          "--output-path", str(out)],
     )
 

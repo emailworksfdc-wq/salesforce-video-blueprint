@@ -170,6 +170,7 @@ def test_exit_zero_on_successful_run(runner: CliRunner, minimal_capture: Path, t
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -186,6 +187,7 @@ def test_exit_nonzero_on_missing_capture(runner: CliRunner, tmp_path: Path) -> N
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(tmp_path / "does_not_exist.jsonl"),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "out.html"),
@@ -202,6 +204,7 @@ def test_exit_nonzero_on_malformed_capture(runner: CliRunner, tmp_path: Path) ->
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(bad_cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "out.html"),
@@ -224,6 +227,7 @@ def test_provenance_stamped_correctly_dom_capture(minimal_capture: Path, tmp_pat
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -245,6 +249,7 @@ def test_provenance_stamped_correctly_live_mode(minimal_capture: Path, tmp_path:
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -308,6 +313,7 @@ def test_warnings_surface_to_terminal(tmp_path: Path, runner: CliRunner) -> None
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -327,6 +333,7 @@ def test_no_path_traversal_in_output_path(runner: CliRunner, minimal_capture: Pa
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "../../../etc/passwd.html"),
@@ -360,6 +367,7 @@ def test_org_url_not_leaked_in_report(runner: CliRunner, tmp_path: Path) -> None
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", f"https://test.my.salesforce.com/secur/frontdoor.jsp?sid={secret_sid}",
             "--output-path", str(out),
@@ -387,6 +395,7 @@ def test_redacted_value_not_in_report(runner: CliRunner, redacted_capture: Path,
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redacted_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -412,6 +421,7 @@ def test_xss_payloads_are_escaped(runner: CliRunner, xss_capture: Path, tmp_path
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(xss_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -460,6 +470,7 @@ def test_spec_json_source_path_is_accurate(runner: CliRunner, minimal_capture: P
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -473,9 +484,9 @@ def test_spec_json_source_path_is_accurate(runner: CliRunner, minimal_capture: P
 
 def test_help_describes_stub_vs_real_evidence(runner: CliRunner) -> None:
     """--help must accurately describe which flags produce stub/mock data."""
-    result = runner.invoke(app, ["--help"])
+    result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    # Check that the help mentions stub vs real evidence
+    # Check that the run sub-command's help mentions stub vs real evidence
     help_text = result.stdout.lower()
     assert "stub" in help_text or "placeholder" in help_text
     assert "dom_capture" in help_text or "--capture" in help_text
@@ -536,6 +547,7 @@ def test_redaction_leak_aborts_run(runner: CliRunner, redaction_leak_capture: Pa
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redaction_leak_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -571,6 +583,7 @@ def test_redaction_leak_canary_not_in_any_output(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(redaction_leak_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -594,6 +607,7 @@ def test_clean_capture_no_regression(runner: CliRunner, minimal_capture: Path, t
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -625,6 +639,7 @@ def test_validate_trace_is_actually_invoked(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(out),
@@ -705,6 +720,7 @@ def test_sub_threshold_loss_is_announced_in_the_terminal(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -727,6 +743,7 @@ def test_clean_capture_says_nothing_about_loss(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(minimal_capture),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -749,6 +766,7 @@ def test_loss_at_the_threshold_still_aborts(runner: CliRunner, tmp_path: Path) -
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -768,6 +786,7 @@ def test_incomplete_notice_is_not_duplicated_as_a_generic_warning(
     result = runner.invoke(
         app,
         [
+            "run",
             "--capture", str(cap),
             "--org-url", "https://test.my.salesforce.com",
             "--output-path", str(tmp_path / "report.html"),
@@ -777,3 +796,137 @@ def test_incomplete_notice_is_not_duplicated_as_a_generic_warning(
     assert result.exit_code == 0
     assert "CAPTURE VALIDATION: EVIDENCE INCOMPLETE:" not in result.stdout
     assert result.stdout.count("EVIDENCE INCOMPLETE: 2 of 10") == 1
+
+
+# =============================================================================
+# === TEST: `iterate` CLI sub-command with --summary flag ===
+# =============================================================================
+
+def _write_minimal_spec_json(path: Path, intent: str = "Update Case Status") -> Path:
+    """Write a minimal valid agent-spec.json for iterate CLI tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spec = {
+        "schema_version": "1.0.0",
+        "intent": intent,
+        "confidence": 0.75,
+        "objects_touched": ["Case"],
+        "entities": [
+            {
+                "name": "status",
+                "object_api_name": "Case",
+                "field_api_name": "Status",
+                "evidence": [{"source": "data-delta", "detail": "Case.Status changed at step-001"}],
+            }
+        ],
+        "orchestration_steps": [
+            "Resolve and load the target Case record",
+            "SUBMIT on button:Save to write Status",
+        ],
+        "guardrails": ["Require confirmation before writing Case.Status"],
+        "failure_handling": ["Observed validation failure during recording"],
+        "unknowns": [],
+        "evidence": [{"source": "telemetry", "detail": "validation event observed at step-001"}],
+    }
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    return path
+
+
+def test_iterate_command_runs_without_summary(runner: CliRunner, tmp_path: Path) -> None:
+    """iterate command runs successfully without --summary and produces JSON report."""
+    spec_path = _write_minimal_spec_json(tmp_path / "agent-spec.json")
+    out_dir = tmp_path / "iterations"
+
+    result = runner.invoke(
+        app,
+        [
+            "iterate",
+            str(spec_path),
+            "--out-dir", str(out_dir),
+            "--company-name", "TestCo",
+            "--company-description", "A test company",
+            "--max-rounds", "2",
+        ],
+    )
+
+    assert result.exit_code == 0, f"iterate command failed:\n{result.stdout}\n{result.exception}"
+    assert (out_dir / "iteration_report.json").exists(), "iteration_report.json not created"
+    # Without --summary, no summary markdown file
+    assert not (out_dir / "iteration_summary.md").exists(), "summary should not be written without --summary"
+
+
+def test_iterate_command_summary_flag_writes_file(runner: CliRunner, tmp_path: Path) -> None:
+    """iterate --summary writes iteration_summary.md to <out_dir>."""
+    spec_path = _write_minimal_spec_json(tmp_path / "agent-spec.json")
+    out_dir = tmp_path / "iterations"
+
+    result = runner.invoke(
+        app,
+        [
+            "iterate",
+            str(spec_path),
+            "--out-dir", str(out_dir),
+            "--company-name", "TestCo",
+            "--company-description", "A test company",
+            "--max-rounds", "2",
+            "--summary",
+        ],
+    )
+
+    assert result.exit_code == 0, f"iterate --summary failed:\n{result.stdout}\n{result.exception}"
+    summary_path = out_dir / "iteration_summary.md"
+    assert summary_path.exists(), f"iteration_summary.md not written to {summary_path}"
+
+
+def test_iterate_command_summary_contains_intent(runner: CliRunner, tmp_path: Path) -> None:
+    """iterate --summary: the summary file contains the spec's intent."""
+    intent = "Resolve a Support Ticket"
+    spec_path = _write_minimal_spec_json(tmp_path / "agent-spec.json", intent=intent)
+    out_dir = tmp_path / "iterations"
+
+    result = runner.invoke(
+        app,
+        [
+            "iterate",
+            str(spec_path),
+            "--out-dir", str(out_dir),
+            "--summary",
+        ],
+    )
+
+    assert result.exit_code == 0, f"iterate --summary failed:\n{result.stdout}"
+    content = (out_dir / "iteration_summary.md").read_text(encoding="utf-8")
+    assert intent in content, f"Intent '{intent}' missing from summary:\n{content}"
+
+
+def test_iterate_command_summary_path_echoed(runner: CliRunner, tmp_path: Path) -> None:
+    """iterate --summary echoes the summary path to stdout so the user knows where it is."""
+    spec_path = _write_minimal_spec_json(tmp_path / "agent-spec.json")
+    out_dir = tmp_path / "iterations"
+
+    result = runner.invoke(
+        app,
+        [
+            "iterate",
+            str(spec_path),
+            "--out-dir", str(out_dir),
+            "--summary",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "iteration_summary" in result.stdout, (
+        f"Expected summary path in stdout. Got:\n{result.stdout}"
+    )
+
+
+def test_iterate_command_invalid_spec_json(runner: CliRunner, tmp_path: Path) -> None:
+    """iterate command exits with non-zero code when the spec JSON is invalid."""
+    bad_spec = tmp_path / "bad-spec.json"
+    bad_spec.write_text("NOT JSON{{{{", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["iterate", str(bad_spec)],
+    )
+
+    assert result.exit_code != 0, "Expected non-zero exit for invalid JSON"

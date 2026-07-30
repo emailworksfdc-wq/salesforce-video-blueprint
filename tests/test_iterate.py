@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 from sf_video_blueprint.iterate import (
+    IterationResult,
+    SpecVersion,
     refine,
+    write_iteration_summary,
     _apply_offline_improvements,
     _pick_best,
 )
@@ -979,3 +982,212 @@ def test_unknowns_deletion_warning_on_read_error(tmp_path):
         assert any("could not read parent spec" in note.lower() for note in v2_notes), (
             f"Expected read-error warning in v2 notes, got: {v2_notes}"
         )
+
+
+# =============================================================================
+# === TEST: write_iteration_summary ===
+# =============================================================================
+
+def _make_mock_score(
+    total: int = 70,
+    max_total: int = 100,
+    band: str = "AMBER",
+    passed: bool = False,
+    blocking_issues: list[str] | None = None,
+    recommendations: list[str] | None = None,
+):
+    """Build a duck-typed mock score object for summary tests."""
+    class _Score:
+        pass
+
+    s = _Score()
+    s.total = total
+    s.max_total = max_total
+    s.band = band
+    s.passed = passed
+    s.blocking_issues = blocking_issues if blocking_issues is not None else []
+    s.recommendations = recommendations if recommendations is not None else []
+    return s
+
+
+def _make_spec_version(
+    version: int,
+    spec_path: Path,
+    score=None,
+    notes: list[str] | None = None,
+) -> SpecVersion:
+    """Build a minimal SpecVersion for summary tests."""
+    if score is None:
+        score = _make_mock_score()
+    return SpecVersion(
+        version=version,
+        spec_path=spec_path,
+        yaml_path=None,
+        score=score,
+        role_used="analyst",
+        source="derived",
+        parent_version=version - 1 if version > 1 else None,
+        notes=notes if notes is not None else [],
+    )
+
+
+def _write_spec_json(path: Path, intent: str = "Handle Case escalation") -> Path:
+    """Write a minimal agent-spec.json to path and return path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"intent": intent, "confidence": 0.75, "unknowns": []}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_write_iteration_summary_file_is_written(tmp_path: Path) -> None:
+    """Summary file must be created at the requested path."""
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+
+    result = IterationResult(
+        versions=[_make_spec_version(1, spec_path)],
+        best=_make_spec_version(1, spec_path),
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    assert out.exists(), f"Summary file was not written to {out}"
+    assert out.suffix == ".md"
+
+
+def test_write_iteration_summary_contains_intent(tmp_path: Path) -> None:
+    """Summary file must contain the intent read from the best version's spec JSON."""
+    intent = "Update Case status to Closed"
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json", intent=intent)
+
+    result = IterationResult(
+        versions=[_make_spec_version(1, spec_path)],
+        best=_make_spec_version(1, spec_path),
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+    assert intent in content, f"Intent '{intent}' not found in summary:\n{content}"
+
+
+def test_write_iteration_summary_contains_round_table(tmp_path: Path) -> None:
+    """Summary must contain a table with a row per round."""
+    spec_path_v1 = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    spec_path_v2 = _write_spec_json(tmp_path / "v2" / "agent-spec.json")
+    spec_path_v3 = _write_spec_json(tmp_path / "v3" / "agent-spec.json")
+
+    v1 = _make_spec_version(1, spec_path_v1, score=_make_mock_score(total=60, band="RED"))
+    v2 = _make_spec_version(2, spec_path_v2, score=_make_mock_score(total=70, band="AMBER"))
+    v3 = _make_spec_version(3, spec_path_v3, score=_make_mock_score(total=80, band="GREEN", passed=True))
+
+    result = IterationResult(
+        versions=[v1, v2, v3],
+        best=v3,
+        converged=False,
+        stop_reason="Score 80/100 >= threshold 75 with no blocking issues",
+        rounds_run=3,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    # Each version row must appear
+    assert "v1" in content, "Round 1 row missing from summary"
+    assert "v2" in content, "Round 2 row missing from summary"
+    assert "v3" in content, "Round 3 row missing from summary"
+
+    # Score values must appear
+    assert "60" in content, "Score 60 missing from summary"
+    assert "70" in content, "Score 70 missing from summary"
+    assert "80" in content, "Score 80 missing from summary"
+
+    # Band values
+    assert "RED" in content, "Band RED missing"
+    assert "AMBER" in content, "Band AMBER missing"
+    assert "GREEN" in content, "Band GREEN missing"
+
+
+def test_write_iteration_summary_blocking_issues_present(tmp_path: Path) -> None:
+    """When the final round has blocking issues, they must appear in the summary."""
+    blocking = ["Must observe at least one failure path", "Insufficient field evidence"]
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    score = _make_mock_score(total=60, blocking_issues=blocking)
+
+    v1 = _make_spec_version(1, spec_path, score=score)
+    result = IterationResult(
+        versions=[v1],
+        best=v1,
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    for issue in blocking:
+        assert issue in content, f"Blocking issue '{issue}' missing from summary:\n{content}"
+
+
+def test_write_iteration_summary_no_blocking_issues_message(tmp_path: Path) -> None:
+    """When there are no blocking issues, the summary must say so explicitly."""
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    score = _make_mock_score(total=80, passed=True, blocking_issues=[])
+
+    v1 = _make_spec_version(1, spec_path, score=score)
+    result = IterationResult(
+        versions=[v1],
+        best=v1,
+        converged=False,
+        stop_reason="Score 80/100 >= threshold 75 with no blocking issues",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+    assert "no blocking issues" in content.lower(), (
+        f"Expected 'no blocking issues' message in summary:\n{content}"
+    )
+    assert "spec passed the gate" in content.lower(), (
+        f"Expected 'spec passed the gate' in summary:\n{content}"
+    )
+
+
+def test_write_iteration_summary_full_run(tmp_path: Path) -> None:
+    """Integration: run refine() and then write_iteration_summary(); verify all sections present."""
+    spec = _make_spec(intent="Escalate a Support Case")
+
+    result = refine(
+        spec,
+        out_dir=tmp_path / "run",
+        company_name="ACME",
+        company_description="Testing company",
+        max_rounds=3,
+        use_cli=False,
+    )
+
+    out = write_iteration_summary(tmp_path / "run" / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    # Intent section
+    assert "Escalate" in content or "Case" in content, (
+        "Intent not found in summary from real refine() run"
+    )
+
+    # Rounds run and stop reason
+    assert str(result.rounds_run) in content
+    assert result.stop_reason[:30] in content  # partial match is enough
+
+    # Per-round table header
+    assert "Round" in content
+    assert "Score" in content
+    assert "Band" in content
+
+    # Blocking issues section
+    assert "Blocking Issues" in content

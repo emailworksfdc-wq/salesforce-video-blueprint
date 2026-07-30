@@ -671,6 +671,115 @@ def _pick_best(versions: list[SpecVersion]) -> SpecVersion:
     return pool_sorted[0]
 
 
+def write_iteration_summary(path: Path, result: IterationResult) -> Path:
+    """Write a human-readable Markdown summary of an iteration run.
+
+    The summary is intentionally distinct from the machine-readable JSON produced by
+    ``write_iteration_report``.  It is meant for a practitioner who wants to understand
+    what happened at a glance without parsing JSON.
+
+    Content:
+    - Intent (read from the best version's on-disk spec JSON)
+    - Rounds run and stop reason
+    - Per-round score table (version, score, band, delta, blocking?)
+    - Blocking issues on the final round (or "no blocking issues — spec passed the gate")
+    - What changed between round 1 and the final round (gathered from version notes)
+
+    Args:
+        path: The file to write (typically ``<out_dir>/iteration_summary.md``).
+        result: The ``IterationResult`` returned by ``refine()``.
+
+    Returns:
+        The path that was written.
+    """
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read intent from the best version's on-disk spec JSON.
+    # The IterationResult carries no intent field directly — it lives in the spec file.
+    intent = "unknown"
+    try:
+        spec_data = json.loads(result.best.spec_path.read_text(encoding="utf-8"))
+        intent = spec_data.get("intent", "unknown")
+    except (OSError, json.JSONDecodeError):
+        intent = "unknown (spec file could not be read)"
+
+    # ------------------------------------------------------------------
+    # Header: intent, rounds, stop reason
+    # ------------------------------------------------------------------
+    lines: list[str] = [
+        "# Iteration Summary",
+        "",
+        f"**Intent:** {intent}",
+        f"**Rounds run:** {result.rounds_run}",
+        f"**Stop reason:** {result.stop_reason}",
+        "",
+    ]
+
+    # ------------------------------------------------------------------
+    # Per-round score table
+    # ------------------------------------------------------------------
+    lines += [
+        "## Per-round Scores",
+        "",
+        "| Round | Score | Max | Band | Δ | Blocking? |",
+        "|-------|-------|-----|------|---|-----------|",
+    ]
+    for i, v in enumerate(result.versions):
+        if i == 0:
+            delta_str = "—"
+        else:
+            delta_val = v.score.total - result.versions[i - 1].score.total
+            delta_str = f"{delta_val:+d}" if delta_val != 0 else "0"
+        blocking_str = "Yes" if v.score.blocking_issues else "No"
+        lines.append(
+            f"| v{v.version} "
+            f"| {v.score.total} "
+            f"| {v.score.max_total} "
+            f"| {v.score.band} "
+            f"| {delta_str} "
+            f"| {blocking_str} |"
+        )
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # Blocking issues on the final round
+    # ------------------------------------------------------------------
+    lines.append("## Blocking Issues (final round)")
+    lines.append("")
+    final = result.versions[-1] if result.versions else result.best
+    if final.score.blocking_issues:
+        for issue in final.score.blocking_issues:
+            lines.append(f"- {issue}")
+    else:
+        lines.append("no blocking issues — spec passed the gate")
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # What changed between round 1 and the final round
+    # ------------------------------------------------------------------
+    lines.append("## Changes (round 1 → final)")
+    lines.append("")
+
+    # Collect all notes from rounds 2 onwards (round 1 has no parent)
+    all_changes: list[str] = []
+    for v in result.versions[1:]:
+        for note in v.notes:
+            all_changes.append(f"- v{v.version}: {note}")
+
+    if all_changes:
+        lines.extend(all_changes)
+    else:
+        if result.rounds_run <= 1:
+            lines.append("Only one round was run — no incremental changes to report.")
+        else:
+            lines.append("No refinement notes were recorded between round 1 and the final round.")
+    lines.append("")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def write_iteration_report(path: Path, result: IterationResult) -> Path:
     """Write a JSON audit trail and a human-readable markdown summary.
 
