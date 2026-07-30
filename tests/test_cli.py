@@ -839,7 +839,7 @@ def test_iterate_command_runs_without_summary(runner: CliRunner, tmp_path: Path)
     result = runner.invoke(
         app,
         [
-            "iterate",
+            "refine",
             str(spec_path),
             "--out-dir", str(out_dir),
             "--company-name", "TestCo",
@@ -862,7 +862,7 @@ def test_iterate_command_summary_flag_writes_file(runner: CliRunner, tmp_path: P
     result = runner.invoke(
         app,
         [
-            "iterate",
+            "refine",
             str(spec_path),
             "--out-dir", str(out_dir),
             "--company-name", "TestCo",
@@ -886,7 +886,7 @@ def test_iterate_command_summary_contains_intent(runner: CliRunner, tmp_path: Pa
     result = runner.invoke(
         app,
         [
-            "iterate",
+            "refine",
             str(spec_path),
             "--out-dir", str(out_dir),
             "--summary",
@@ -906,7 +906,7 @@ def test_iterate_command_summary_path_echoed(runner: CliRunner, tmp_path: Path) 
     result = runner.invoke(
         app,
         [
-            "iterate",
+            "refine",
             str(spec_path),
             "--out-dir", str(out_dir),
             "--summary",
@@ -926,7 +926,7 @@ def test_iterate_command_invalid_spec_json(runner: CliRunner, tmp_path: Path) ->
 
     result = runner.invoke(
         app,
-        ["iterate", str(bad_spec)],
+        ["refine", str(bad_spec)],
     )
 
     assert result.exit_code != 0, "Expected non-zero exit for invalid JSON"
