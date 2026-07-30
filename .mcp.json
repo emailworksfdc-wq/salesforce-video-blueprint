@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "sf-blueprint": {
+      "command": "sf-blueprint-mcp"
+    }
+  }
+}

@@ -27,6 +27,37 @@ for the full limitation list.
 
 ---
 
+## Install a Claude Code skill (quickest path)
+
+If you use **Claude Code**, the fastest way to get started is to install the
+bundled skill. It teaches Claude how to drive the CLI and MCP tools automatically,
+fires on phrases like "capture my Salesforce process" or "build an Agentforce
+agent from this recording", and includes a quick-start, flag reference, and
+troubleshooting guide.
+
+**Global install** (works in every project):
+
+```bash
+mkdir -p ~/.claude/skills
+curl -fsSL https://raw.githubusercontent.com/emailworksfdc-wq/salesforce-video-blueprint/main/skills/sf-blueprint.md \
+  -o ~/.claude/skills/sf-blueprint.md
+```
+
+**Project-scoped** (checked-in alongside your code):
+
+```bash
+mkdir -p .claude/skills
+cp skills/sf-blueprint.md .claude/skills/sf-blueprint.md
+```
+
+Then just tell Claude Code what you want in plain English — the skill activates
+automatically. No further configuration needed for pure CLI use.
+
+To also expose the MCP tools (so Claude can call `derive_spec`, `score_spec`,
+etc. as structured tool calls), continue with the MCP install below.
+
+---
+
 ## Install
 
 Requires **Python ≥ 3.11**.

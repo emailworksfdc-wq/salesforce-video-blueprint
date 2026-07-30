@@ -83,6 +83,25 @@ for any AI harness, a [Python API](#2--python-library), and a [CLI](#3--command-
 That is packaging, not progress against the table above: all three run the same
 offline pipeline, and all three stay offline unless you ask for an org.
 
+**Using Claude Code?** Install the bundled skill for the fastest on-ramp — it
+teaches Claude how to drive the CLI and all MCP tools, fires automatically on
+phrases like "capture my Salesforce process", and includes a full flag reference
+and troubleshooting guide:
+
+```bash
+# Global (all your projects)
+mkdir -p ~/.claude/skills
+curl -fsSL https://raw.githubusercontent.com/emailworksfdc-wq/salesforce-video-blueprint/main/skills/sf-blueprint.md \
+  -o ~/.claude/skills/sf-blueprint.md
+
+# Or project-scoped
+cp skills/sf-blueprint.md .claude/skills/sf-blueprint.md
+```
+
+**Using any other MCP client?** The repo ships a `.mcp.json` at its root — clone
+the repo and the server is already wired up. See [docs/mcp-install.md](docs/mcp-install.md)
+for Claude Desktop, Cursor, Windsurf, and `uvx` configs.
+
 Two code paths can contact one, both opt-in and neither of which deploys anything
 — the CLI POSTs the local file to the compile endpoint:
 
