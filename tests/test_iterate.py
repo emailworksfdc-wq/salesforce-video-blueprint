@@ -1415,7 +1415,6 @@ def test_org_feedback_non_terminal_rounds_have_no_stop_reason(tmp_path: Path) ->
         (tmp_path / "stage5" / "round-3" / "round.json").read_text(encoding="utf-8")
     )
     assert "stop_reason" in terminal_payload
-=======
 
 # =============================================================================
 # === TEST: write_iteration_summary ===
