@@ -654,6 +654,10 @@ class Stage5Round:
     score_before: Any = None
     score_after: Any = None
     blocking_issues: list[str] = field(default_factory=list)
+    # Written by refine_with_org_feedback when this is the terminal round of a loop
+    # that stopped early. ``None`` means the loop was not stopped early by this round
+    # (i.e. the loop ran to completion or the stopping check has not been evaluated yet).
+    stop_reason: str | None = None
 
     @property
     def trustworthy(self) -> bool:
@@ -685,6 +689,10 @@ class Stage5Round:
                     "blocking_issues": list(score.blocking_issues),
                 }
             )
+        # Only include stop_reason when it is set; absent means the round was not the
+        # terminal round of an early-stopped loop, not that the reason is unknown.
+        if self.stop_reason is not None:
+            payload["stop_reason"] = self.stop_reason
         return payload
 
 

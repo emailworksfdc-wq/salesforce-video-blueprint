@@ -979,3 +979,437 @@ def test_unknowns_deletion_warning_on_read_error(tmp_path):
         assert any("could not read parent spec" in note.lower() for note in v2_notes), (
             f"Expected read-error warning in v2 notes, got: {v2_notes}"
         )
+
+# ============================================================================
+# === TESTS: refine_with_org_feedback stopping conditions ====================
+# ============================================================================
+#
+# Each test uses an injected runner so no org is needed.  An injected runner
+# stamps feedback with source=INJECTED_RUNNER_SOURCE, which is NOT in
+# REAL_FEEDBACK_SOURCES, so every round is correctly marked untrustworthy and
+# the spec is NOT carried forward.  That means:
+# - The spec's score_after stays constant (same spec is re-scored every round)
+# - The identical_score_plateau condition fires predictably
+# - The gate_pass condition fires only when the spec itself is already above
+#   PASS_THRESHOLD with no blocking issues
+#
+# Helper builders are local to this section to keep each test self-contained.
+
+def _make_org_runner(payload_json: str):
+    """Return a (runner, calls) pair that records every invocation."""
+    import json as _json
+
+    calls: list[list[str]] = []
+
+    class Done:
+        returncode = 0
+        stdout = payload_json
+        stderr = ""
+
+    def runner(cmd, timeout):
+        calls.append(cmd)
+        return Done()
+
+    return runner, calls
+
+
+def _run_eval_payload_json() -> str:
+    """Return the real fixture as a JSON string for the injected runner."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    fixture = _Path(__file__).parent / "fixtures" / "run_eval_aft3_coral_cloud_booking.json"
+    return fixture.read_text(encoding="utf-8")
+
+
+def _make_passing_spec() -> DerivedAgentSpec:
+    """A spec that scores >= PASS_THRESHOLD=75 with no blocking issues.
+
+    Verified to score 82/100 (passed=True, blocking=[]) both before and after
+    apply_feedback with synthetic feedback. Used to test gate_pass: the spec
+    already satisfies the gate, so gate_pass fires on round 1 regardless of
+    the runner used.
+
+    This uses the same construction as test_stage5._make_spec() which has been
+    confirmed to score 82 with no blocking issues.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case (Status)",
+        confidence=0.7,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("data-delta", "Case.Status observed")],
+            )
+        ],
+        orchestration_steps=["Resolve the Case", "SUBMIT on button:Save -> writes Status"],
+        guardrails=["Require explicit user confirmation before writing: Status."],
+        failure_handling=["No failures were observed in this run, so error paths are UNTESTED."],
+        unknowns=["Action API names were not observed."],
+        evidence=[SpecEvidence("dom-capture", "8 events observed")],
+    )
+
+
+def _make_stalling_spec() -> DerivedAgentSpec:
+    """A spec that scores well below PASS_THRESHOLD and stays flat across rounds.
+
+    Uses inference-only evidence (no dom-capture/telemetry) so evidence_grounding
+    stays near zero, keeping the total safely under 75.  apply_feedback with a
+    synthetic (injected-runner) result adds an 'unvalidated' unknown but does not
+    change the score because the honesty dimension is already penalised by the
+    blocking issues.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case Status field value in the record",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("inference", "inferred from recording context")],
+            )
+        ],
+        orchestration_steps=[
+            "Navigate to the Case record by record identifier",
+            "Locate the Status field on the Case detail layout",
+            "Update the Status field to the desired new value",
+            "Submit the form to persist the Status change",
+        ],
+        guardrails=[
+            "Require explicit confirmation before writing Status field",
+            "Enforce field-level security on Case.Status",
+        ],
+        failure_handling=["Observed validation error: Status value was rejected by the server"],
+        unknowns=["Exact Action API name was not observed in the recording"],
+        evidence=[SpecEvidence("inference", "inferred from user-click sequence")],
+    )
+
+
+# --- Stopping condition 1: gate_pass ---
+
+def test_org_feedback_stops_when_gate_passes(tmp_path: Path) -> None:
+    """refine_with_org_feedback stops after the first round when the spec passes the gate.
+
+    The fixture uses _make_passing_spec() which already scores >= PASS_THRESHOLD
+    with no blocking issues.  apply_feedback with synthetic results does not lower
+    the score, so gate_pass fires on round 1 even though rounds=5 was requested.
+
+    Assertions:
+    - Only 1 round returned (early exit, not all 5)
+    - The round's stop_reason starts with 'gate_pass:'
+    - The round.json on disk contains a 'stop_reason' field
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+    from sf_video_blueprint.spec_score import PASS_THRESHOLD
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_passing_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=5,
+        runner=runner,
+    )
+
+    # Only one round should have run (gate fired immediately)
+    assert len(rounds) == 1, (
+        f"Expected 1 round (gate_pass), got {len(rounds)}. "
+        f"stop_reason of last round: {rounds[-1].stop_reason!r}"
+    )
+    assert len(calls) == 1, f"Expected 1 org call, got {len(calls)}"
+
+    # The terminal round must carry the stop_reason
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("gate_pass:"), (
+        f"Expected stop_reason to start with 'gate_pass:', got: {terminal.stop_reason!r}"
+    )
+    assert str(PASS_THRESHOLD) in terminal.stop_reason
+
+    # The round.json on disk must include stop_reason
+    round_json_path = tmp_path / "stage5" / "round-1" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for gate_pass round"
+    assert payload["stop_reason"].startswith("gate_pass:"), payload["stop_reason"]
+
+
+# --- Stopping condition 2: identical_score_plateau ---
+
+def test_org_feedback_stops_on_three_identical_scores(tmp_path: Path) -> None:
+    """refine_with_org_feedback stops after 3 consecutive identical scores.
+
+    The fixture uses _make_stalling_spec() which scores flat with synthetic
+    feedback.  With rounds=10, the loop should stop at round 3 (the third
+    consecutive identical score triggers the plateau condition).
+
+    Assertions:
+    - Exactly 3 rounds returned
+    - The terminal round's stop_reason starts with 'identical_score_plateau:'
+    - The round.json of round 3 contains stop_reason
+    - Rounds 1 and 2 do NOT have a stop_reason (they did not terminate the loop)
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        runner=runner,
+    )
+
+    # Should stop at round 3 (three consecutive identical scores)
+    assert len(rounds) == 3, (
+        f"Expected 3 rounds (identical_score_plateau after 3), got {len(rounds)}. "
+        f"Scores: {[r.score_after.total for r in rounds if r.score_after]}"
+    )
+    assert len(calls) == 3, f"Expected 3 org calls, got {len(calls)}"
+
+    # All three scores must be identical
+    scores = [r.score_after.total for r in rounds if r.score_after is not None]
+    assert len(set(scores)) == 1, f"Expected identical scores, got: {scores}"
+
+    # Terminal round has the stop_reason; earlier rounds do not
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("identical_score_plateau:"), (
+        f"Expected stop_reason to start with 'identical_score_plateau:', got: {terminal.stop_reason!r}"
+    )
+    assert "3 consecutive" in terminal.stop_reason
+
+    # Non-terminal rounds must NOT have a stop_reason
+    for r in rounds[:-1]:
+        assert r.stop_reason is None, (
+            f"Round {r.round_number} should not have a stop_reason, got: {r.stop_reason!r}"
+        )
+
+    # Terminal round.json must include stop_reason
+    round_json_path = tmp_path / "stage5" / "round-3" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for plateau round"
+    assert payload["stop_reason"].startswith("identical_score_plateau:"), payload["stop_reason"]
+
+    # Earlier rounds must NOT have stop_reason in their JSON
+    for n in (1, 2):
+        prev_json = tmp_path / "stage5" / f"round-{n}" / "round.json"
+        prev_payload = json.loads(prev_json.read_text(encoding="utf-8"))
+        assert "stop_reason" not in prev_payload, (
+            f"round-{n}.json should not have stop_reason, got: {prev_payload.get('stop_reason')!r}"
+        )
+
+
+# --- Stopping condition 3: max_no_improvement ---
+
+def test_org_feedback_stops_on_max_no_improvement(tmp_path: Path) -> None:
+    """refine_with_org_feedback stops when max_no_improvement consecutive rounds
+    pass without the score going up.
+
+    Uses _make_stalling_spec() (flat score) with max_no_improvement=1 and
+    rounds=10.  The score never improves, so after 1 no-improvement round
+    the loop stops.
+
+    Counting: round 1 sets best_score_seen=S and no_improvement_streak=0.
+    Round 2 scores S again (not > S) -> streak=1 >= max_no_improvement=1 -> stop.
+    2 rounds total.
+
+    max_no_improvement=1 is chosen deliberately so the stopping condition fires
+    at round 2, before the identical_score_plateau condition (which fires at
+    round 3).  This avoids ambiguity about which condition takes precedence when
+    two conditions fire simultaneously.
+
+    Assertions:
+    - Exactly 2 rounds returned (1 baseline + 1 no-improvement)
+    - Terminal round's stop_reason starts with 'max_no_improvement:'
+    - round.json of the terminal round contains stop_reason
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        max_no_improvement=1,
+        runner=runner,
+    )
+
+    # Should stop at round 2 (round 1 = baseline, round 2 = no improvement)
+    assert len(rounds) == 2, (
+        f"Expected 2 rounds (max_no_improvement=1), got {len(rounds)}. "
+        f"Scores: {[r.score_after.total for r in rounds if r.score_after]}"
+    )
+
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("max_no_improvement:"), (
+        f"Expected stop_reason to start with 'max_no_improvement:', got: {terminal.stop_reason!r}"
+    )
+    assert "limit=1" in terminal.stop_reason
+
+    # Terminal round.json must include stop_reason
+    round_json_path = tmp_path / "stage5" / "round-2" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for max_no_improvement round"
+    assert payload["stop_reason"].startswith("max_no_improvement:"), payload["stop_reason"]
+
+
+def test_org_feedback_max_no_improvement_triggers_at_limit_1(tmp_path: Path) -> None:
+    """max_no_improvement=1 stops after the first round without a score increase.
+
+    Round 1 sets best=S.  Round 2 also returns S -> no improvement -> streak=1
+    >= max_no_improvement=1 -> stop.  2 rounds total.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        max_no_improvement=1,
+        runner=runner,
+    )
+
+    assert len(rounds) == 2, (
+        f"Expected 2 rounds (max_no_improvement=1: 1 baseline + 1 no-improvement), got {len(rounds)}"
+    )
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None
+    assert terminal.stop_reason.startswith("max_no_improvement:")
+    assert "limit=1" in terminal.stop_reason
+
+
+def test_org_feedback_max_no_improvement_invalid_value_raises(tmp_path: Path) -> None:
+    """max_no_improvement < 1 must raise ValueError."""
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    with pytest.raises(ValueError, match="max_no_improvement must be >= 1"):
+        refine_with_org_feedback(
+            _make_stalling_spec(),
+            out_dir=tmp_path,
+            org_alias="AFT3",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            max_no_improvement=0,
+        )
+
+
+def test_org_feedback_max_no_improvement_none_does_not_stop_loop(tmp_path: Path) -> None:
+    """max_no_improvement=None (the default) means the condition is disabled.
+
+    With a stalling spec and 3 rounds budget, the loop should run all 3 rounds
+    (stopped only by the identical_score_plateau after round 3, not by
+    max_no_improvement since it is None).
+
+    This also verifies that not passing max_no_improvement at all doesn't
+    accidentally enable the condition with some default limit.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=3,
+        # max_no_improvement not passed -> None -> disabled
+        runner=runner,
+    )
+
+    # Without max_no_improvement, the loop runs 3 rounds (stopped by the
+    # identical_score_plateau condition after the 3rd identical score).
+    assert len(rounds) == 3, f"Expected 3 rounds without max_no_improvement, got {len(rounds)}"
+    assert len(calls) == 3
+
+
+def test_org_feedback_gate_pass_stop_reason_written_to_disk(tmp_path: Path) -> None:
+    """stop_reason must appear in round.json when gate_pass fires.
+
+    This is the audit-trail contract: a reader opening round.json for the
+    terminal round must be able to see WHY the loop ended without reading any
+    other file.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+    from sf_video_blueprint.spec_score import PASS_THRESHOLD
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    refine_with_org_feedback(
+        _make_passing_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=3,
+        runner=runner,
+    )
+
+    # round-1 is the terminal round; it must have stop_reason in its JSON
+    payload = json.loads(
+        (tmp_path / "stage5" / "round-1" / "round.json").read_text(encoding="utf-8")
+    )
+    assert "stop_reason" in payload
+    assert "gate_pass" in payload["stop_reason"]
+    assert str(PASS_THRESHOLD) in payload["stop_reason"]
+
+    # round-2 and round-3 must NOT exist (loop stopped at 1)
+    assert not (tmp_path / "stage5" / "round-2").exists(), "No round-2 should exist after gate_pass"
+
+
+def test_org_feedback_non_terminal_rounds_have_no_stop_reason(tmp_path: Path) -> None:
+    """Non-terminal rounds must NOT carry a stop_reason field in round.json.
+
+    Only the round that actually triggered a stopping condition should have
+    stop_reason in its JSON.  Earlier rounds having it would imply the loop
+    was stopped early on every round, which is false.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        runner=runner,
+    )
+
+    # Loop stops at round 3 due to identical_score_plateau.
+    # Rounds 1 and 2 must have no stop_reason.
+    assert len(rounds) == 3
+    for n in (1, 2):
+        payload = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert "stop_reason" not in payload, (
+            f"round-{n}.json must not contain stop_reason; "
+            f"only the terminal round should. Got: {payload.get('stop_reason')!r}"
+        )
+
+    # Round 3 IS the terminal and must have stop_reason.
+    terminal_payload = json.loads(
+        (tmp_path / "stage5" / "round-3" / "round.json").read_text(encoding="utf-8")
+    )
+    assert "stop_reason" in terminal_payload
