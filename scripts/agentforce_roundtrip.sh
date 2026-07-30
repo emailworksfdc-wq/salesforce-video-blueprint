@@ -305,7 +305,7 @@ if [[ -n "${SPEC_IN}" ]]; then
 else
   DERIVED_SPEC="${OUT_DIR}/roundtrip.agent-spec.json"
   set +e
-  "${PY_BIN}" -m sf_video_blueprint.cli \
+  "${PY_BIN}" -m sf_video_blueprint.cli run \
     --capture "${CAPTURE}" \
     --org-url "${ORG_INSTANCE:-https://example-dev.develop.my.salesforce.com}" \
     --output-path "${OUT_DIR}/roundtrip.html" \

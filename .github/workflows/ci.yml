@@ -75,7 +75,7 @@ jobs:
 
       - name: Run the pipeline on the example capture
         run: |
-          python -m sf_video_blueprint.cli \
+          python -m sf_video_blueprint.cli run \
             --capture examples/case_triage.dom_capture.jsonl \
             --org-url "https://example-dev.develop.my.salesforce.com" \
             --output-path outputs/ci_smoke.html

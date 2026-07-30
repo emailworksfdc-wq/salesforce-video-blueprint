@@ -9,6 +9,76 @@ While the major version is `0`, the public API may change in any minor release.
 
 ## [Unreleased]
 
+### Added — one-click capture pipeline
+
+Recording a Salesforce process was a manual, multi-step affair: launch the
+injector script by hand, remember the timestamped filename it chose, pass that
+path to a separate `run` invocation, then find and run `iterate.py` separately.
+Lanes B01–B09 replace those three loose ends with one integrated pipeline.
+
+- **`sf-blueprint capture` sub-command (B02).** `capture/inject.py`'s main
+  function is now wired as a first-class CLI sub-command:
+  `sf-blueprint capture --org-alias <alias> --process-name <slug>`. The capture
+  module is lazy-imported, so `cli.py` stays importable on machines that only
+  have the base package; a missing `playwright` prints an install hint instead of
+  a stack trace.
+
+- **`--process-name` manifest field (B01).** The injector now requires a
+  slug-safe process name (`case-creation`, `case-status-update`, etc.) at
+  startup, validated before any side-effect runs. The name flows into:
+  the output filename (`<process_name>_<timestamp>.dom_capture.jsonl`), a JSONL
+  header record so the file is self-describing without the manifest, and the
+  manifest JSON's `process_name` key. The manifest is also enriched with
+  `sf_cli_version` and `playwright_mcp_version` so a capture can be re-examined
+  alongside the tool versions that produced it.
+
+- **Live streaming counter (B05).** During a capture session a background thread
+  prints a counter line every five seconds (`[inject] 🔴 Recording — N events
+  captured (M network), K errors. Elapsed: Xs`), overwriting the previous line
+  in place. A final `Recording ended — N events total` line appears when the
+  operator presses Enter. `live_counter_line` and `start_live_counter` are the
+  new public helpers.
+
+- **Deny-list integration in the capture layer (B04).** `assert_org_is_safe` in
+  `capture/inject.py` now delegates to `org_denylist.is_org_blocked` rather than
+  a bare `in BLOCKED_ORG_ALIASES` set test. The previous check missed lowercase
+  spellings, username forms, and instance-URL forms of the blocked aliases. The
+  function also gains a URL-pattern fallback for the `isSandbox` key missing from
+  `sf org display` output since CLI 2.143.6, which was causing the guard to refuse
+  legitimate Developer Edition orgs.
+
+- **Redaction audit findings at capture time (B03).** After the operator presses
+  Enter, `validate_trace()` now runs automatically on the just-written JSONL.
+  `SECURITY CRITICAL` or `DATA LOSS` findings abort with exit code 1 so the
+  operator sees failures immediately rather than hours later when the pipeline
+  runs. `EVIDENCE INCOMPLETE` findings print as warnings. A clean trace prints a
+  success line. Operators no longer need to run validation separately.
+
+- **`selector_confidence` field (B08).** `recorder.js` now scores each captured
+  event's selector quality and writes it to the JSONL:
+  `1.0` when both `role` and `name` are present (deterministic replay);
+  `0.5` for role-only or a stable `data-id`/`testid` attribute;
+  `0.1` for `null`/`null` (bare LWC shadow element, CSS-path only).
+  A `selector_fallback` field records the best non-null alternative identifier
+  (`aria-label > data-id > innerText[:40] > null`). `RawSelectors` in
+  `dom_capture.py` gains both as optional fields so pre-B08 captures still parse
+  without errors.
+
+- **`sf-blueprint run --last-capture` (B06).** After recording, the operator no
+  longer needs to look up the timestamped filename. `--last-capture` scans
+  `--capture-dir` (default `./outputs/capture`) for the most recently modified
+  `*.dom_capture.jsonl` and prints which file it chose alongside its event count
+  from the companion manifest. When both `--last-capture` and `--capture` are
+  supplied, `--capture` wins and a warning is printed.
+
+The full one-click flow is now:
+
+```bash
+sf-blueprint capture --org-alias <alias> --process-name <slug>
+sf-blueprint run --last-capture --org-url "https://your-org.my.salesforce.com"
+sf-blueprint iterate --spec outputs/capture/<slug_timestamp>.agent-spec.json
+```
+
 ### Fixed — the score gate was scoring the wrong things
 
 The gate is the component that decides whether a derived spec is fit to become an
@@ -245,6 +315,60 @@ backwards is a semantic decision about what may be claimed as caused.
 *(Resolved in this release — see "the first real Salesforce capture" above.
 `test_c11_on_lane_02_real_capture_when_available` now runs against the committed
 artifact instead of skipping.)*
+
+### Added — iterate loop: sf agent test integration hardened
+
+`iterate.refine_with_org_feedback` closes the offline loop against a live
+Agentforce agent. Each round emits a test spec, runs it via `sf agent test
+run-eval`, parses the real per-case verdicts, folds them into the spec as added
+observations, and re-scores. Every round is written to its own `round-N/`
+directory under the caller-supplied output path; `write_round` refuses to
+overwrite an existing round before writing a byte or spending an org LLM call.
+
+**`sf agent test run-eval` is the only command that executes.** Measured against
+AFT3: `sf agent test create` is refused by the Metadata API with "Not available
+for deploy for this organization", so the deploy-then-run path is unavailable on
+Developer Edition. `run-eval` accepts only the legacy `AiEvaluationDefinition`
+dialect. `select_dialect_for_run_eval()` enforces this locally — a caller
+supplying an NGT spec gets a precise error before any org call is made.
+
+**Stopping conditions.** `iterate.refine` (offline loop) stops when: (a) score
+≥ `PASS_THRESHOLD` with no blocking issues — reported as `"threshold"`; (b)
+score regresses — best version is preserved and the loop stops immediately; (c)
+improvement < `epsilon` for two consecutive rounds — reported as `"converged"`;
+or (d) `max_rounds` is exhausted. `refine_with_org_feedback` runs exactly
+`rounds` round-trips; the caller supplies the budget. In both cases the final
+`stop_reason` string in the report names which condition fired.
+
+**Provenance enforcement.** An injected test runner (for tests) stamps feedback
+`"injected-runner"`, which is not in `REAL_FEEDBACK_SOURCES` and is refused by
+`feedback_blocking_issues`. Fabricated org results cannot be carried forward into
+the loop: only feedback stamped `"run-eval"` is `trustworthy`, and only
+trustworthy rounds advance the spec.
+
+**Report format.** `write_iteration_report(path, result)` writes two files:
+`iteration_report.json` — a machine-readable audit trail with `rounds_run`,
+`converged`, `stop_reason`, `best_version`, and a per-version array of scores,
+bands, blocking issues, and recommendations — and `iteration_report.md`, a
+Markdown table with one row per round, a delta column, and a final
+Recommendations section. Per-round org call output is written to
+`round-N/round.json` (and the emitted `testSpec.yaml` to `round-N/testSpec.yaml`
+as a round-scoped artifact). Session IDs are redacted before any file is written.
+
+**What the loop can and cannot learn.** `apply_feedback` may only ADD
+observations derived from real agent verdicts — it never deletes an unknown,
+never raises confidence, and never invents an entity or topic. A loop allowed to
+delete caveats would optimise straight to a meaningless 100; the constraint is
+structural, not advisory. One counter-intuitive consequence, recorded rather than
+hidden: a failing round can raise the score, because the rubric awards honesty
+points for each declared unknown and a failed case adds one. `stage5_round`
+emits an explicit note in `round.json` whenever the score rises on a round that
+carried failures.
+
+**`emit_test_spec` MCP tool.** The MCP server's existing `emit_test_spec` tool
+produces either dialect offline. The `note` field in its response discloses that
+`sf agent test create/run/results` is not invoked by the server — the tool
+emits the spec but does not run it.
 
 ## [0.1.1] — 2026-07-26
 

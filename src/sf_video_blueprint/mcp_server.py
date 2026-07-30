@@ -7,11 +7,17 @@ Continue, or anything else that speaks the Model Context Protocol.
 
 Design notes worth knowing before adding a tool here:
 
-**Every tool is read-only and offline.** Nothing in this server contacts a
-Salesforce org, launches a browser, or writes outside an explicitly supplied
-output path. An agent driving this server cannot mutate an org through it. That is
-deliberate: an LLM deciding on its own to replay recorded clicks against a live
+**Most tools are read-only and offline.** Nothing in the offline tools contacts a
+Salesforce org, launches a browser, or writes outside an explicitly supplied output
+path. An agent driving this server cannot mutate an org through those tools. That
+is deliberate: an LLM deciding on its own to replay recorded clicks against a live
 org is precisely the failure this project should not enable.
+
+**run_stage5_round and run_iterate contact a live org.** Both tools shell out to
+``sf agent test run-eval``, which sends test cases to a real Salesforce agent. They
+refuse forbidden org aliases (PPCDM, PPCaccenture) before any network call is made.
+Feedback stamped with a source outside :data:`stage5.REAL_FEEDBACK_SOURCES` is
+blocking and is never reported as evidence of a passing agent.
 
 **Tools return honest structure, not prose.** Each result carries provenance and,
 where relevant, the reasons a score was withheld. An agent that reads only the
@@ -90,8 +96,11 @@ conversational agent spec, an Agentforce Agent Script bundle, and test specs.
 Call `health` first: it lists this server's real limitations, several of which
 change how you should interpret the output.
 
-Every tool is offline and read-only. No tool contacts a Salesforce org, launches
-a browser, or modifies anything outside a path you explicitly pass.
+Most tools are offline and read-only. No tool in that set contacts a Salesforce
+org, launches a browser, or modifies anything outside a path you explicitly pass.
+Two tools are exceptions: `run_stage5_round` and `run_iterate` shell out to
+`sf agent test run-eval`, which sends test cases to a live agent in the org you
+supply. Both refuse PPCDM and PPCaccenture before any network call.
 
 Two things to carry into how you report results:
 
@@ -251,15 +260,24 @@ def health() -> dict[str, Any]:
             "emit_agent_bundle",
             "emit_test_spec",
             "preview_api_names",
+            "run_stage5_round",
+            "run_iterate",
         ],
         capabilities={
-            # Offline by default. `emit_agent_bundle` contacts an org only when
-            # given an org_alias, and even then it compiles rather than deploys:
-            # the file's contents are POSTed to the compile endpoint and no
-            # metadata is created. Every other tool is offline unconditionally.
-            "offline": "by default; emit_agent_bundle(org_alias=...) compiles against an org",
+            # Most tools are offline. Three tools contact an org when given an
+            # org_alias: emit_agent_bundle (compiles, never deploys),
+            # run_stage5_round, and run_iterate (both run sf agent test run-eval
+            # against a live agent). The two stage-5 tools refuse PPCDM and
+            # PPCaccenture before any network call is attempted.
+            "offline": (
+                "by default; emit_agent_bundle(org_alias=...) compiles against an org; "
+                "run_stage5_round and run_iterate call sf agent test run-eval against a live org"
+            ),
             "readOnly": True,
-            "contactsSalesforceOrg": "only when emit_agent_bundle is given an org_alias",
+            "contactsSalesforceOrg": (
+                "emit_agent_bundle when given org_alias; "
+                "run_stage5_round and run_iterate always (they require org_alias)"
+            ),
             "launchesBrowser": False,
             "telemetry": "mock-only — collecting real telemetry needs a live org",
         },
@@ -814,6 +832,310 @@ def preview_api_names(process_description: str) -> dict[str, Any]:
             "`sf agent publish authoring-bundle`. These names have never been "
             "round-tripped through a real org."
         ),
+    )
+
+
+def _spec_from_json(spec_json: str) -> Any:
+    """Deserialize a DerivedAgentSpec from its JSON representation.
+
+    Accepts the on-disk format written by spec_builder.write_spec — the same
+    shape that score_spec_file reads — so a caller can pipe the output of
+    derive_spec directly into run_stage5_round or run_iterate.
+
+    Raises:
+        ValueError: If the JSON is malformed or missing required keys.
+    """
+    from .spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
+
+    try:
+        data = json.loads(spec_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"spec_json is not valid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"spec_json must be a JSON object, got {type(data).__name__}")
+
+    entities = [
+        DerivedEntity(
+            name=ent.get("name") or "",
+            object_api_name=ent.get("object_api_name") or "",
+            field_api_name=ent.get("field_api_name") or "",
+            evidence=[
+                SpecEvidence(source=e.get("source") or "", detail=e.get("detail") or "")
+                for e in ent.get("evidence", [])
+            ],
+        )
+        for ent in data.get("entities", [])
+    ]
+    evidence = [
+        SpecEvidence(source=e.get("source") or "", detail=e.get("detail") or "")
+        for e in data.get("evidence", [])
+    ]
+    return DerivedAgentSpec(
+        intent=data.get("intent", ""),
+        confidence=float(data.get("confidence", 0.0)),
+        objects_touched=list(data.get("objects_touched", [])),
+        entities=entities,
+        orchestration_steps=list(data.get("orchestration_steps", [])),
+        guardrails=list(data.get("guardrails", [])),
+        failure_handling=list(data.get("failure_handling", [])),
+        unknowns=list(data.get("unknowns", [])),
+        evidence=evidence,
+    )
+
+
+@mcp.tool()
+def run_stage5_round(
+    spec_json: str,
+    org_alias: str,
+    agent_api_name: str,
+    test_spec_name: str,
+    out_dir: str,
+) -> dict[str, Any]:
+    """Run one stage-5 round: emit a test spec, run it against a live agent, fold verdicts in.
+
+    This is the tool that actually learns from a real Agentforce agent. It emits a
+    legacy AiEvaluationDefinition from the supplied spec, runs it against
+    ``agent_api_name`` in ``org_alias`` via ``sf agent test run-eval``, parses the
+    real per-case verdicts, folds them into the spec as added observations, and
+    re-scores. The round directory is written to ``out_dir/round-<N>`` and is
+    never overwritten.
+
+    Feedback that did not come from a live org (injected runners, fabricated
+    JSON) is blocked and reported as such. A round whose feedback is synthetic
+    produces blocking_issues and trustworthy=false; it never advances the spec.
+
+    Forbidden org aliases (PPCDM, PPCaccenture) are refused before any network
+    call is made.
+
+    Args:
+        spec_json: The DerivedAgentSpec as JSON (output of derive_spec.spec, or
+            written by score_spec). Must be the on-disk schema from spec_builder.
+        org_alias: Salesforce org alias for ``sf agent test run-eval``. Required.
+        agent_api_name: API name of the deployed Agentforce agent under test.
+        test_spec_name: Base name for the emitted AiEvaluationDefinition.
+        out_dir: Directory to write the round output. The round is written to
+            ``out_dir/round-1/`` (or the next available round number).
+    """
+    request_id = uuid4().hex[:12]
+    started = time.monotonic()
+    tool = "run_stage5_round"
+
+    from .org_validation import org_is_forbidden
+
+    if org_is_forbidden(org_alias):
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"Org alias {org_alias!r} is out of scope for this project and was refused.",
+            remedy="Use a Developer Edition or sandbox org you own.",
+        )
+
+    try:
+        spec = _spec_from_json(spec_json)
+    except ValueError as exc:
+        return _err(tool, request_id, started, ERROR_VALIDATION, f"Could not parse spec_json: {exc}")
+
+    try:
+        from .stage5 import (
+            assert_round_unwritten,
+            run_agent_eval,
+            stage5_round,
+            write_round,
+            RUN_EVAL_DIALECT,
+        )
+        from .eval_spec import build_legacy_test_spec, write_test_spec
+    except ImportError as exc:
+        return _err(tool, request_id, started, ERROR_DEPENDENCY, f"Required module not available: {exc}")
+
+    out = _resolve(out_dir)
+
+    # Determine the next round number from existing round-N directories.
+    existing = sorted(
+        int(d.name.split("-")[1])
+        for d in out.glob("round-*")
+        if d.is_dir() and d.name.split("-")[1:] and d.name.split("-")[1].isdigit()
+    )
+    round_number = (max(existing) + 1) if existing else 1
+
+    try:
+        assert_round_unwritten(out, round_number)
+    except Exception as exc:
+        return _err(tool, request_id, started, ERROR_VALIDATION, str(exc))
+
+    try:
+        round_dir = out / f"round-{round_number}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+
+        test_spec_obj, _derivations = build_legacy_test_spec(
+            spec, name=f"{test_spec_name}_r{round_number}", subject_name=agent_api_name
+        )
+        spec_path = write_test_spec(round_dir / "testSpec.yaml", test_spec_obj)
+
+        feedback = run_agent_eval(
+            spec_path,
+            org_alias=org_alias,
+            api_name=agent_api_name,
+            dialect=RUN_EVAL_DIALECT,
+        )
+
+        round_result = stage5_round(spec, feedback, round_number=round_number)
+        write_round(out, round_result)
+    except Exception as exc:  # noqa: BLE001
+        return _err(tool, request_id, started, ERROR_INTERNAL, f"Stage-5 round failed: {exc}")
+
+    rd = round_result.to_dict()
+    score_after = rd.get("score_after") or {}
+    score_before = rd.get("score_before") or {}
+    return _ok(
+        tool,
+        request_id,
+        started,
+        roundNumber=round_result.round_number,
+        trustworthy=round_result.trustworthy,
+        score=score_after.get("total"),
+        scoreBefore=score_before.get("total"),
+        passed=score_after.get("passed", False),
+        blockingIssues=round_result.blocking_issues,
+        stopReason=None,
+        findings=round_result.findings,
+        notes=round_result.notes,
+        feedbackSource=round_result.feedback.source,
+        feedbackIsReal=round_result.feedback.is_real,
+        caseCount=len(round_result.feedback.cases),
+        passedCount=round_result.feedback.passed_count,
+        failedCount=round_result.feedback.failed_count,
+        writtenTo=str(out / f"round-{round_number}" / "round.json"),
+    )
+
+
+@mcp.tool()
+def run_iterate(
+    spec_json: str,
+    org_alias: str,
+    agent_api_name: str,
+    test_spec_name: str,
+    out_dir: str,
+    rounds: int = 1,
+) -> dict[str, Any]:
+    """Run the stage-5 refinement loop: emit, evaluate against live agent, repeat.
+
+    Each round emits a legacy test spec, runs it against the live agent in
+    ``org_alias``, folds the real per-case verdicts into the spec as added
+    observations, and re-scores. The loop runs ``rounds`` times (default 1). The
+    spec carried forward is always the adjusted spec from the previous round,
+    but only when that round was trustworthy (real org feedback, no blocking
+    issues). A round with synthetic feedback annotates the spec as unvalidated
+    and does not advance it.
+
+    Round directories are written to ``out_dir/round-N/`` and are never
+    overwritten. An attempt to overwrite raises rather than silently replacing
+    the existing audit trail.
+
+    Forbidden org aliases (PPCDM, PPCaccenture) are refused before any network
+    call is made.
+
+    Args:
+        spec_json: The DerivedAgentSpec as JSON (output of derive_spec.spec, or
+            written by score_spec). Must be the on-disk schema from spec_builder.
+        org_alias: Salesforce org alias for ``sf agent test run-eval``. Required.
+        agent_api_name: API name of the deployed Agentforce agent under test.
+        test_spec_name: Base name for the emitted AiEvaluationDefinitions.
+        out_dir: Root directory for round output. Each round writes to
+            ``out_dir/round-N/``.
+        rounds: Number of round trips to run. Each costs real org LLM calls.
+            Must be >= 1. Default 1.
+    """
+    request_id = uuid4().hex[:12]
+    started = time.monotonic()
+    tool = "run_iterate"
+
+    from .org_validation import org_is_forbidden
+
+    if org_is_forbidden(org_alias):
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"Org alias {org_alias!r} is out of scope for this project and was refused.",
+            remedy="Use a Developer Edition or sandbox org you own.",
+        )
+
+    if rounds < 1:
+        return _err(
+            tool,
+            request_id,
+            started,
+            ERROR_VALIDATION,
+            f"rounds must be >= 1, got {rounds}",
+        )
+
+    try:
+        spec = _spec_from_json(spec_json)
+    except ValueError as exc:
+        return _err(tool, request_id, started, ERROR_VALIDATION, f"Could not parse spec_json: {exc}")
+
+    out = _resolve(out_dir)
+
+    try:
+        from .iterate import refine_with_org_feedback
+    except ImportError as exc:
+        return _err(tool, request_id, started, ERROR_DEPENDENCY, f"Required module not available: {exc}")
+
+    try:
+        round_results = refine_with_org_feedback(
+            spec,
+            out_dir=out,
+            org_alias=org_alias,
+            agent_api_name=agent_api_name,
+            test_spec_name=test_spec_name,
+            rounds=rounds,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(tool, request_id, started, ERROR_INTERNAL, f"Iterate failed: {exc}")
+
+    rounds_run = len(round_results)
+    last = round_results[-1] if round_results else None
+    last_dict = last.to_dict() if last else {}
+    score_after = last_dict.get("score_after") or {}
+    blocking = last.blocking_issues if last else []
+
+    # The stop reason for the iterate loop: trustworthy exit if any round passed,
+    # or summarise why the loop ended.
+    if last and last.trustworthy and score_after.get("passed"):
+        stop_reason = "passed"
+    elif last and not last.feedback.is_real:
+        stop_reason = "synthetic-feedback"
+    elif rounds_run >= rounds:
+        stop_reason = f"completed {rounds_run} round(s)"
+    else:
+        stop_reason = "unknown"
+
+    return _ok(
+        tool,
+        request_id,
+        started,
+        roundsRun=rounds_run,
+        finalScore=score_after.get("total"),
+        passed=score_after.get("passed", False),
+        blockingIssues=blocking,
+        stopReason=stop_reason,
+        rounds=[
+            {
+                "roundNumber": r.round_number,
+                "trustworthy": r.trustworthy,
+                "score": (r.to_dict().get("score_after") or {}).get("total"),
+                "passed": (r.to_dict().get("score_after") or {}).get("passed", False),
+                "blockingIssues": r.blocking_issues,
+                "feedbackSource": r.feedback.source,
+                "passedCount": r.feedback.passed_count,
+                "failedCount": r.feedback.failed_count,
+            }
+            for r in round_results
+        ],
     )
 
 

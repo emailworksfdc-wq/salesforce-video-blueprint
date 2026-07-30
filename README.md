@@ -68,11 +68,11 @@ deploy as an Agentforce agent* — the honest grade is roughly **58%**:
 
 | Stage | Status | Reality |
 | --- | --- | --- |
-| 1 · Record | 🟡 Partial | Real DOM recorder (`capture/recorder.js`, ~604 lines). Never run against a live org. Invoked by hand, not as a pipeline stage. |
+| 1 · Record | 🟢 Works | `sf-blueprint capture --org-alias <alias> --process-name <slug>` drives a headed browser, injects `capture/recorder.js`, streams a live event counter, runs `validate_trace` automatically on stop, and writes a timestamped JSONL with process-scoped filenames. First real capture (`case_creation_aft3.dom_capture.jsonl`) committed and verified through ingest. Safety: org deny-list enforced via `org_denylist.is_org_blocked` before any CLI call; `selector_confidence` field (0.1 / 0.5 / 1.0) and `selector_fallback` in every event. Requires `playwright install chromium`. |
 | 2 · Ingest | 🟡 Partial | Parses and validates capture traces. **Silently discards events in three known cases** — see [Known defects](#known-defects). |
 | 3 · Derive | 🟢 Works | The strongest part. Correlates, coalesces, derives intent and entities from observed evidence. Refuses to guess; caps confidence at 0.70. |
 | 4 · Score | 🟢 Works | Falsifiable 7-dimension gate. Bad specs measurably fail. Cannot be gamed by padding. |
-| 5 · Iterate | 🔴 Absent | `sf agent test create/run/results` appear **nowhere** in this repo. The offline loop scores 79/79/79 and reports `converged=true` — a loop that cannot change its input is not a loop. |
+| 5 · Iterate | 🟡 Partial | `sf agent test run-eval` is wired end-to-end via `stage5.run_agent_eval` and `iterate.refine_with_org_feedback`. Measured against AFT3: real per-case verdicts fold back as added observations and the score shifts. Still partial: `sf agent test create` is unavailable on Developer Edition, no round has been run against a published agent, and the loop has no CLI sub-command. |
 | 6 · Deploy | 🟡 Partial | Every emitter is written and unit-tested, and reachable from the MCP server. One emitted bundle (`SFVB_TEST_Case_Triage`, 2026-07-26) now **compiles** (`sf agent validate authoring-bundle` → exit 0) and **deploys** as `AiAuthoringBundle` metadata to a DE org, round-tripping byte-identically. Still partial: one intent shape only, no agent has been published, and nothing checks the compiled agent's behaviour — compilation is syntax, not semantics. |
 
 The two stages nearest to zero are the two the end goal names explicitly. This
@@ -148,10 +148,10 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 1386 passed, 1 skipped
+.venv/bin/python -m pytest -q          # 1657 passed, 1 skipped
 ```
 
-Without the `mcp` extra you get `1346 passed, 2 skipped` — the MCP server tests
+Without the `mcp` extra you get `1598 passed, 2 skipped` — the MCP server tests
 skip rather than fail when the optional dependency is absent.
 
 One skip is expected: an opt-in check that validates artifacts from a real
@@ -160,6 +160,27 @@ The score-gate assertion against a real recorded capture used to be the second
 skip; `examples/case_creation_aft3.dom_capture.jsonl` is now committed and
 survives ingest, so it runs. Everything else is hermetic — no org, no network,
 no credentials.
+
+### One-click capture from a real org
+
+If you have a Salesforce org authenticated with the CLI, the three-step flow is:
+
+```bash
+# Step 1: record a process (requires playwright install chromium first)
+sf-blueprint capture --org-alias <alias> --process-name case-creation
+
+# Step 2: run the pipeline on the just-recorded capture
+sf-blueprint run --last-capture \
+  --org-url "https://your-org.develop.my.salesforce.com"
+
+# Step 3: refine iteratively against the score gate
+sf-blueprint iterate --spec outputs/capture/case-creation_*.agent-spec.json
+```
+
+`--last-capture` scans `./outputs/capture/` for the most recently modified
+`*.dom_capture.jsonl` — no need to remember the timestamped filename.
+
+### Offline pipeline (bundled example)
 
 Then run the pipeline on the bundled example capture — **no Salesforce org, no
 network, no credentials required**:

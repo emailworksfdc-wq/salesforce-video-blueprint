@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -14,11 +15,19 @@ from .dom_extractor import DomCaptureExtractor
 from .extractor import HeuristicVideoExtractor
 from .html_report import AgentBlueprintSection, DataProvenance, MasterBlueprintRenderer
 from .models import ActionType, ExtractedAction
+from .org_validation import org_is_forbidden
 from .redaction import scrub_collected_telemetry
 from .replay import NoopUIAdapter, ReplayEngine, ReplayRunMetadata, SalesforceUIAdapter
 from .replay_browser import BrowserReplayAdapter
 from .salesforce_collectors import SalesforceRestClient, SalesforceTelemetryCollector
-from .spec_builder import build_agent_spec, write_spec
+from .spec_builder import (
+    DerivedAgentSpec,
+    DerivedEntity,
+    SpecEvidence,
+    build_agent_spec,
+    write_spec,
+)
+from .spec_score import PASS_THRESHOLD
 from .telemetry import (
     MockTelemetryCollector,
     TelemetryCollector,
@@ -27,6 +36,77 @@ from .telemetry import (
 )
 
 app = typer.Typer(help="Generate Salesforce process blueprint from video inputs.")
+
+
+# ---------------------------------------------------------------------------
+# capture sub-command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def capture(
+    org_alias: str = typer.Option(..., help="Salesforce org alias or username"),
+    out_dir: Path = typer.Option(
+        Path("./outputs/capture"),
+        help="Output directory for JSONL and manifest",
+    ),
+    start_url: str | None = typer.Option(
+        None,
+        help="Optional starting URL (defaults to org home after frontdoor)",
+    ),
+    note: str | None = typer.Option(
+        None,
+        help="Operator description of the process being recorded",
+    ),
+) -> None:
+    """Launch a headed browser, inject the DOM recorder, and collect events to JSONL.
+
+    A human operator performs the business process in the browser. Press Enter
+    in the terminal when done. Requires playwright to be installed:
+
+        pip install playwright && playwright install chromium
+
+    The output artifacts (dom_capture.jsonl, dom_capture.network.jsonl,
+    dom_capture.manifest.json) can then be passed to 'sf-blueprint run
+    --capture <out_dir>/dom_capture.jsonl'.
+    """
+    # Guard: confirm playwright is importable before we attempt anything else.
+    # This must be a lazy import -- importing playwright at module load time would
+    # make the entire CLI un-importable on machines that only have the base package.
+    import importlib as _importlib
+
+    try:
+        _importlib.import_module("playwright.sync_api")
+    except ModuleNotFoundError:
+        typer.secho(
+            "ERROR: playwright is not installed. The 'capture' sub-command requires it.\n"
+            "Install it with:\n"
+            "    pip install playwright\n"
+            "    playwright install chromium",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Lazy-import the capture module so this file stays importable without playwright.
+    # Try the project-root package path (normal development / installed layout).
+    try:
+        _inject = _importlib.import_module("capture.inject")
+    except ModuleNotFoundError as exc:
+        typer.secho(
+            f"ERROR: Could not import the capture module: {exc}\n"
+            "Ensure capture/inject.py is present in the project root.",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    _inject.main(
+        org_alias=org_alias,
+        out_dir=out_dir,
+        start_url=start_url,
+        note=note,
+    )
+
 
 
 def _redact_sensitive_url(url: str) -> str:
@@ -55,6 +135,95 @@ def _parse_tracked_records(values: list[str]) -> list[tuple[str, str]]:
     return parsed
 
 
+
+
+def _load_spec_from_json(spec_path: Path) -> DerivedAgentSpec:
+    """Reconstruct a DerivedAgentSpec from a JSON file written by write_spec.
+
+    The JSON schema mirrors DerivedAgentSpec.to_dict() plus a top-level
+    provisioning key which is ignored here (it belongs to the run, not the spec).
+    """
+    data = json.loads(spec_path.read_text(encoding="utf-8"))
+    entities = [
+        DerivedEntity(
+            name=e["name"],
+            object_api_name=e.get("object_api_name"),
+            field_api_name=e.get("field_api_name"),
+            evidence=[
+                SpecEvidence(source=ev["source"], detail=ev["detail"])
+                for ev in e.get("evidence", [])
+            ],
+        )
+        for e in data.get("entities", [])
+    ]
+    evidence = [
+        SpecEvidence(source=ev["source"], detail=ev["detail"])
+        for ev in data.get("evidence", [])
+    ]
+    return DerivedAgentSpec(
+        intent=data["intent"],
+        confidence=float(data["confidence"]),
+        objects_touched=list(data.get("objects_touched", [])),
+        entities=entities,
+        orchestration_steps=list(data.get("orchestration_steps", [])),
+        guardrails=list(data.get("guardrails", [])),
+        failure_handling=list(data.get("failure_handling", [])),
+        unknowns=list(data.get("unknowns", [])),
+        evidence=evidence,
+    )
+
+def find_last_capture(capture_dir: Path) -> "Path | None":
+    """Find the most recently modified ``*.dom_capture.jsonl`` file under *capture_dir*.
+
+    The function scans only the immediate children of *capture_dir* and returns
+    the file with the highest ``st_mtime``.  If the directory does not exist or
+    contains no matching files, ``None`` is returned.
+
+    Args:
+        capture_dir: Directory to search (e.g. ``./outputs/capture``).
+
+    Returns:
+        The most recently modified ``.dom_capture.jsonl`` file, or ``None`` if
+        the directory is empty or does not exist.
+    """
+    if not capture_dir.exists():
+        return None
+    candidates = sorted(
+        capture_dir.glob("*.dom_capture.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _read_event_count_from_manifest(capture_path: Path) -> "int | None":
+    """Read the ``event_count`` field from the companion manifest, if it exists.
+
+    The manifest is expected to be a JSON file whose name is derived from the
+    capture file by replacing ``.dom_capture.jsonl`` with
+    ``.dom_capture.manifest.json``.
+
+    Args:
+        capture_path: Path to the ``.dom_capture.jsonl`` capture file.
+
+    Returns:
+        The integer ``event_count`` from the manifest, or ``None`` if the
+        manifest is absent or unparseable.
+    """
+    # The companion manifest lives next to the capture file.
+    # Naming convention (B01): <stem>.dom_capture.manifest.json
+    # where <stem>.dom_capture.jsonl is the capture.
+    stem = capture_path.name.removesuffix(".dom_capture.jsonl")
+    manifest_path = capture_path.parent / f"{stem}.dom_capture.manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        count = data.get("event_count")
+        return int(count) if count is not None else None
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
+
 @app.command()
 def run(
     video_path: Path = typer.Argument(
@@ -68,6 +237,18 @@ def run(
         exists=True,
         help="Path to a dom_capture.jsonl produced by capture/inject.py. This is "
         "real observed evidence and is preferred over the video path.",
+    ),
+    last_capture: bool = typer.Option(
+        False,
+        "--last-capture",
+        help="Use the most recently modified *.dom_capture.jsonl found under "
+        "--capture-dir (default: ./outputs/capture). Ignored (with a warning) "
+        "if --capture is also specified.",
+    ),
+    capture_dir: Path = typer.Option(
+        Path("./outputs/capture"),
+        help="Directory searched by --last-capture. Has no effect unless "
+        "--last-capture is also given.",
     ),
     org_url: str = typer.Option(..., help="Target Salesforce org URL."),
     username: str = typer.Option("analyst@example.com", help="Replay username for trace metadata."),
@@ -91,6 +272,32 @@ def run(
         help="Record to monitor for field diffs; format ObjectApiName:RecordId. Repeatable.",
     ),
 ) -> None:
+    # --last-capture resolution: find the most recent *.dom_capture.jsonl in
+    # capture_dir and use it as --capture, unless --capture was already given.
+    if last_capture:
+        if capture is not None:
+            typer.secho(
+                "WARNING: --last-capture is ignored because --capture was also specified. "
+                "Using explicit --capture path.",
+                fg=typer.colors.YELLOW,
+            )
+        else:
+            found = find_last_capture(capture_dir)
+            if found is None:
+                typer.secho(
+                    f"ERROR: --last-capture found no *.dom_capture.jsonl files under "
+                    f"{capture_dir}. Run 'sf-blueprint capture' first, or pass an "
+                    "explicit path with --capture.",
+                    fg=typer.colors.RED,
+                    bold=True,
+                )
+                raise typer.Exit(code=1)
+            event_count = _read_event_count_from_manifest(found)
+            count_msg = f" ({event_count} events)" if event_count is not None else ""
+            typer.echo(f"--last-capture: using {found}{count_msg}")
+            capture = found
+    
+    
     if capture is not None:
         # Real observed evidence: a DOM trace recorded click-by-click from the org.
         # CRITICAL SECURITY BOUNDARY: validate_trace must run BEFORE extraction
@@ -307,6 +514,214 @@ def run(
     for unknown in spec.unknowns:
         typer.secho(f"UNKNOWN: {unknown}", fg=typer.colors.YELLOW)
 
+
+
+
+
+@app.command()
+def refine(
+    spec_json: Path = typer.Argument(
+        ...,
+        help="Path to an agent-spec.json produced by the 'run' command.",
+        exists=True,
+    ),
+    out_dir: Path = typer.Option(
+        Path("./outputs/iterations"),
+        help="Output directory. Each round is written to a versioned sub-directory (v1/, v2/, ...).",
+    ),
+    company_name: str = typer.Option("Acme Corp", help="Company name for the agent spec YAML."),
+    company_description: str = typer.Option(
+        "A company using Salesforce.",
+        help="Company description for the agent spec YAML.",
+    ),
+    max_rounds: int = typer.Option(5, help="Maximum number of refinement rounds."),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="Write a human-readable Markdown summary to <out_dir>/iteration_summary.md.",
+    ),
+) -> None:
+    """Iteratively refine an agent spec using the offline scoring loop.
+
+    Reads an agent-spec.json, scores it, applies deterministic improvements, and
+    writes versioned outputs to <out_dir>/v1/, v2/, etc.  Stops when the spec
+    passes the quality gate, converges, or reaches --max-rounds.
+
+    Use --summary to also write <out_dir>/iteration_summary.md with a
+    human-readable view of what happened across all rounds.
+    """
+    from .iterate import refine, write_iteration_report, write_iteration_summary
+
+    spec = _load_spec_from_json(spec_json)
+
+    typer.echo(f"Loaded spec: {spec_json}")
+    typer.echo(f"Intent: {spec.intent}")
+    typer.echo(f"Output dir: {out_dir}")
+
+    result = refine(
+        spec,
+        out_dir=out_dir,
+        company_name=company_name,
+        company_description=company_description,
+        max_rounds=max_rounds,
+        use_cli=False,
+    )
+
+    # Always write the JSON report (machine-readable contract)
+    report_path = write_iteration_report(out_dir / "iteration_report", result)
+    typer.echo(f"Iteration report: {report_path}")
+
+    # Optionally write a human-readable Markdown summary
+    if summary:
+        summary_path = write_iteration_summary(out_dir / "iteration_summary.md", result)
+        typer.echo(f"Iteration summary: {summary_path}")
+
+    typer.echo(
+        f"Done — {result.rounds_run} round(s), stop reason: {result.stop_reason}. "
+        f"Best version: v{result.best.version} (score {result.best.score.total}/{result.best.score.max_total})."
+    )
+
+
+@app.command()
+def iterate(
+    spec: Path = typer.Option(
+        ...,
+        help="Path to agent-spec.json produced by the run command.",
+    ),
+    org_alias: str = typer.Option(
+        ...,
+        help="Salesforce org alias for running agent tests.",
+    ),
+    agent_api_name: str = typer.Option(
+        ...,
+        help="API name of the deployed Agentforce agent to test against.",
+    ),
+    test_spec_name: str = typer.Option(
+        ...,
+        help="Name prefix for the generated AiEvaluationDefinition test specs.",
+    ),
+    rounds: int = typer.Option(
+        1,
+        help="Number of refinement rounds to run. Each round costs real org LLM calls.",
+        min=1,
+    ),
+    out_dir: Path = typer.Option(
+        ...,
+        help="Output directory for round artifacts. Each round writes round-N/ sub-dirs.",
+    ),
+) -> None:
+    """Iteratively refine an agent spec by running it against a real Salesforce org.
+
+    Each round: emits a test spec, runs sf agent test run-eval against the org,
+    parses real per-case verdicts, folds them into the spec as observations, and
+    re-scores. Round artifacts are written to out-dir/round-N/ and are never
+    overwritten.
+
+    Exits non-zero if the final score is below the pass threshold
+    (PASS_THRESHOLD=75) or if a blocking issue remains in the final round.
+    """
+    if not spec.exists():
+        typer.secho(f"ERROR: spec file not found: {spec}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    if not spec.is_file():
+        typer.secho(f"ERROR: spec path is not a file: {spec}", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    if org_is_forbidden(org_alias):
+        typer.secho(
+            "ERROR: org alias " + repr(org_alias) + " is strictly out of scope for this project. "
+            "PPCDM and PPCaccenture may not be targeted by this tool.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    out_dir_resolved = Path(out_dir).resolve()
+    try:
+        out_dir_resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        typer.secho(
+            f"ERROR: cannot create output directory {str(out_dir)!r}: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    probe = out_dir_resolved / ".write_probe"
+    try:
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        typer.secho(
+            f"ERROR: output directory {str(out_dir)!r} is not writable: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        agent_spec = _load_spec_from_json(spec)
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        typer.secho(
+            f"ERROR: could not parse spec file {str(spec)!r}: {exc}",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"Loaded spec: {agent_spec.intent!r} "
+        f"(confidence {agent_spec.confidence:.2f}, {len(agent_spec.entities)} entities)"
+    )
+    typer.echo(
+        f"Running {rounds} refinement round(s) against org {org_alias!r}, "
+        f"agent {agent_api_name!r}..."
+    )
+    from .iterate import refine_with_org_feedback
+    round_results = refine_with_org_feedback(
+        agent_spec,
+        out_dir=out_dir_resolved,
+        org_alias=org_alias,
+        agent_api_name=agent_api_name,
+        test_spec_name=test_spec_name,
+        rounds=rounds,
+    )
+    for r in round_results:
+        score_after = r.score_after
+        if score_after is not None:
+            score_val = score_after.total
+            passed_val = score_after.passed
+        else:
+            score_val = None
+            passed_val = None
+        stop_reason_parts: list[str] = []
+        if r.blocking_issues:
+            stop_reason_parts.append("blocking: " + "; ".join(r.blocking_issues))
+        if not r.trustworthy:
+            stop_reason_parts.append("round not trustworthy (synthetic runner or blocked)")
+        score_display = f"{score_val}/{score_after.max_total}" if score_after is not None else "n/a"
+        passed_display = "PASS" if passed_val else "FAIL"
+        stop_display = " [" + "; ".join(stop_reason_parts) + "]" if stop_reason_parts else ""
+        typer.echo(f"Round {r.round_number}: score={score_display} passed={passed_display}{stop_display}")
+    if not round_results:
+        typer.secho("ERROR: no rounds were completed.", fg=typer.colors.RED, bold=True)
+        raise typer.Exit(code=1)
+    final_round = round_results[-1]
+    final_score = final_round.score_after
+    if final_score is None:
+        typer.secho(
+            "ERROR: final round produced no score; cannot determine pass/fail.",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    if final_score.total < PASS_THRESHOLD:
+        typer.secho(
+            f"FAIL: final score {final_score.total}/{final_score.max_total} "
+            f"is below pass threshold ({PASS_THRESHOLD}).",
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    if final_round.blocking_issues:
+        typer.secho(
+            "FAIL: final round has blocking issue(s): " + "; ".join(final_round.blocking_issues),
+            fg=typer.colors.RED, bold=True,
+        )
+        raise typer.Exit(code=1)
+    typer.secho(
+        f"PASS: final score {final_score.total}/{final_score.max_total} >= threshold ({PASS_THRESHOLD}).",
+        fg=typer.colors.GREEN, bold=True,
+    )
 
 if __name__ == "__main__":
     app()

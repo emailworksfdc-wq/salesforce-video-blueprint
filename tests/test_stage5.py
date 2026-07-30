@@ -39,6 +39,12 @@ from sf_video_blueprint.stage5 import (
     DialectNotSupportedError,
     EvaluationOutcome,
     Stage5Error,
+    AgentTestCreateResult,
+    AgentTestResultsPayload,
+    AgentTestStatusResult,
+    agent_test_create,
+    agent_test_results,
+    agent_test_status,
     apply_feedback,
     feedback_blocking_issues,
     feedback_findings,
@@ -92,6 +98,41 @@ def _real_feedback() -> AgentFeedback:
         source="run-eval",
         subject_name="Coral_Cloud_Booking_Agent",
         org_alias="AFT3",
+    )
+
+
+def _make_below_threshold_spec() -> DerivedAgentSpec:
+    """A spec that scores well below PASS_THRESHOLD=75 so the gate-pass stop never fires.
+
+    Uses only inference-sourced evidence (no dom-capture / telemetry) which scores
+    low on evidence_grounding, keeping the total safely under 75. This lets tests
+    that need to run multiple rounds do so without being cut short by gate_pass.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case Status field value in the record",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("inference", "inferred from recording context")],
+            )
+        ],
+        orchestration_steps=[
+            "Navigate to the Case record by record identifier",
+            "Locate the Status field on the Case detail layout",
+            "Update the Status field to the desired new value",
+            "Submit the form to persist the Status change",
+        ],
+        guardrails=[
+            "Require explicit confirmation before writing Status field",
+            "Enforce field-level security on Case.Status",
+        ],
+        failure_handling=["Observed validation error: Status value was rejected by the server"],
+        unknowns=["Exact Action API name was not observed in the recording"],
+        evidence=[SpecEvidence("inference", "inferred from user-click sequence")],
     )
 
 
@@ -304,11 +345,26 @@ def test_apply_feedback_does_not_mutate_input_spec() -> None:
 
 
 def test_apply_feedback_invents_no_entities_or_objects() -> None:
+    """apply_feedback must not invent entities or objects.
+
+    orchestration_steps MAY grow: when a real run-eval result carries an
+    actual_topic that differs from the derived spec, apply_feedback appends an
+    observed-routing step so the iteration loop learns the live agent's real
+    routing target.  That step is evidence, not invention — its value comes
+    verbatim from the run-eval payload.
+    """
     spec = _make_spec()
     adjusted, _ = apply_feedback(spec, _real_feedback())
     assert [e.name for e in adjusted.entities] == [e.name for e in spec.entities]
     assert adjusted.objects_touched == spec.objects_touched
-    assert adjusted.orchestration_steps == spec.orchestration_steps
+    # Original steps must all still be present (nothing removed).
+    for step in spec.orchestration_steps:
+        assert step in adjusted.orchestration_steps
+    # The fixture has a topic mismatch, so exactly one [observed routing] step
+    # must have been appended.
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 1
+    assert "Booked_Activity_Management" in observed[0]
 
 
 def test_synthetic_feedback_marks_spec_unvalidated_not_validated() -> None:
@@ -327,6 +383,107 @@ def test_feedback_with_no_cases_records_an_unknown() -> None:
     adjusted, _ = apply_feedback(_make_spec(), AgentFeedback(source="run-eval", subject_name="A", cases=[]))
     assert any("no test-case results" in u for u in adjusted.unknowns)
 
+
+
+
+def test_apply_feedback_appends_observed_routing_step_for_topic_mismatch() -> None:
+    """Gap 1: when a real run-eval result routes to a different topic, the spec
+    must record it in orchestration_steps so the loop can converge."""
+    spec = _make_spec()
+    adjusted, notes = apply_feedback(spec, _real_feedback())
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    # The fixture has one topic mismatch: actual=Booked_Activity_Management, expected=Update_Case_Status
+    assert len(observed) == 1
+    assert "Booked_Activity_Management" in observed[0]
+    assert "Update_Case_Status" in observed[0]
+    assert any("appended" in n and "routing target" in n for n in notes)
+
+
+def test_apply_feedback_no_observed_routing_step_when_no_mismatch() -> None:
+    """Gap 1: if no topic mismatch, no [observed routing] step is appended."""
+    fb = AgentFeedback(
+        source="run-eval",
+        subject_name="PerfectAgent",
+        cases=[
+            CaseFeedback(
+                case_id="c0",
+                status="passed",
+                outcomes=[EvaluationOutcome("evaluator.other", "e0", True)],
+            )
+        ],
+    )
+    spec = _make_spec()
+    adjusted, notes = apply_feedback(spec, fb)
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 0
+    assert not any("routing target" in n for n in notes)
+
+
+def test_apply_feedback_deduplicates_observed_routing_steps_across_cases() -> None:
+    """Gap 1: the same actual topic seen in multiple cases must produce one step."""
+    fb = AgentFeedback(
+        source="run-eval",
+        subject_name="MultiCaseAgent",
+        cases=[
+            CaseFeedback(
+                case_id="c0",
+                status="failed",
+                outcomes=[
+                    EvaluationOutcome(
+                        "evaluator.planner_topic_assertion",
+                        "t",
+                        False,
+                        actual="SameTopic",
+                        expected="DerivedTopic",
+                    )
+                ],
+            ),
+            CaseFeedback(
+                case_id="c1",
+                status="failed",
+                outcomes=[
+                    EvaluationOutcome(
+                        "evaluator.planner_topic_assertion",
+                        "t",
+                        False,
+                        actual="SameTopic",
+                        expected="DerivedTopic",
+                    )
+                ],
+            ),
+        ],
+    )
+    spec = _make_spec()
+    adjusted, _ = apply_feedback(spec, fb)
+    observed = [s for s in adjusted.orchestration_steps if s.startswith("[observed routing]")]
+    assert len(observed) == 1, "same actual topic from two cases should produce one observation"
+
+
+def test_apply_feedback_confidence_ceiling_0_70_never_exceeded() -> None:
+    """Gap 2: apply_feedback must never produce a spec with confidence > 0.70.
+
+    Runs 10 consecutive apply_feedback calls with a mix of passing and failing
+    feedback to simulate the iteration loop — confidence must stay at or below
+    0.70 in every round, even if the spec's starting confidence equals 0.70.
+    """
+    import pytest as _pytest
+
+    spec = _make_spec(confidence=0.70)
+    for _ in range(10):
+        spec, _ = apply_feedback(spec, _real_feedback())
+        assert spec.confidence <= 0.70, (
+            f"confidence exceeded ceiling: {spec.confidence}"
+        )
+
+
+def test_apply_feedback_raises_stage5error_if_confidence_already_above_ceiling() -> None:
+    """Gap 2: a spec that somehow enters apply_feedback with confidence > 0.70
+    must trigger a Stage5Error, not silently pass through."""
+    import pytest as _pytest
+
+    spec = _make_spec(confidence=0.75)
+    with _pytest.raises(Stage5Error, match="ceiling"):
+        apply_feedback(spec, _real_feedback())
 
 # --- A full round ---
 
@@ -389,6 +546,105 @@ def test_redact_session_ids_covers_nested_planner_state() -> None:
     payload = {"a": [{"session_id": "019f-real"}, {"planner": {"sessionProperties": {"sessionId": "019f-real"}}}]}
     scrubbed = redact_session_ids(payload)
     assert "019f-real" not in json.dumps(scrubbed)
+
+
+# --- Parametrized coverage for the three new redaction gaps ---
+
+
+@pytest.mark.parametrize(
+    "header_key",
+    ["Authorization", "authorization"],
+    ids=["capitalized", "lowercase"],
+)
+def test_redact_session_ids_bearer_token_in_headers(header_key: str) -> None:
+    """Bearer tokens in HTTP header dicts must be redacted regardless of case."""
+    payload = {"request": {"headers": {header_key: "Bearer SYNTHETIC_TOKEN_ABCDEF1234567890"}}}
+    scrubbed = redact_session_ids(payload)
+    assert "SYNTHETIC_TOKEN_ABCDEF1234567890" not in json.dumps(scrubbed)
+    assert SESSION_ID_REDACTED in json.dumps(scrubbed)
+
+
+def test_redact_session_ids_non_bearer_headers_are_preserved() -> None:
+    """Keys that are NOT authorization headers must not be redacted (no false positives)."""
+    payload = {"request": {"headers": {"Content-Type": "application/json", "X-Request-Id": "req-abc-123"}}}
+    scrubbed = redact_session_ids(payload)
+    assert scrubbed == payload, "Non-credential headers should be left untouched"
+
+
+@pytest.mark.parametrize(
+    "url,expected_present,expected_absent",
+    [
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_SID_TOKEN&retURL=/",
+            "sid=",
+            "SYNTHETIC_SID_TOKEN",
+        ),
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_SID_ONLY",
+            "sid=",
+            "SYNTHETIC_SID_ONLY",
+        ),
+        (
+            "https://example.salesforce.com/secur/frontdoor.jsp?retURL=/home&sid=SYNTHETIC_SID_MIDDLE&foo=bar",
+            "sid=",
+            "SYNTHETIC_SID_MIDDLE",
+        ),
+    ],
+    ids=["sid-with-trailing-params", "sid-at-end", "sid-in-middle"],
+)
+def test_redact_session_ids_frontdoor_sid_url(
+    url: str, expected_present: str, expected_absent: str
+) -> None:
+    """The sid= parameter value in frontdoor.jsp URLs must be redacted."""
+    payload = {"login_url": url}
+    scrubbed = redact_session_ids(payload)
+    scrubbed_url = scrubbed["login_url"]
+    assert expected_absent not in scrubbed_url
+    assert expected_present in scrubbed_url
+    assert SESSION_ID_REDACTED in scrubbed_url
+
+
+def test_redact_session_ids_plain_url_without_sid_unchanged() -> None:
+    """A URL that does NOT contain frontdoor.jsp must not be modified."""
+    url = "https://example.salesforce.com/lightning/r/Case/500abc/view"
+    payload = {"url": url}
+    scrubbed = redact_session_ids(payload)
+    assert scrubbed["url"] == url
+
+
+@pytest.mark.parametrize(
+    "depth_label,payload,secret",
+    [
+        (
+            "bearer_3_levels_deep",
+            {"level1": {"level2": {"headers": {"Authorization": "Bearer SYNTHETIC_DEEP_BEARER"}}}},
+            "SYNTHETIC_DEEP_BEARER",
+        ),
+        (
+            "frontdoor_3_levels_deep",
+            {
+                "level1": [
+                    {
+                        "level2": {
+                            "url": "https://test.salesforce.com/secur/frontdoor.jsp?sid=SYNTHETIC_DEEP_SID"
+                        }
+                    }
+                ]
+            },
+            "SYNTHETIC_DEEP_SID",
+        ),
+        (
+            "session_id_in_list_of_dicts_3_levels",
+            {"planner": {"steps": [{"inner": {"session_id": "SYNTHETIC_NESTED_SID"}}]}},
+            "SYNTHETIC_NESTED_SID",
+        ),
+    ],
+)
+def test_redact_session_ids_three_levels_deep(depth_label: str, payload: dict, secret: str) -> None:
+    """Each new pattern must be caught at three levels of nesting."""
+    scrubbed = redact_session_ids(payload)
+    assert secret not in json.dumps(scrubbed), f"Secret leaked at depth {depth_label}"
+    assert SESSION_ID_REDACTED in json.dumps(scrubbed)
 
 
 def test_write_round_refuses_to_overwrite_a_prior_round(tmp_path: Path) -> None:
@@ -458,7 +714,11 @@ def test_run_agent_eval_requires_an_existing_spec_file(tmp_path: Path) -> None:
 
 
 def test_iterate_org_feedback_loop_writes_one_round_per_trip(tmp_path: Path) -> None:
-    """The stage-5 loop in iterate.py must emit, run, parse, and version each round."""
+    """The stage-5 loop in iterate.py must emit, run, parse, and version each round.
+
+    Uses _make_below_threshold_spec() so the gate-pass stopping condition never fires
+    and both rounds in the budget actually execute.
+    """
     from sf_video_blueprint.iterate import refine_with_org_feedback
 
     calls: list[list[str]] = []
@@ -473,7 +733,7 @@ def test_iterate_org_feedback_loop_writes_one_round_per_trip(tmp_path: Path) -> 
         return Done()
 
     rounds = refine_with_org_feedback(
-        _make_spec(),
+        _make_below_threshold_spec(),
         out_dir=tmp_path / "stage5",
         org_alias="AFT3",
         agent_api_name="Coral_Cloud_Booking_Agent",
@@ -519,6 +779,10 @@ def test_iterate_org_feedback_loop_does_not_carry_synthetic_results_forward(tmp_
 
     No monkeypatching needed: an injected runner is synthetic by construction, so
     this exercises the real provenance path rather than a simulated one.
+
+    Uses _make_below_threshold_spec() so gate-pass does not stop the loop after
+    round 1 — both rounds need to run to verify that round 2 did not inherit
+    round 1's (synthetic) adjusted spec.
     """
     from sf_video_blueprint.iterate import refine_with_org_feedback
 
@@ -528,7 +792,7 @@ def test_iterate_org_feedback_loop_does_not_carry_synthetic_results_forward(tmp_
         stderr = ""
 
     rounds = refine_with_org_feedback(
-        _make_spec(),
+        _make_below_threshold_spec(),
         out_dir=tmp_path / "s5",
         org_alias="AFT3",
         agent_api_name="A",
@@ -767,3 +1031,376 @@ def test_loop_refuses_an_existing_round_before_spending_org_calls(tmp_path: Path
     assert calls == []
     assert (out_dir / "round-1" / "testSpec.yaml").read_text(encoding="utf-8") == "name: PRIOR_ROUND\n"
     assert json.loads((out_dir / "round-1" / "round.json").read_text(encoding="utf-8")) == {"round_number": 1}
+
+
+# ---------------------------------------------------------------------------
+# agent_test_create wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_create_builds_the_verified_argv(tmp_path):
+    """The create wrapper must emit exactly the argv the CLI expects."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = "Test suite created."
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "create"]
+    assert "--spec" in cmd
+    assert str(spec_file.resolve()) in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.org_alias == "AFT3"
+
+
+def test_agent_test_create_raises_stage5error_with_real_stderr(tmp_path):
+    """A non-zero exit must raise Stage5Error with the org's actual complaint."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+    real_error = "Error (DeployFailed): Not available for deploy for this organization"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "Not available for deploy" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_create_requires_an_existing_spec_file(tmp_path):
+    """The guard must fire before the runner is called."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called when spec file is missing")
+
+    with pytest.raises(Stage5Error, match="test spec not found"):
+        agent_test_create(tmp_path / "missing.yaml", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_create_injected_runner_is_not_real(tmp_path):
+    """An injected runner must never produce is_real=True."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+
+    class Done:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Done())
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert INJECTED_RUNNER_SOURCE not in REAL_FEEDBACK_SOURCES
+
+
+def test_agent_test_create_to_dict_carries_provenance(tmp_path):
+    """to_dict must include source and is_real so a log reader sees provenance."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+
+    class Done:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["org_alias"] == "AFT3"
+
+
+# ---------------------------------------------------------------------------
+# agent_test_status wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_status_builds_the_verified_argv():
+    """The status wrapper must always include --result-format json."""
+    captured = {}
+    status_payload = {"result": {"status": "COMPLETED"}}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps(status_payload)
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_status("JOB-001", org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "status"]
+    assert "--job-id" in cmd and "JOB-001" in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    # The flag must be present — without it the CLI emits a table and silently
+    # discards the structured fields.
+    assert "--result-format" in cmd
+    assert "json" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.status == "COMPLETED"
+    assert result.job_id == "JOB-001"
+
+
+def test_agent_test_status_missing_result_format_flag_cannot_silently_drop_data():
+    """The --result-format flag is mandatory in the argv; its absence loses data.
+
+    This test verifies that the argv produced by agent_test_status always
+    contains --result-format so a caller never accidentally gets a text table
+    back from the CLI.
+    """
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"result": {"status": "IN_PROGRESS"}})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    agent_test_status("JOB-002", org_alias="AFT3", runner=runner)
+    cmd = captured["cmd"]
+    # Confirm the flag is present at the exact position the CLI reads it.
+    assert "--result-format" in cmd, (
+        "argv is missing --result-format; without it the CLI returns a human-readable "
+        "table and silently discards per-case verdicts"
+    )
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "json", f"expected json after --result-format, got {cmd[idx+1]!r}"
+
+
+def test_agent_test_status_raises_stage5error_with_real_stderr():
+    """A non-zero exit must surface the org's actual complaint."""
+    real_error = "Error (JobNotFound): No test job with id NOTEXIST"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_status("NOTEXIST", org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "JobNotFound" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_status_empty_job_id_raises_before_runner():
+    """An empty job_id must be caught locally, not sent to the org."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with an empty job_id")
+
+    with pytest.raises(Stage5Error, match="job_id must not be empty"):
+        agent_test_status("", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_status_parses_top_level_status():
+    """Status may appear at the top level or under result; both must be found."""
+    for payload in [
+        {"status": "IN_PROGRESS"},
+        {"result": {"status": "IN_PROGRESS"}},
+    ]:
+
+        class Done:
+            returncode = 0
+            stdout = json.dumps(payload)
+            stderr = ""
+
+        result = agent_test_status("JOB-003", org_alias="AFT3", runner=lambda c, t: Done())
+        assert result.status == "IN_PROGRESS", f"failed for payload {payload}"
+
+
+def test_agent_test_status_to_dict_carries_provenance():
+    """to_dict must include source and is_real so a log reader sees provenance."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"status": "COMPLETED"})
+        stderr = ""
+
+    result = agent_test_status("JOB-004", org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "job_id" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["job_id"] == "JOB-004"
+
+
+# ---------------------------------------------------------------------------
+# agent_test_results wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_results_builds_the_verified_argv():
+    """The results wrapper must always include --result-format in the argv."""
+    captured = {}
+    results_payload = {"result": {"tests": []}}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps(results_payload)
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_results("JOB-005", org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "results"]
+    assert "--job-id" in cmd and "JOB-005" in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    assert "--result-format" in cmd and "json" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.job_id == "JOB-005"
+    assert result.result_format == "json"
+
+
+def test_agent_test_results_missing_result_format_flag_cannot_silently_drop_data():
+    """The --result-format flag must always be in the argv produced.
+
+    Omitting it causes the CLI to emit a human-readable table that silently
+    discards verdicts, scores, and explanations — the exact data the caller
+    needs to learn from the run.
+    """
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    agent_test_results("JOB-006", org_alias="AFT3", runner=runner)
+    cmd = captured["cmd"]
+    assert "--result-format" in cmd, (
+        "argv is missing --result-format; without it the CLI returns a human-readable "
+        "table and silently discards per-case verdicts, scores, and explanations"
+    )
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "json"
+
+
+def test_agent_test_results_empty_result_format_raises_locally():
+    """An empty result_format must be caught before any subprocess is spawned.
+
+    Passing an empty string to the CLI would silently drop data; raising
+    locally is better than a confusing CLI error.
+    """
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with empty result_format")
+
+    with pytest.raises(Stage5Error, match="result_format must be specified"):
+        agent_test_results("JOB-007", org_alias="AFT3", result_format="", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_results_raises_stage5error_with_real_stderr():
+    """A non-zero exit must surface the org's actual complaint."""
+    real_error = "Error (JobNotFound): No test job with id BADID"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_results("BADID", org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "JobNotFound" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_results_empty_job_id_raises_before_runner():
+    """An empty job_id must be caught locally."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with an empty job_id")
+
+    with pytest.raises(Stage5Error, match="job_id must not be empty"):
+        agent_test_results("", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_results_injected_runner_is_not_real():
+    """An injected runner must never produce is_real=True."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    result = agent_test_results("JOB-008", org_alias="AFT3", runner=lambda c, t: Done())
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert INJECTED_RUNNER_SOURCE not in REAL_FEEDBACK_SOURCES
+
+
+def test_agent_test_results_to_dict_carries_provenance():
+    """to_dict must include source, is_real, result_format for audit readers."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    result = agent_test_results("JOB-009", org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "result_format" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["result_format"] == "json"
+    assert d["job_id"] == "JOB-009"
+
+
+def test_agent_test_results_custom_result_format_travels_to_argv():
+    """result_format is forwarded to the CLI, not overridden silently."""
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_results("JOB-010", org_alias="AFT3", result_format="tap", runner=runner)
+    cmd = captured["cmd"]
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "tap"
+    assert result.result_format == "tap"

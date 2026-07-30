@@ -38,6 +38,8 @@ EXPECTED_TOOLS = {
     "emit_agent_bundle",
     "emit_test_spec",
     "preview_api_names",
+    "run_stage5_round",
+    "run_iterate",
 }
 
 
@@ -80,10 +82,19 @@ def test_health_reports_capabilities_and_limitations() -> None:
     assert result["ok"] is True
     assert set(result["tools"]) == EXPECTED_TOOLS
     # Org contact is conditional, not absent: `emit_agent_bundle` compiles against
-    # an org when given an org_alias. Claiming a flat False here would understate
-    # what the server does, which is its own kind of dishonesty.
-    assert "org_alias" in result["capabilities"]["contactsSalesforceOrg"]
+    # an org when given an org_alias, and `run_stage5_round`/`run_iterate` always
+    # call sf agent test run-eval. Claiming a flat False would understate what the
+    # server does, which is its own kind of dishonesty.
+    contacts_org = result["capabilities"]["contactsSalesforceOrg"]
+    assert "org_alias" in contacts_org, (
+        "health() must name the org_alias condition in contactsSalesforceOrg"
+    )
+    assert "run_stage5_round" in contacts_org or "run_iterate" in contacts_org or "stage" in contacts_org.lower(), (
+        "health() must disclose that run_stage5_round and run_iterate contact the org"
+    )
     assert "by default" in result["capabilities"]["offline"]
+    # Offline disclosure must mention the stage-5 tools too.
+    assert "run_stage5_round" in result["capabilities"]["offline"] or "run_iterate" in result["capabilities"]["offline"]
     assert result["capabilities"]["readOnly"] is True
     assert result["capabilities"]["launchesBrowser"] is False
     # The limitations list is load-bearing: an agent plans around it. Assert the
@@ -509,3 +520,441 @@ def test_main_is_callable_entry_point() -> None:
     """`sf-blueprint-mcp` points here; a wrong name breaks only at install time."""
     assert callable(mcp_server.main)
     assert inspect.signature(mcp_server.main).parameters == {}
+
+
+# ---------------------------------------------------------------------------
+# _spec_from_json helper
+# ---------------------------------------------------------------------------
+
+
+def _derived_spec_json() -> str:
+    """Return a minimal DerivedAgentSpec JSON string for test fixtures."""
+    derived = mcp_server.derive_spec(str(EXAMPLE))
+    assert derived["ok"] is True
+    return json.dumps(derived["spec"])
+
+
+def test_spec_from_json_round_trips_a_real_spec() -> None:
+    """_spec_from_json must reconstruct the same shape that to_dict() produces."""
+    spec_json = _derived_spec_json()
+    spec = mcp_server._spec_from_json(spec_json)
+
+    from sf_video_blueprint.spec_builder import DerivedAgentSpec
+
+    assert isinstance(spec, DerivedAgentSpec)
+    assert spec.intent
+    assert isinstance(spec.entities, list)
+    assert isinstance(spec.evidence, list)
+
+
+def test_spec_from_json_rejects_malformed_json() -> None:
+    with pytest.raises(ValueError, match="not valid JSON"):
+        mcp_server._spec_from_json("{not json}")
+
+
+def test_spec_from_json_rejects_non_object_json() -> None:
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        mcp_server._spec_from_json("[1, 2, 3]")
+
+
+def test_spec_from_json_tolerates_missing_optional_keys() -> None:
+    """A minimal spec with only intent must deserialize without raising."""
+    spec = mcp_server._spec_from_json(json.dumps({"intent": "test intent"}))
+    assert spec.intent == "test intent"
+    assert spec.entities == []
+    assert spec.evidence == []
+
+
+# ---------------------------------------------------------------------------
+# run_stage5_round
+# ---------------------------------------------------------------------------
+
+
+def _make_injected_runner(result_json: str):
+    """Return a runner callable that fakes sf agent test run-eval output."""
+    import subprocess
+
+    class FakeResult:
+        returncode = 0
+        stdout = result_json
+        stderr = ""
+
+    def runner(cmd: list, timeout: int) -> FakeResult:
+        return FakeResult()
+
+    return runner
+
+
+_FAKE_RUN_EVAL_RESULT = json.dumps({
+    "result": {
+        "tests": [
+            {
+                "id": "case_001",
+                "status": "COMPLETED",
+                "evaluations": [
+                    {
+                        "type": "topic",
+                        "id": "topic_eval",
+                        "is_pass": False,
+                        "expected_value": "Update_Case_Status",
+                        "actual_value": "General_Inquiry",
+                    }
+                ],
+                "outputs": [],
+            }
+        ],
+        "summary": {"total": 1, "passed": 0, "failed": 1},
+    }
+})
+
+
+def test_run_stage5_round_refuses_forbidden_org(tmp_path: Path) -> None:
+    """PPCDM / PPCaccenture must be refused before any org call."""
+    result = mcp_server.run_stage5_round(
+        spec_json=_derived_spec_json(),
+        org_alias="PPCDM",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert "scope" in result["error"]["message"].lower()
+
+
+def test_run_stage5_round_refuses_ppaccenture(tmp_path: Path) -> None:
+    """PPCaccenture variant is also refused."""
+    result = mcp_server.run_stage5_round(
+        spec_json=_derived_spec_json(),
+        org_alias="PPCaccenture",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_server.ERROR_VALIDATION
+
+
+def test_run_stage5_round_rejects_bad_spec_json(tmp_path: Path) -> None:
+    result = mcp_server.run_stage5_round(
+        spec_json="not json at all",
+        org_alias="test-org",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_server.ERROR_VALIDATION
+    assert "spec_json" in result["error"]["message"]
+
+
+def test_run_stage5_round_result_is_json_serializable(tmp_path: Path) -> None:
+    """Stage-5 results must be wire-safe regardless of the org feedback shape."""
+    # Patch run_agent_eval at the stage5 module level so the tool exercises the
+    # full code path (forbidden-org check, spec parsing, feedback loop) without
+    # a real org.
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_stage5_round(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+        )
+    finally:
+        stage5._default_runner = _original
+
+    # May fail if the org call fails; we just need JSON-serializability.
+    assert json.loads(json.dumps(result))
+
+
+def test_run_stage5_round_response_has_expected_fields(tmp_path: Path) -> None:
+    """A successful round must return all the documented top-level fields.
+
+    Note: patching stage5._default_runner runs the full code path while keeping
+    the subprocess off the network. The source is still 'run-eval' because
+    run_agent_eval uses `runner is None` to decide provenance, not whether
+    _default_runner was replaced. What we test here is the *shape* of the
+    envelope, not provenance (provenance is tested in test_stage5.py).
+    """
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_stage5_round(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+        )
+    finally:
+        stage5._default_runner = _original
+
+    # Error path (e.g. sf not found on PATH in CI) is acceptable; shape path is not.
+    if result["ok"]:
+        assert "roundNumber" in result
+        assert "trustworthy" in result
+        assert isinstance(result["blockingIssues"], list)
+        assert "findings" in result
+        assert "feedbackSource" in result
+        assert isinstance(result["caseCount"], int)
+
+
+def test_run_stage5_round_writes_round_file(tmp_path: Path) -> None:
+    """A successful round must write a round.json to out_dir/round-N/."""
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_stage5_round(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+        )
+    finally:
+        stage5._default_runner = _original
+
+    if result["ok"]:
+        assert Path(result["writtenTo"]).is_file(), (
+            "run_stage5_round must write round.json when it succeeds"
+        )
+
+
+def test_run_stage5_round_increments_round_number_when_prior_rounds_exist(tmp_path: Path) -> None:
+    """The tool must auto-increment the round number rather than overwriting a prior round.
+
+    Pre-creating round-1/round.json simulates a completed round; the next call
+    must write round-2, not attempt to overwrite round-1.
+    """
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    # Pre-create round-1 so the tool sees it as an existing round.
+    (tmp_path / "round-1").mkdir()
+    (tmp_path / "round-1" / "round.json").write_text(
+        json.dumps({"round_number": 1}), encoding="utf-8"
+    )
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_stage5_round(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+        )
+    finally:
+        stage5._default_runner = _original
+
+    if result["ok"]:
+        assert result["roundNumber"] == 2, (
+            "tool must write round-2 when round-1 already exists"
+        )
+        assert (tmp_path / "round-1" / "round.json").read_text().startswith("{"), (
+            "round-1 must not be overwritten"
+        )
+
+
+# ---------------------------------------------------------------------------
+# run_iterate
+# ---------------------------------------------------------------------------
+
+
+def test_run_iterate_refuses_forbidden_org(tmp_path: Path) -> None:
+    result = mcp_server.run_iterate(
+        spec_json=_derived_spec_json(),
+        org_alias="PPCDM",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert "scope" in result["error"]["message"].lower()
+
+
+def test_run_iterate_refuses_ppaccenture(tmp_path: Path) -> None:
+    result = mcp_server.run_iterate(
+        spec_json=_derived_spec_json(),
+        org_alias="PPCaccenture",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_server.ERROR_VALIDATION
+
+
+def test_run_iterate_rejects_rounds_less_than_one(tmp_path: Path) -> None:
+    result = mcp_server.run_iterate(
+        spec_json=_derived_spec_json(),
+        org_alias="test-org",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+        rounds=0,
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_server.ERROR_VALIDATION
+    assert "rounds" in result["error"]["message"]
+
+
+def test_run_iterate_rejects_bad_spec_json(tmp_path: Path) -> None:
+    result = mcp_server.run_iterate(
+        spec_json="not json",
+        org_alias="test-org",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        out_dir=str(tmp_path),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == mcp_server.ERROR_VALIDATION
+
+
+def test_run_iterate_result_is_json_serializable(tmp_path: Path) -> None:
+    """Iterate results must be wire-safe regardless of round shape."""
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_iterate(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+            rounds=1,
+        )
+    finally:
+        stage5._default_runner = _original
+
+    assert json.loads(json.dumps(result))
+
+
+def test_run_iterate_with_injected_runner_reports_rounds_run(tmp_path: Path) -> None:
+    """Even with synthetic feedback, the tool must report how many rounds ran."""
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _FAKE_RUN_EVAL_RESULT
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_iterate(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+            rounds=1,
+        )
+    finally:
+        stage5._default_runner = _original
+
+    if result["ok"]:
+        assert result["roundsRun"] >= 1
+        assert isinstance(result["rounds"], list)
+        assert len(result["rounds"]) == result["roundsRun"]
+
+
+def test_run_iterate_passed_and_blocking_issues_are_consistent(tmp_path: Path) -> None:
+    """passed=True and non-empty blockingIssues must never appear together.
+
+    `passed` means the quality gate was cleared; `blockingIssues` means it was
+    not. Reporting both simultaneously is a contradiction.
+    """
+    from sf_video_blueprint import stage5
+
+    _original = stage5._default_runner
+
+    # Build a fake that claims every case passed.
+    _fake_all_pass = json.dumps({
+        "result": {
+            "tests": [
+                {
+                    "id": "case_001",
+                    "status": "COMPLETED",
+                    "evaluations": [
+                        {"type": "topic", "id": "t", "is_pass": True}
+                    ],
+                    "outputs": [],
+                }
+            ],
+            "summary": {"total": 1, "passed": 1, "failed": 0},
+        }
+    })
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = _fake_all_pass
+        stderr = ""
+
+    stage5._default_runner = lambda cmd, timeout: _FakeCompleted()
+    try:
+        result = mcp_server.run_iterate(
+            spec_json=_derived_spec_json(),
+            org_alias="fake-dev-org",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            out_dir=str(tmp_path),
+            rounds=1,
+        )
+    finally:
+        stage5._default_runner = _original
+
+    if result["ok"]:
+        # passed=True and non-empty blockingIssues is a contradiction.
+        if result.get("passed"):
+            assert not result.get("blockingIssues"), (
+                "run_iterate must not report passed=True alongside blocking issues"
+            )

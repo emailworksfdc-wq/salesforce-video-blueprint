@@ -2,8 +2,8 @@
 
 This module launches a headed browser, authenticates with a Salesforce org via
 frontdoor (bypassing MFA/SSO), injects the JavaScript recorder into every page
-and iframe, and collects raw DOM events to `dom_capture.jsonl` while a human
-operator performs a business process.
+and iframe, and collects raw DOM events to a timestamped JSONL file while a
+human operator performs a business process.
 
 Design rationale:
 - **Human-driven**: A synthetic clicker cannot know the business process. The
@@ -12,37 +12,163 @@ Design rationale:
 - **Frontdoor authentication**: Automating the Salesforce login form is fragile
   and violates policy. Instead, `sf org open --url-only` returns a signed
   `frontdoor.jsp` URL that bypasses MFA/SSO legitimately.
-- **Network sidecar**: The network trace (`dom_capture.network.jsonl`) records
-  the exact timestamps of Salesforce API calls, providing the correlation layer
-  with causal evidence instead of heuristic step_id matching.
+- **Network sidecar**: The network trace records the exact timestamps of
+  Salesforce API calls, providing the correlation layer with causal evidence
+  instead of heuristic step_id matching.
 - **Persistent context**: Using `launch_persistent_context` with an
   org-specific `--user-data-dir` keeps cookies between recordings, so the
   operator does not have to sign in again if the session is still valid.
   **Constraint**: A persistent profile can only be used by one browser instance
   at a time; never combine with `--isolated`.
+- **Process-scoped filenames**: Output files are prefixed with `process_name`
+  and a timestamp so two captures of different processes in the same out_dir
+  do not collide.
 
-Output artifacts:
-- `dom_capture.jsonl` — one JSON line per DOM event (clicks, inputs, navigation)
-- `dom_capture.network.jsonl` — network trace of Salesforce API calls
-- `dom_capture.manifest.json` — capture metadata and provenance
+Output artifacts (prefix = ``<process_name>_<timestamp>``):
+- ``<prefix>.dom_capture.jsonl`` — one JSON line per DOM event
+- ``<prefix>.dom_capture.network.jsonl`` — network trace of Salesforce API calls
+- ``<prefix>.dom_capture.manifest.json`` — capture metadata and provenance
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
+import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import typer
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, sync_playwright
 
+# Import validation layer -- same logic used by cli.py so operators see the same
+# diagnostics immediately after recording, not hours later when the pipeline runs.
+from sf_video_blueprint.dom_capture import parse_capture_file, validate_trace
+
+# Allow capture/inject.py to be run standalone (outside the installed package)
+# by resolving the src tree from the repo root.
+_repo_root = Path(__file__).resolve().parent.parent
+_src_path = _repo_root / "src"
+if str(_src_path) not in sys.path:
+    sys.path.insert(0, str(_src_path))
+
+from sf_video_blueprint.org_denylist import blocked_org_message, is_org_blocked  # noqa: E402
+
+# ANSI colour escapes — used only when stdout is a TTY.
+_YELLOW = "\033[33m"
+_RED = "\033[31m"
+_RESET = "\033[0m"
+
+# Interval (seconds) between live-counter refreshes.
+COUNTER_INTERVAL = 5
+
 app = typer.Typer()
+
+# Hard-blocked org aliases per INTERFACE_CONTRACT.md S2.1 (rule 6).
+# Kept for external callers that imported this constant directly; the guard
+# itself now delegates to org_denylist.is_org_blocked so case variants,
+# punctuation forms, and URL/username shapes are all caught.
+
+
+app = typer.Typer()
+
+# _ABORT_PREFIXES mirrors the logic used by cli.py so the two surfaces agree on
+# which findings are fatal.  "SECURITY CRITICAL:" catches redaction leaks;
+# "DATA LOSS:" catches 100%-loss and >=50%-loss captures.  Both require the
+# operator to fix the recorder and re-record -- they must not be silently
+# ignored until the pipeline runs hours later.
+_ABORT_PREFIXES: tuple[str, ...] = ("SECURITY CRITICAL:", "DATA LOSS:")
+
+# "EVIDENCE INCOMPLETE:" is non-fatal: the capture parsed, it is just not a
+# complete record.  Printed as a warning so the operator can decide whether to
+# re-record, but does not abort.
+_WARN_PREFIX = "EVIDENCE INCOMPLETE:"
+
+
+def run_capture_validation(jsonl_path: Path) -> int:
+    """Validate a written capture JSONL and print findings.
+
+    This is the "did the recording work?" check that previously only ran inside
+    the pipeline CLI.  By running it immediately after the capture session ends,
+    operators learn about problems before they leave the terminal -- not when the
+    pipeline fails hours later.
+
+    Severity rules (mirror cli.py so the two surfaces agree):
+
+    - ``SECURITY CRITICAL:`` or ``DATA LOSS:`` findings -> print error, return 1.
+      The caller (``main``) must abort with a non-zero exit so CI and manual
+      runs both catch the failure.
+    - ``EVIDENCE INCOMPLETE:`` findings -> print warning, continue (return 0).
+      The capture parsed; it may just be missing some events.
+    - No findings -> print the success message and return 0.
+
+    Args:
+        jsonl_path: Path to the JSONL file that was just written.
+
+    Returns:
+        0 on success (clean or incomplete-only), 1 on critical/data-loss finding.
+    """
+    print("\n[inject] Validating capture...")
+    try:
+        trace = parse_capture_file(jsonl_path)
+    except Exception as exc:
+        print(f"[inject] ERROR: Could not parse capture file: {exc}")
+        return 1
+
+    findings = validate_trace(trace)
+
+    if not findings:
+        print("[inject] ✓ capture validated — no issues found.")
+        return 0
+
+    # Partition by severity.
+    abort_findings = [f for f in findings if any(f.startswith(p) for p in _ABORT_PREFIXES)]
+    warn_findings = [f for f in findings if f.startswith(_WARN_PREFIX)]
+    other_findings = [
+        f for f in findings
+        if not any(f.startswith(p) for p in _ABORT_PREFIXES) and not f.startswith(_WARN_PREFIX)
+    ]
+
+    # Print non-fatal informational findings first (least alarming).
+    for finding in other_findings:
+        print(f"[inject]   {finding}")
+
+    # Print warnings (EVIDENCE INCOMPLETE) -- non-fatal.
+    if warn_findings:
+        print("[inject] WARNING: capture is incomplete -- evidence was lost:")
+        for finding in warn_findings:
+            print(f"[inject]   {finding}")
+
+    # Print fatal findings last so they are the last thing the operator sees.
+    if abort_findings:
+        print("[inject] CAPTURE VALIDATION FAILED -- recording cannot be used:")
+        for finding in abort_findings:
+            print(f"[inject]   {finding}")
+        print(
+            "[inject] ABORTING: Fix the recorder and re-record. "
+            "No pipeline run should use this capture."
+        )
+        return 1
+
+    return 0
 
 # Hard-blocked org aliases per INTERFACE_CONTRACT.md §2.1 (rule 6).
 BLOCKED_ORG_ALIASES = {"PPCDM", "PPCaccenture"}
+
+# Instance-URL substrings that identify non-production Salesforce orgs.
+# develop.my.salesforce.com is the subdomain pattern for Developer Edition
+# orgs -- isSandbox is absent from sf org display output as of CLI 2.143.6
+# but the URL pattern is stable and sufficient.
+_SAFE_URL_MARKERS: tuple[str, ...] = (
+    "develop.my.salesforce.com",
+    ".sandbox.my.salesforce.com",
+    ".scratch.my.salesforce.com",
+)
 
 # Salesforce API URL patterns for network trace.
 SF_API_PATTERNS = {
@@ -51,6 +177,89 @@ SF_API_PATTERNS = {
     "/webruntime/",
     "/services/apexrest/",
 }
+
+# Slug pattern: letters, digits, and hyphens only.
+_SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
+
+
+def validate_process_name(process_name: str) -> str:
+    """Validate and return a slug-safe process name.
+
+    A valid process name contains only ASCII letters, digits, and hyphens,
+    and must start with a letter or digit (not a hyphen).
+
+    Args:
+        process_name: The process name to validate.
+
+    Returns:
+        The validated process name (unchanged).
+
+    Raises:
+        ValueError: If the name contains spaces, slashes, or other disallowed
+            characters.
+
+    Examples:
+        >>> validate_process_name("case-creation")
+        'case-creation'
+        >>> validate_process_name("case update")
+        Traceback (most recent call last):
+            ...
+        ValueError: ...
+    """
+    if not process_name:
+        raise ValueError("process_name must not be empty.")
+    if not _SLUG_RE.match(process_name):
+        raise ValueError(
+            f"process_name {process_name!r} is not slug-safe. "
+            "Use only ASCII letters, digits, and hyphens (e.g. 'case-creation')."
+        )
+    return process_name
+
+
+def capture_sf_cli_version() -> str | None:
+    """Return the Salesforce CLI version string from ``sf --version --json``.
+
+    Returns:
+        A version string such as ``"@salesforce/cli/2.x.y darwin-arm64 node-v20.x.y"``
+        or ``None`` if the CLI is not installed or the command fails.
+    """
+    try:
+        result = subprocess.run(
+            ["sf", "--version", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        data = json.loads(result.stdout)
+        # The JSON output contains a "cliVersion" key.
+        return data.get("cliVersion") or data.get("version") or result.stdout.strip()
+    except Exception:
+        # Non-fatal — missing CLI version does not block recording.
+        return None
+
+
+def capture_playwright_mcp_version() -> str | None:
+    """Return the playwright-mcp package version if detectable.
+
+    Attempts to read the version from the installed package metadata.
+
+    Returns:
+        A version string such as ``"1.50.0"`` or ``None`` if not detectable.
+    """
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("playwright-mcp")
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version as pkg_version
+
+        return pkg_version("mcp-playwright")
+    except Exception:
+        pass
+    return None
 
 
 def resolve_org_info(alias: str) -> dict[str, Any]:
@@ -82,24 +291,37 @@ def assert_org_is_safe(org_info: dict[str, Any]) -> None:
     """Fail-closed production safety guard.
 
     Refuses to proceed if the org looks like production. Refuses when:
-    - `isSandbox` is false AND `isScratch` is false AND the instance URL does
-      not contain a dev/sandbox/scratch marker.
-    - Username contains `@salesforce.com` without a sandbox suffix.
-    - Org alias is in the permanently blocked list.
+    - Any of alias, username, or instanceUrl names a permanently blocked org
+      (PPCDM / PPCaccenture), using the canonical normalising matcher in
+      org_denylist.is_org_blocked. This runs BEFORE any CLI call so a
+      blocked alias cannot reach the network.
+    - Username contains @salesforce.com without a sandbox suffix.
+    - The org is neither a sandbox nor a scratch org, AND the instance URL
+      does not contain a recognised dev/sandbox/scratch marker.
+
+    The isSandbox / isScratch flags are consulted first when present.
+    When absent (e.g. sf org display CLI 2.143.6 no longer emits isSandbox),
+    the guard falls back to URL-pattern matching.  Developer Edition orgs carry
+    develop.my.salesforce.com in their instance URL and are treated as safe.
 
     Args:
-        org_info: Output of `resolve_org_info`.
+        org_info: Output of resolve_org_info.
 
     Raises:
         ValueError: If the org is production or blocked.
     """
     alias = org_info.get("alias") or org_info.get("username")
-    if alias in BLOCKED_ORG_ALIASES:
-        raise ValueError(
-            f"Org alias '{alias}' is permanently out of scope per project rules."
-        )
-
     username = org_info.get("username", "")
+    instance_url = org_info.get("instanceUrl", "")
+
+    # --- Gap 1 fix: deny-list check before any CLI call ---------------------
+    # Check every available identifier so derived aliases, username forms, and
+    # instance-URL forms are all caught by the canonical normalising matcher.
+    for identifier in (alias, username, instance_url):
+        if is_org_blocked(identifier):
+            raise ValueError(blocked_org_message(identifier))
+
+    # --- Username heuristic -------------------------------------------------
     if "@salesforce.com" in username and not any(
         suffix in username for suffix in [".sandbox", ".scratch", ".dev"]
     ):
@@ -108,21 +330,27 @@ def assert_org_is_safe(org_info: dict[str, Any]) -> None:
             "Refusing to proceed."
         )
 
+    # --- Sandbox / scratch / dev-org detection ------------------------------
+    # Gap 2 fix: isSandbox may be absent from CLI 2.143.6+ output.  Fall back
+    # to URL-pattern matching when neither flag is True (absent or False).
     is_sandbox = org_info.get("isSandbox", False)
     is_scratch = org_info.get("isScratch", False)
-    instance_url = org_info.get("instanceUrl", "")
 
-    if not is_sandbox and not is_scratch:
-        # Must have a dev/sandbox/scratch marker in the instance URL.
-        if not any(
-            marker in instance_url
-            for marker in [".develop.my.salesforce.com", ".sandbox.my.salesforce.com", ".scratch.my.salesforce.com"]
-        ):
-            raise ValueError(
-                f"Org '{alias}' is neither a sandbox nor a scratch org, and the "
-                f"instance URL '{instance_url}' does not contain a dev/sandbox/scratch "
-                f"marker. Refusing to proceed (production safety)."
-            )
+    if is_sandbox or is_scratch:
+        # Explicit flag present and true -- safe.
+        return
+
+    # Neither flag was True (either absent or explicitly False).  Fall back to
+    # URL-pattern matching.  develop.my.salesforce.com is the Developer
+    # Edition pattern; .sandbox. and .scratch. cover the other safe tiers.
+    if any(marker in instance_url for marker in _SAFE_URL_MARKERS):
+        return
+
+    raise ValueError(
+        f"Org '{alias}' is neither a sandbox nor a scratch org, and the "
+        f"instance URL '{instance_url}' does not contain a dev/sandbox/scratch "
+        f"marker. Refusing to proceed (production safety)."
+    )
 
 
 def parse_frontdoor_url(json_str: str) -> str:
@@ -162,6 +390,71 @@ def compute_file_sha256(path: Path) -> str:
     return sha256.hexdigest()
 
 
+def live_counter_line(
+    event_count: int,
+    network_event_count: int,
+    sink_errors: int,
+    *,
+    use_colour: bool = True,
+) -> str:
+    """Return a single-line status string for the live recording counter.
+
+    The line is prefixed with a colour code when *use_colour* is True and
+    stdout is a TTY.  Error state (sink_errors > 0) uses yellow/red.
+
+    Args:
+        event_count: Total DOM events captured so far.
+        network_event_count: Network events captured so far.
+        sink_errors: Number of sink handler errors so far.
+        use_colour: Apply ANSI colour codes when True.
+
+    Returns:
+        A human-readable status line (no trailing newline).
+    """
+    base = (
+        f"[inject] 🔴 Recording — {event_count} events captured "
+        f"({network_event_count} network), {sink_errors} errors. "
+        "Press Enter to stop."
+    )
+    if use_colour and sink_errors > 0 and sys.stdout.isatty():
+        colour = _RED if sink_errors >= 3 else _YELLOW
+        return f"{colour}{base}{_RESET}"
+    return base
+
+
+def start_live_counter(
+    get_counts: Callable[[], tuple[int, int, int]],
+    stop_event: threading.Event,
+    interval: float = COUNTER_INTERVAL,
+) -> threading.Thread:
+    """Start a background thread that prints a live counter line every *interval* seconds.
+
+    The counter line is written to stdout, preceded by a carriage return so it
+    overwrites the previous line on TTY terminals.  On non-TTY output (pipes,
+    log files) a plain newline is used instead so each update appears on its
+    own line.
+
+    Args:
+        get_counts: Zero-argument callable returning ``(event_count,
+            network_event_count, sink_errors)`` atomically.
+        stop_event: :class:`threading.Event` — set this to stop the loop.
+        interval: Seconds between refreshes (default ``COUNTER_INTERVAL``).
+
+    Returns:
+        The started daemon :class:`threading.Thread`.
+    """
+    def _loop() -> None:
+        while not stop_event.wait(timeout=interval):
+            event_count, network_event_count, sink_errors = get_counts()
+            line = live_counter_line(event_count, network_event_count, sink_errors)
+            eol = "\r" if sys.stdout.isatty() else "\n"
+            print(line, end=eol, flush=True)
+
+    thread = threading.Thread(target=_loop, daemon=True, name="inject-live-counter")
+    thread.start()
+    return thread
+
+
 def main(
     org_alias: str = typer.Option(..., help="Salesforce org alias or username"),
     out_dir: Path = typer.Option(
@@ -176,12 +469,29 @@ def main(
         None,
         help="Operator description of the process being recorded",
     ),
+    process_name: str = typer.Option(
+        ...,
+        help=(
+            "Short slug identifying the business process being recorded "
+            "(e.g. 'case-creation', 'case-update'). "
+            "Must contain only ASCII letters, digits, and hyphens."
+        ),
+    ),
 ) -> None:
     """Launch a headed browser, inject the DOM recorder, and collect events to JSONL.
 
     A human operator performs the business process. Press Enter in the terminal
     when done.
+
+    Output files are named ``<process_name>_<timestamp>.dom_capture.jsonl`` so
+    captures of different processes in the same out_dir never overwrite each other.
     """
+    # 0. Validate process_name at startup before any side-effects.
+    try:
+        process_name = validate_process_name(process_name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--process-name") from exc
+
     # 1. Safety checks.
     print(f"[inject] Resolving org metadata for '{org_alias}'...")
     org_info = resolve_org_info(org_alias)
@@ -199,11 +509,13 @@ def main(
     frontdoor_url = parse_frontdoor_url(result.stdout)
     print("[inject] ✓ Frontdoor URL obtained.")
 
-    # 3. Prepare output directory.
+    # 3. Prepare output directory and build timestamped, process-scoped filenames.
     out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / "dom_capture.jsonl"
-    network_jsonl_path = out_dir / "dom_capture.network.jsonl"
-    manifest_path = out_dir / "dom_capture.manifest.json"
+    timestamp = int(time.time())
+    file_stem = f"{process_name}_{timestamp}"
+    jsonl_path = out_dir / f"{file_stem}.dom_capture.jsonl"
+    network_jsonl_path = out_dir / f"{file_stem}.dom_capture.network.jsonl"
+    manifest_path = out_dir / f"{file_stem}.dom_capture.manifest.json"
 
     # Recorder path.
     recorder_path = Path(__file__).parent / "recorder.js"
@@ -225,6 +537,17 @@ def main(
     # Open output files.
     jsonl_file = jsonl_path.open("a", encoding="utf-8")
     network_jsonl_file = network_jsonl_path.open("a", encoding="utf-8")
+
+    # Write a header record so the JSONL file is self-describing.
+    header = {
+        "_record_type": "header",
+        "capture_id": capture_id,
+        "process_name": process_name,
+        "org_alias": org_alias,
+        "started_at": started_at,
+    }
+    jsonl_file.write(json.dumps(header) + "\n")
+    jsonl_file.flush()
 
     # 5. Launch browser.
     print("[inject] Launching browser (headed mode)...")
@@ -302,12 +625,28 @@ def main(
         print("  3. Return here and press Enter to stop.")
         print("=" * 70 + "\n")
 
+        # Start the live counter thread.
+        _counter_stop = threading.Event()
+
+        def _get_counts() -> tuple[int, int, int]:
+            return event_count, network_event_count, sink_errors
+
+        _counter_thread = start_live_counter(_get_counts, _counter_stop)
+
         try:
             input("Press Enter to stop recording...\n")
         except KeyboardInterrupt:
             print("\n[inject] KeyboardInterrupt received. Stopping...")
         except EOFError:
             print("\n[inject] EOFError (terminal closed?). Stopping...")
+        finally:
+            # Stop the counter and print the final summary line.
+            _counter_stop.set()
+            _counter_thread.join(timeout=1.0)
+            print(
+                f"\n[inject] ✓ Recording ended — {event_count} events total.",
+                flush=True,
+            )
 
         # Check if the operator closed the browser instead.
         if page.is_closed():
@@ -322,6 +661,7 @@ def main(
     # 12. Write manifest.
     manifest = {
         "capture_id": capture_id,
+        "process_name": process_name,
         "org_alias": org_alias,
         "org_instance_url": org_info.get("instanceUrl"),
         "is_sandbox": org_info.get("isSandbox", False),
@@ -333,6 +673,8 @@ def main(
         "sink_errors": sink_errors,
         "recorder_sha256": recorder_sha256,
         "playwright_version": p.chromium.version,  # type: ignore[unreachable]
+        "sf_cli_version": capture_sf_cli_version(),
+        "playwright_mcp_version": capture_playwright_mcp_version(),
         "operator_note": note,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -347,6 +689,14 @@ def main(
     print(f"[inject]   JSONL: {jsonl_path}")
     print(f"[inject]   Network JSONL: {network_jsonl_path}")
     print(f"[inject]   Manifest: {manifest_path}")
+
+    # 14. Validate the capture immediately so the operator knows whether the
+    #     recording worked before they leave the terminal -- not when the pipeline
+    #     fails hours later.  Fatal findings (SECURITY CRITICAL, DATA LOSS) abort
+    #     with a non-zero exit; EVIDENCE INCOMPLETE is a non-fatal warning.
+    exit_code = run_capture_validation(jsonl_path)
+    if exit_code != 0:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

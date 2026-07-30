@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 from sf_video_blueprint.iterate import (
+    IterationResult,
+    SpecVersion,
     refine,
+    write_iteration_summary,
     _apply_offline_improvements,
     _pick_best,
 )
@@ -979,3 +982,662 @@ def test_unknowns_deletion_warning_on_read_error(tmp_path):
         assert any("could not read parent spec" in note.lower() for note in v2_notes), (
             f"Expected read-error warning in v2 notes, got: {v2_notes}"
         )
+
+# =====================================================================# === TESTS: refine_with_org_feedback stopping conditions ====================
+# ============================================================================
+#
+# Each test uses an injected runner so no org is needed.  An injected runner
+# stamps feedback with source=INJECTED_RUNNER_SOURCE, which is NOT in
+# REAL_FEEDBACK_SOURCES, so every round is correctly marked untrustworthy and
+# the spec is NOT carried forward.  That means:
+# - The spec's score_after stays constant (same spec is re-scored every round)
+# - The identical_score_plateau condition fires predictably
+# - The gate_pass condition fires only when the spec itself is already above
+#   PASS_THRESHOLD with no blocking issues
+#
+# Helper builders are local to this section to keep each test self-contained.
+
+def _make_org_runner(payload_json: str):
+    """Return a (runner, calls) pair that records every invocation."""
+    import json as _json
+
+    calls: list[list[str]] = []
+
+    class Done:
+        returncode = 0
+        stdout = payload_json
+        stderr = ""
+
+    def runner(cmd, timeout):
+        calls.append(cmd)
+        return Done()
+
+    return runner, calls
+
+
+def _run_eval_payload_json() -> str:
+    """Return the real fixture as a JSON string for the injected runner."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    fixture = _Path(__file__).parent / "fixtures" / "run_eval_aft3_coral_cloud_booking.json"
+    return fixture.read_text(encoding="utf-8")
+
+
+def _make_passing_spec() -> DerivedAgentSpec:
+    """A spec that scores >= PASS_THRESHOLD=75 with no blocking issues.
+
+    Verified to score 82/100 (passed=True, blocking=[]) both before and after
+    apply_feedback with synthetic feedback. Used to test gate_pass: the spec
+    already satisfies the gate, so gate_pass fires on round 1 regardless of
+    the runner used.
+
+    This uses the same construction as test_stage5._make_spec() which has been
+    confirmed to score 82 with no blocking issues.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case (Status)",
+        confidence=0.7,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("data-delta", "Case.Status observed")],
+            )
+        ],
+        orchestration_steps=["Resolve the Case", "SUBMIT on button:Save -> writes Status"],
+        guardrails=["Require explicit user confirmation before writing: Status."],
+        failure_handling=["No failures were observed in this run, so error paths are UNTESTED."],
+        unknowns=["Action API names were not observed."],
+        evidence=[SpecEvidence("dom-capture", "8 events observed")],
+    )
+
+
+def _make_stalling_spec() -> DerivedAgentSpec:
+    """A spec that scores well below PASS_THRESHOLD and stays flat across rounds.
+
+    Uses inference-only evidence (no dom-capture/telemetry) so evidence_grounding
+    stays near zero, keeping the total safely under 75.  apply_feedback with a
+    synthetic (injected-runner) result adds an 'unvalidated' unknown but does not
+    change the score because the honesty dimension is already penalised by the
+    blocking issues.
+    """
+    return DerivedAgentSpec(
+        intent="Update Case Status field value in the record",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[SpecEvidence("inference", "inferred from recording context")],
+            )
+        ],
+        orchestration_steps=[
+            "Navigate to the Case record by record identifier",
+            "Locate the Status field on the Case detail layout",
+            "Update the Status field to the desired new value",
+            "Submit the form to persist the Status change",
+        ],
+        guardrails=[
+            "Require explicit confirmation before writing Status field",
+            "Enforce field-level security on Case.Status",
+        ],
+        failure_handling=["Observed validation error: Status value was rejected by the server"],
+        unknowns=["Exact Action API name was not observed in the recording"],
+        evidence=[SpecEvidence("inference", "inferred from user-click sequence")],
+    )
+
+
+# --- Stopping condition 1: gate_pass ---
+
+def test_org_feedback_stops_when_gate_passes(tmp_path: Path) -> None:
+    """gate_pass requires trustworthy=True; an injected runner never fires it.
+
+    The injected runner makes feedback.is_real=False, so trustworthy=False, and
+    the gate_pass stopping condition is skipped.  With a _make_passing_spec()
+    (score 82/100, no blocking issues) the loop runs until the identical-score
+    plateau fires at round 3, which is the earliest a stopping condition can
+    trigger on a score that never changes.
+
+    Assertions:
+    - Exactly 3 rounds (plateau, not gate_pass)
+    - The terminal round's stop_reason starts with 'identical_score_plateau:'
+    - The round.json on disk contains a 'stop_reason' field
+    - round-1 and round-2 do NOT carry a stop_reason (they are non-terminal)
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_passing_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=5,
+        runner=runner,
+    )
+
+    # gate_pass is skipped for injected runners; plateau fires at round 3
+    assert len(rounds) == 3, (
+        f"Expected 3 rounds (identical_score_plateau), got {len(rounds)}. "
+        f"stop_reason of last round: {rounds[-1].stop_reason!r}"
+    )
+    assert len(calls) == 3, f"Expected 3 org calls, got {len(calls)}"
+
+    # The terminal round must carry the stop_reason
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("identical_score_plateau:"), (
+        f"Expected stop_reason to start with 'identical_score_plateau:', got: {terminal.stop_reason!r}"
+    )
+
+    # The round.json on disk must include stop_reason for the terminal round
+    round_json_path = tmp_path / "stage5" / "round-3" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for terminal round"
+    assert payload["stop_reason"].startswith("identical_score_plateau:"), payload["stop_reason"]
+
+    # Non-terminal rounds must NOT have a stop_reason
+    for n in (1, 2):
+        p = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert p.get("stop_reason") is None, f"round-{n} must not carry stop_reason"
+
+
+# --- Stopping condition 2: identical_score_plateau ---
+
+def test_org_feedback_stops_on_three_identical_scores(tmp_path: Path) -> None:
+    """refine_with_org_feedback stops after 3 consecutive identical scores.
+
+    The fixture uses _make_stalling_spec() which scores flat with synthetic
+    feedback.  With rounds=10, the loop should stop at round 3 (the third
+    consecutive identical score triggers the plateau condition).
+
+    Assertions:
+    - Exactly 3 rounds returned
+    - The terminal round's stop_reason starts with 'identical_score_plateau:'
+    - The round.json of round 3 contains stop_reason
+    - Rounds 1 and 2 do NOT have a stop_reason (they did not terminate the loop)
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        runner=runner,
+    )
+
+    # Should stop at round 3 (three consecutive identical scores)
+    assert len(rounds) == 3, (
+        f"Expected 3 rounds (identical_score_plateau after 3), got {len(rounds)}. "
+        f"Scores: {[r.score_after.total for r in rounds if r.score_after]}"
+    )
+    assert len(calls) == 3, f"Expected 3 org calls, got {len(calls)}"
+
+    # All three scores must be identical
+    scores = [r.score_after.total for r in rounds if r.score_after is not None]
+    assert len(set(scores)) == 1, f"Expected identical scores, got: {scores}"
+
+    # Terminal round has the stop_reason; earlier rounds do not
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("identical_score_plateau:"), (
+        f"Expected stop_reason to start with 'identical_score_plateau:', got: {terminal.stop_reason!r}"
+    )
+    assert "3 consecutive" in terminal.stop_reason
+
+    # Non-terminal rounds must NOT have a stop_reason
+    for r in rounds[:-1]:
+        assert r.stop_reason is None, (
+            f"Round {r.round_number} should not have a stop_reason, got: {r.stop_reason!r}"
+        )
+
+    # Terminal round.json must include stop_reason
+    round_json_path = tmp_path / "stage5" / "round-3" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for plateau round"
+    assert payload["stop_reason"].startswith("identical_score_plateau:"), payload["stop_reason"]
+
+    # Earlier rounds must NOT have stop_reason in their JSON
+    for n in (1, 2):
+        prev_json = tmp_path / "stage5" / f"round-{n}" / "round.json"
+        prev_payload = json.loads(prev_json.read_text(encoding="utf-8"))
+        assert "stop_reason" not in prev_payload, (
+            f"round-{n}.json should not have stop_reason, got: {prev_payload.get('stop_reason')!r}"
+        )
+
+
+# --- Stopping condition 3: max_no_improvement ---
+
+def test_org_feedback_stops_on_max_no_improvement(tmp_path: Path) -> None:
+    """refine_with_org_feedback stops when max_no_improvement consecutive rounds
+    pass without the score going up.
+
+    Uses _make_stalling_spec() (flat score) with max_no_improvement=1 and
+    rounds=10.  The score never improves, so after 1 no-improvement round
+    the loop stops.
+
+    Counting: round 1 sets best_score_seen=S and no_improvement_streak=0.
+    Round 2 scores S again (not > S) -> streak=1 >= max_no_improvement=1 -> stop.
+    2 rounds total.
+
+    max_no_improvement=1 is chosen deliberately so the stopping condition fires
+    at round 2, before the identical_score_plateau condition (which fires at
+    round 3).  This avoids ambiguity about which condition takes precedence when
+    two conditions fire simultaneously.
+
+    Assertions:
+    - Exactly 2 rounds returned (1 baseline + 1 no-improvement)
+    - Terminal round's stop_reason starts with 'max_no_improvement:'
+    - round.json of the terminal round contains stop_reason
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        max_no_improvement=1,
+        runner=runner,
+    )
+
+    # Should stop at round 2 (round 1 = baseline, round 2 = no improvement)
+    assert len(rounds) == 2, (
+        f"Expected 2 rounds (max_no_improvement=1), got {len(rounds)}. "
+        f"Scores: {[r.score_after.total for r in rounds if r.score_after]}"
+    )
+
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None, "Terminal round must have a stop_reason"
+    assert terminal.stop_reason.startswith("max_no_improvement:"), (
+        f"Expected stop_reason to start with 'max_no_improvement:', got: {terminal.stop_reason!r}"
+    )
+    assert "limit=1" in terminal.stop_reason
+
+    # Terminal round.json must include stop_reason
+    round_json_path = tmp_path / "stage5" / "round-2" / "round.json"
+    assert round_json_path.exists()
+    payload = json.loads(round_json_path.read_text(encoding="utf-8"))
+    assert "stop_reason" in payload, "round.json must contain stop_reason for max_no_improvement round"
+    assert payload["stop_reason"].startswith("max_no_improvement:"), payload["stop_reason"]
+
+
+def test_org_feedback_max_no_improvement_triggers_at_limit_1(tmp_path: Path) -> None:
+    """max_no_improvement=1 stops after the first round without a score increase.
+
+    Round 1 sets best=S.  Round 2 also returns S -> no improvement -> streak=1
+    >= max_no_improvement=1 -> stop.  2 rounds total.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        max_no_improvement=1,
+        runner=runner,
+    )
+
+    assert len(rounds) == 2, (
+        f"Expected 2 rounds (max_no_improvement=1: 1 baseline + 1 no-improvement), got {len(rounds)}"
+    )
+    terminal = rounds[-1]
+    assert terminal.stop_reason is not None
+    assert terminal.stop_reason.startswith("max_no_improvement:")
+    assert "limit=1" in terminal.stop_reason
+
+
+def test_org_feedback_max_no_improvement_invalid_value_raises(tmp_path: Path) -> None:
+    """max_no_improvement < 1 must raise ValueError."""
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    with pytest.raises(ValueError, match="max_no_improvement must be >= 1"):
+        refine_with_org_feedback(
+            _make_stalling_spec(),
+            out_dir=tmp_path,
+            org_alias="AFT3",
+            agent_api_name="TestAgent",
+            test_spec_name="TestSpec",
+            max_no_improvement=0,
+        )
+
+
+def test_org_feedback_max_no_improvement_none_does_not_stop_loop(tmp_path: Path) -> None:
+    """max_no_improvement=None (the default) means the condition is disabled.
+
+    With a stalling spec and 3 rounds budget, the loop should run all 3 rounds
+    (stopped only by the identical_score_plateau after round 3, not by
+    max_no_improvement since it is None).
+
+    This also verifies that not passing max_no_improvement at all doesn't
+    accidentally enable the condition with some default limit.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, calls = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=3,
+        # max_no_improvement not passed -> None -> disabled
+        runner=runner,
+    )
+
+    # Without max_no_improvement, the loop runs 3 rounds (stopped by the
+    # identical_score_plateau condition after the 3rd identical score).
+    assert len(rounds) == 3, f"Expected 3 rounds without max_no_improvement, got {len(rounds)}"
+    assert len(calls) == 3
+
+
+def test_org_feedback_gate_pass_stop_reason_written_to_disk(tmp_path: Path) -> None:
+    """stop_reason must appear in round.json for the terminal round (audit-trail contract).
+
+    With an injected runner (trustworthy=False) gate_pass cannot fire.  The loop
+    runs 3 rounds and stops on identical_score_plateau.  The terminal round-3
+    must have stop_reason in its JSON; rounds 1 and 2 must NOT.
+
+    This is the audit-trail contract: a reader opening round.json for the
+    terminal round must be able to see WHY the loop ended without reading any
+    other file.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    refine_with_org_feedback(
+        _make_passing_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=5,
+        runner=runner,
+    )
+
+    # round-3 is the terminal round (identical_score_plateau); it must have stop_reason
+    payload = json.loads(
+        (tmp_path / "stage5" / "round-3" / "round.json").read_text(encoding="utf-8")
+    )
+    assert "stop_reason" in payload
+    assert "identical_score_plateau" in payload["stop_reason"]
+
+    # Non-terminal rounds must NOT carry a stop_reason
+    for n in (1, 2):
+        p = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert p.get("stop_reason") is None, f"round-{n} should not have stop_reason"
+
+    # Rounds 4 and 5 must not exist (loop stopped at 3)
+    assert not (tmp_path / "stage5" / "round-4").exists(), "round-4 must not exist"
+    assert not (tmp_path / "stage5" / "round-5").exists(), "round-5 must not exist"
+
+
+def test_org_feedback_non_terminal_rounds_have_no_stop_reason(tmp_path: Path) -> None:
+    """Non-terminal rounds must NOT carry a stop_reason field in round.json.
+
+    Only the round that actually triggered a stopping condition should have
+    stop_reason in its JSON.  Earlier rounds having it would imply the loop
+    was stopped early on every round, which is false.
+    """
+    from sf_video_blueprint.iterate import refine_with_org_feedback
+
+    runner, _ = _make_org_runner(_run_eval_payload_json())
+    rounds = refine_with_org_feedback(
+        _make_stalling_spec(),
+        out_dir=tmp_path / "stage5",
+        org_alias="AFT3",
+        agent_api_name="TestAgent",
+        test_spec_name="TestSpec",
+        rounds=10,
+        runner=runner,
+    )
+
+    # Loop stops at round 3 due to identical_score_plateau.
+    # Rounds 1 and 2 must have no stop_reason.
+    assert len(rounds) == 3
+    for n in (1, 2):
+        payload = json.loads(
+            (tmp_path / "stage5" / f"round-{n}" / "round.json").read_text(encoding="utf-8")
+        )
+        assert "stop_reason" not in payload, (
+            f"round-{n}.json must not contain stop_reason; "
+            f"only the terminal round should. Got: {payload.get('stop_reason')!r}"
+        )
+
+    # Round 3 IS the terminal and must have stop_reason.
+    terminal_payload = json.loads(
+        (tmp_path / "stage5" / "round-3" / "round.json").read_text(encoding="utf-8")
+    )
+    assert "stop_reason" in terminal_payload
+
+# =============================================================================
+# === TEST: write_iteration_summary ===
+# =============================================================================
+
+def _make_mock_score(
+    total: int = 70,
+    max_total: int = 100,
+    band: str = "AMBER",
+    passed: bool = False,
+    blocking_issues: list[str] | None = None,
+    recommendations: list[str] | None = None,
+):
+    """Build a duck-typed mock score object for summary tests."""
+    class _Score:
+        pass
+
+    s = _Score()
+    s.total = total
+    s.max_total = max_total
+    s.band = band
+    s.passed = passed
+    s.blocking_issues = blocking_issues if blocking_issues is not None else []
+    s.recommendations = recommendations if recommendations is not None else []
+    return s
+
+
+def _make_spec_version(
+    version: int,
+    spec_path: Path,
+    score=None,
+    notes: list[str] | None = None,
+) -> SpecVersion:
+    """Build a minimal SpecVersion for summary tests."""
+    if score is None:
+        score = _make_mock_score()
+    return SpecVersion(
+        version=version,
+        spec_path=spec_path,
+        yaml_path=None,
+        score=score,
+        role_used="analyst",
+        source="derived",
+        parent_version=version - 1 if version > 1 else None,
+        notes=notes if notes is not None else [],
+    )
+
+
+def _write_spec_json(path: Path, intent: str = "Handle Case escalation") -> Path:
+    """Write a minimal agent-spec.json to path and return path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"intent": intent, "confidence": 0.75, "unknowns": []}),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_write_iteration_summary_file_is_written(tmp_path: Path) -> None:
+    """Summary file must be created at the requested path."""
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+
+    result = IterationResult(
+        versions=[_make_spec_version(1, spec_path)],
+        best=_make_spec_version(1, spec_path),
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    assert out.exists(), f"Summary file was not written to {out}"
+    assert out.suffix == ".md"
+
+
+def test_write_iteration_summary_contains_intent(tmp_path: Path) -> None:
+    """Summary file must contain the intent read from the best version's spec JSON."""
+    intent = "Update Case status to Closed"
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json", intent=intent)
+
+    result = IterationResult(
+        versions=[_make_spec_version(1, spec_path)],
+        best=_make_spec_version(1, spec_path),
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+    assert intent in content, f"Intent '{intent}' not found in summary:\n{content}"
+
+
+def test_write_iteration_summary_contains_round_table(tmp_path: Path) -> None:
+    """Summary must contain a table with a row per round."""
+    spec_path_v1 = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    spec_path_v2 = _write_spec_json(tmp_path / "v2" / "agent-spec.json")
+    spec_path_v3 = _write_spec_json(tmp_path / "v3" / "agent-spec.json")
+
+    v1 = _make_spec_version(1, spec_path_v1, score=_make_mock_score(total=60, band="RED"))
+    v2 = _make_spec_version(2, spec_path_v2, score=_make_mock_score(total=70, band="AMBER"))
+    v3 = _make_spec_version(3, spec_path_v3, score=_make_mock_score(total=80, band="GREEN", passed=True))
+
+    result = IterationResult(
+        versions=[v1, v2, v3],
+        best=v3,
+        converged=False,
+        stop_reason="Score 80/100 >= threshold 75 with no blocking issues",
+        rounds_run=3,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    # Each version row must appear
+    assert "v1" in content, "Round 1 row missing from summary"
+    assert "v2" in content, "Round 2 row missing from summary"
+    assert "v3" in content, "Round 3 row missing from summary"
+
+    # Score values must appear
+    assert "60" in content, "Score 60 missing from summary"
+    assert "70" in content, "Score 70 missing from summary"
+    assert "80" in content, "Score 80 missing from summary"
+
+    # Band values
+    assert "RED" in content, "Band RED missing"
+    assert "AMBER" in content, "Band AMBER missing"
+    assert "GREEN" in content, "Band GREEN missing"
+
+
+def test_write_iteration_summary_blocking_issues_present(tmp_path: Path) -> None:
+    """When the final round has blocking issues, they must appear in the summary."""
+    blocking = ["Must observe at least one failure path", "Insufficient field evidence"]
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    score = _make_mock_score(total=60, blocking_issues=blocking)
+
+    v1 = _make_spec_version(1, spec_path, score=score)
+    result = IterationResult(
+        versions=[v1],
+        best=v1,
+        converged=False,
+        stop_reason="Reached max_rounds=1",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    for issue in blocking:
+        assert issue in content, f"Blocking issue '{issue}' missing from summary:\n{content}"
+
+
+def test_write_iteration_summary_no_blocking_issues_message(tmp_path: Path) -> None:
+    """When there are no blocking issues, the summary must say so explicitly."""
+    spec_path = _write_spec_json(tmp_path / "v1" / "agent-spec.json")
+    score = _make_mock_score(total=80, passed=True, blocking_issues=[])
+
+    v1 = _make_spec_version(1, spec_path, score=score)
+    result = IterationResult(
+        versions=[v1],
+        best=v1,
+        converged=False,
+        stop_reason="Score 80/100 >= threshold 75 with no blocking issues",
+        rounds_run=1,
+    )
+
+    out = write_iteration_summary(tmp_path / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+    assert "no blocking issues" in content.lower(), (
+        f"Expected 'no blocking issues' message in summary:\n{content}"
+    )
+    assert "spec passed the gate" in content.lower(), (
+        f"Expected 'spec passed the gate' in summary:\n{content}"
+    )
+
+
+def test_write_iteration_summary_full_run(tmp_path: Path) -> None:
+    """Integration: run refine() and then write_iteration_summary(); verify all sections present."""
+    spec = _make_spec(intent="Escalate a Support Case")
+
+    result = refine(
+        spec,
+        out_dir=tmp_path / "run",
+        company_name="ACME",
+        company_description="Testing company",
+        max_rounds=3,
+        use_cli=False,
+    )
+
+    out = write_iteration_summary(tmp_path / "run" / "iteration_summary.md", result)
+    content = out.read_text(encoding="utf-8")
+
+    # Intent section
+    assert "Escalate" in content or "Case" in content, (
+        "Intent not found in summary from real refine() run"
+    )
+
+    # Rounds run and stop reason
+    assert str(result.rounds_run) in content
+    assert result.stop_reason[:30] in content  # partial match is enough
+
+    # Per-round table header
+    assert "Round" in content
+    assert "Score" in content
+    assert "Band" in content
+
+    # Blocking issues section
+    assert "Blocking Issues" in content

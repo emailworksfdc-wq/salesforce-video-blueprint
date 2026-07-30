@@ -295,16 +295,21 @@ def test_the_gate_does_not_accuse_the_builder_of_padding_on_real_dom() -> None:
     )
 
 
-def test_validate_trace_finds_nothing_to_report_on_the_real_capture() -> None:
-    """The integrity layer is silent because there is genuinely no loss left.
+def test_validate_trace_no_data_loss_on_the_real_capture() -> None:
+    """The data-loss layer is silent because there is genuinely no loss left.
 
     It used to report `DATA LOSS: 171 of 175 lines were skipped (98%)`. That the
     finding is gone is the strongest single statement about the ingest fix — the
     check that caught the defect no longer has anything to say about this file.
+
+    NOTE: validate_trace may now emit REDACTION AUDIT findings on real org data
+    (record Ids in URLs/sf.record_id). Those are EXPECTED — they are the new
+    REDACTION AUDIT feature. This test only guards the data-loss channel.
     """
     trace = parse_capture_file(REAL_CAPTURE)
     findings = validate_trace(trace)
-    assert findings == [], f"expected a clean real capture, got findings: {findings}"
+    data_loss_findings = [f for f in findings if f.startswith("DATA LOSS:") or f.startswith("EVIDENCE INCOMPLETE:")]
+    assert data_loss_findings == [], f"expected no data-loss findings on a clean real capture, got: {data_loss_findings}"
 
 
 # ============================================================================

@@ -324,6 +324,7 @@ def refine_with_org_feedback(
     agent_api_name: str,
     test_spec_name: str,
     rounds: int = 1,
+    max_no_improvement: int | None = None,
     provenance: dict[str, str] | None = None,
     runner: Any = None,
 ) -> list[Any]:
@@ -341,8 +342,29 @@ def refine_with_org_feedback(
     Only the legacy dialect is emitted, because that is the only one
     ``sf agent test run-eval`` executes (measured; see :mod:`stage5`).
 
+    The loop short-circuits on any of these three stopping conditions (checked in
+    order after each round):
+
+    1. **Gate pass**: ``score_after.total >= PASS_THRESHOLD`` with no blocking issues.
+       The spec has satisfied the gate; further rounds would only bill more org LLM
+       calls for no actionable gain.
+
+    2. **Identical-score plateau**: three consecutive rounds all produced the same
+       ``score_after.total``. The org keeps returning the same signal; the loop is
+       not converging further.
+
+    3. **No-improvement budget**: if ``max_no_improvement`` is set, the loop stops
+       when that many consecutive rounds pass without the score going up. A round
+       that scores the same as or lower than the previous is a "no-improvement" round.
+
+    In every case, the terminal round's :attr:`stage5.Stage5Round.stop_reason` is
+    set so the audit trail explains why the loop ended.
+
     Args:
-        rounds: How many round trips to run. Each one costs real org LLM calls.
+        rounds: Maximum round trips to run. Each one costs real org LLM calls.
+        max_no_improvement: If given, stop after this many consecutive rounds that
+            did not raise ``score_after.total`` above the highest seen so far.
+            ``None`` (the default) disables this condition.
         runner: Injected subprocess runner, for tests. Cannot forge provenance:
                 passing one stamps the feedback ``injected-runner``, which is not a
                 real source, so every such round is refused by
@@ -352,15 +374,18 @@ def refine_with_org_feedback(
         The list of :class:`stage5.Stage5Round`, in order.
 
     Raises:
-        ValueError: If ``rounds < 1``.
+        ValueError: If ``rounds < 1`` or ``max_no_improvement < 1`` when provided.
         Stage5Error: If a round's org call fails; the real stderr is attached.
                      A stage-5 round that degraded to synthetic results silently
                      would be worse than one that stopped.
     """
     if rounds < 1:
         raise ValueError(f"rounds must be >= 1, got {rounds}")
+    if max_no_improvement is not None and max_no_improvement < 1:
+        raise ValueError(f"max_no_improvement must be >= 1 when provided, got {max_no_improvement}")
 
     from .eval_spec import build_legacy_test_spec, write_test_spec
+    from .spec_score import PASS_THRESHOLD
     from .stage5 import (
         RUN_EVAL_DIALECT,
         assert_round_unwritten,
@@ -374,6 +399,12 @@ def refine_with_org_feedback(
 
     results: list[Any] = []
     current = spec
+
+    # Stopping-condition state
+    consecutive_identical: int = 0  # rounds where score_after == previous score_after
+    last_score_total: int | None = None  # score_after.total from the previous round
+    best_score_seen: int | None = None  # highest score_after.total seen so far
+    no_improvement_streak: int = 0  # consecutive rounds without score increase
 
     for round_num in range(1, rounds + 1):
         # Refuse BEFORE writing a spec or spending real org LLM calls. write_round
@@ -398,6 +429,61 @@ def refine_with_org_feedback(
         round_result = stage5_round(
             current, feedback, round_number=round_num, provenance=provenance
         )
+
+        # Evaluate stopping conditions BEFORE writing, so the terminal round's
+        # stop_reason is on disk. write_round refuses to overwrite, so the reason
+        # must be stamped on the object before the file is created.
+        current_score = round_result.score_after.total if round_result.score_after is not None else None
+        stop_reason: str | None = None
+
+        # 1. Gate pass: score >= PASS_THRESHOLD with no blocking issues, AND the
+        #    round must be trustworthy (real org feedback). A synthetic runner cannot
+        #    satisfy the gate — the feedback is not real, so the loop must keep running.
+        if (
+            round_result.score_after is not None
+            and current_score is not None
+            and current_score >= PASS_THRESHOLD
+            and not round_result.score_after.blocking_issues
+            and round_result.trustworthy
+        ):
+            stop_reason = (
+                f"gate_pass: score {current_score} >= PASS_THRESHOLD {PASS_THRESHOLD} "
+                "with no blocking issues"
+            )
+
+        # 2. Three consecutive identical scores
+        if stop_reason is None and current_score is not None:
+            if current_score == last_score_total:
+                consecutive_identical += 1
+            else:
+                consecutive_identical = 0
+            # We need 3 consecutive identical scores, meaning:
+            # - round N-2 = S, round N-1 = S, round N = S -> consecutive_identical == 2
+            # (first identical is count=1, second is count=2, so >= 2 means 3 in a row)
+            if consecutive_identical >= 2:
+                stop_reason = (
+                    f"identical_score_plateau: score {current_score} unchanged for "
+                    "3 consecutive rounds"
+                )
+
+        # 3. max_no_improvement budget
+        if stop_reason is None and max_no_improvement is not None and current_score is not None:
+            if best_score_seen is None or current_score > best_score_seen:
+                best_score_seen = current_score
+                no_improvement_streak = 0
+            else:
+                no_improvement_streak += 1
+            if no_improvement_streak >= max_no_improvement:
+                stop_reason = (
+                    f"max_no_improvement: {no_improvement_streak} consecutive round(s) "
+                    f"without score increase (best={best_score_seen}, "
+                    f"current={current_score}, limit={max_no_improvement})"
+                )
+
+        # Stamp stop_reason before writing so the audit trail includes the reason.
+        if stop_reason is not None:
+            round_result.stop_reason = stop_reason
+
         write_round(out_dir, round_result)
         results.append(round_result)
 
@@ -406,6 +492,13 @@ def refine_with_org_feedback(
         # audit trail as though the org had spoken.
         if round_result.trustworthy:
             current = round_result.spec_after
+
+        # Update state for the next round's stopping checks
+        last_score_total = current_score
+
+        # Early exit when a stopping condition was triggered
+        if stop_reason is not None:
+            break
 
     return results
 
@@ -669,6 +762,115 @@ def _pick_best(versions: list[SpecVersion]) -> SpecVersion:
     # Sort by score descending, then by version ascending (earlier wins ties)
     pool_sorted = sorted(pool, key=lambda v: (-v.score.total, v.version))
     return pool_sorted[0]
+
+
+def write_iteration_summary(path: Path, result: IterationResult) -> Path:
+    """Write a human-readable Markdown summary of an iteration run.
+
+    The summary is intentionally distinct from the machine-readable JSON produced by
+    ``write_iteration_report``.  It is meant for a practitioner who wants to understand
+    what happened at a glance without parsing JSON.
+
+    Content:
+    - Intent (read from the best version's on-disk spec JSON)
+    - Rounds run and stop reason
+    - Per-round score table (version, score, band, delta, blocking?)
+    - Blocking issues on the final round (or "no blocking issues — spec passed the gate")
+    - What changed between round 1 and the final round (gathered from version notes)
+
+    Args:
+        path: The file to write (typically ``<out_dir>/iteration_summary.md``).
+        result: The ``IterationResult`` returned by ``refine()``.
+
+    Returns:
+        The path that was written.
+    """
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read intent from the best version's on-disk spec JSON.
+    # The IterationResult carries no intent field directly — it lives in the spec file.
+    intent = "unknown"
+    try:
+        spec_data = json.loads(result.best.spec_path.read_text(encoding="utf-8"))
+        intent = spec_data.get("intent", "unknown")
+    except (OSError, json.JSONDecodeError):
+        intent = "unknown (spec file could not be read)"
+
+    # ------------------------------------------------------------------
+    # Header: intent, rounds, stop reason
+    # ------------------------------------------------------------------
+    lines: list[str] = [
+        "# Iteration Summary",
+        "",
+        f"**Intent:** {intent}",
+        f"**Rounds run:** {result.rounds_run}",
+        f"**Stop reason:** {result.stop_reason}",
+        "",
+    ]
+
+    # ------------------------------------------------------------------
+    # Per-round score table
+    # ------------------------------------------------------------------
+    lines += [
+        "## Per-round Scores",
+        "",
+        "| Round | Score | Max | Band | Δ | Blocking? |",
+        "|-------|-------|-----|------|---|-----------|",
+    ]
+    for i, v in enumerate(result.versions):
+        if i == 0:
+            delta_str = "—"
+        else:
+            delta_val = v.score.total - result.versions[i - 1].score.total
+            delta_str = f"{delta_val:+d}" if delta_val != 0 else "0"
+        blocking_str = "Yes" if v.score.blocking_issues else "No"
+        lines.append(
+            f"| v{v.version} "
+            f"| {v.score.total} "
+            f"| {v.score.max_total} "
+            f"| {v.score.band} "
+            f"| {delta_str} "
+            f"| {blocking_str} |"
+        )
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # Blocking issues on the final round
+    # ------------------------------------------------------------------
+    lines.append("## Blocking Issues (final round)")
+    lines.append("")
+    final = result.versions[-1] if result.versions else result.best
+    if final.score.blocking_issues:
+        for issue in final.score.blocking_issues:
+            lines.append(f"- {issue}")
+    else:
+        lines.append("no blocking issues — spec passed the gate")
+    lines.append("")
+
+    # ------------------------------------------------------------------
+    # What changed between round 1 and the final round
+    # ------------------------------------------------------------------
+    lines.append("## Changes (round 1 → final)")
+    lines.append("")
+
+    # Collect all notes from rounds 2 onwards (round 1 has no parent)
+    all_changes: list[str] = []
+    for v in result.versions[1:]:
+        for note in v.notes:
+            all_changes.append(f"- v{v.version}: {note}")
+
+    if all_changes:
+        lines.extend(all_changes)
+    else:
+        if result.rounds_run <= 1:
+            lines.append("Only one round was run — no incremental changes to report.")
+        else:
+            lines.append("No refinement notes were recorded between round 1 and the final round.")
+    lines.append("")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def write_iteration_report(path: Path, result: IterationResult) -> Path:
