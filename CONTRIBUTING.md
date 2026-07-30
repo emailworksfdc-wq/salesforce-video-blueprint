@@ -17,11 +17,11 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q
 ```
 
-You should see `1386 passed, 1 skipped` (the count grows as fixes land). No
+You should see `1396 passed, 1 skipped` (the count grows as fixes land). No
 Salesforce org, network access, or credentials are needed — every test is
 hermetic and offline.
 
-Omit the `mcp` extra and you get `1346 passed, 2 skipped` instead: the MCP server
+Omit the `mcp` extra and you get `1356 passed, 2 skipped` instead: the MCP server
 tests `importorskip` the optional dependency. **Keep it that way** — a plain
 `pip install -e ".[dev]"` must not produce a red suite. CI runs both
 configurations for exactly this reason.

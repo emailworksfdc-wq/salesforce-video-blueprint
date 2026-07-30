@@ -764,6 +764,16 @@ SESSION_ID_REDACTED = "[REDACTED-SESSION-ID]"
 
 _SESSION_ID_KEYS = frozenset({"session_id", "sessionId"})
 
+# HTTP headers that carry bearer/session tokens.
+# Only these two case variants appear in Salesforce API responses; do not widen
+# this set to a case-insensitive match — false positives remove operator data.
+_BEARER_HEADER_KEYS = frozenset({"Authorization", "authorization"})
+
+# Redacts the sid query-parameter value in frontdoor.jsp URLs.
+# Matches: ...frontdoor.jsp?sid=<token>&...  or  ...frontdoor.jsp?sid=<token> (end)
+# Replacement keeps the key ("sid=") so the URL structure is still readable.
+_FRONTDOOR_SID_RE = re.compile(r"(frontdoor\.jsp\?(?:[^&]*&)*sid=)[^&\s\"']+")
+
 
 def redact_session_ids(payload: Any) -> Any:
     """Return ``payload`` with every agent session id replaced by a placeholder.
@@ -772,16 +782,33 @@ def redact_session_ids(payload: Any) -> Any:
     them to pull the session in the org — but they are not written to disk. A
     round file is an artifact that gets copied into reports and commits, and a
     session identifier does not belong in one.
+
+    Redacted patterns:
+
+    * Dict keys ``session_id`` / ``sessionId`` — the primary session-id fields.
+    * Dict keys ``Authorization`` / ``authorization`` inside a ``headers`` dict —
+      bearer tokens that embed the session credential.
+    * String values containing ``frontdoor.jsp?sid=<token>`` — signed login URLs
+      whose ``sid`` query parameter IS the session id.
+
+    All three patterns are applied recursively so deeply-nested structures (e.g.
+    a planner state that is ``list[dict[str, Any]]`` inside another dict) are
+    covered without special-casing the depth.
     """
     if isinstance(payload, dict):
-        # Redact on the key alone, whatever the value's type — a session id that
-        # arrived as a non-string is still a session id.
-        return {
-            k: (SESSION_ID_REDACTED if k in _SESSION_ID_KEYS and v is not None else redact_session_ids(v))
-            for k, v in payload.items()
-        }
+        result: dict[str, Any] = {}
+        for k, v in payload.items():
+            if k in _SESSION_ID_KEYS and v is not None:
+                result[k] = SESSION_ID_REDACTED
+            elif k in _BEARER_HEADER_KEYS and isinstance(v, str) and v is not None:
+                result[k] = SESSION_ID_REDACTED
+            else:
+                result[k] = redact_session_ids(v)
+        return result
     if isinstance(payload, list):
         return [redact_session_ids(item) for item in payload]
+    if isinstance(payload, str) and "frontdoor.jsp" in payload:
+        return _FRONTDOOR_SID_RE.sub(r"\g<1>" + SESSION_ID_REDACTED, payload)
     return payload
 
 
