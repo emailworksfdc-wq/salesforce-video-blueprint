@@ -39,6 +39,12 @@ from sf_video_blueprint.stage5 import (
     DialectNotSupportedError,
     EvaluationOutcome,
     Stage5Error,
+    AgentTestCreateResult,
+    AgentTestResultsPayload,
+    AgentTestStatusResult,
+    agent_test_create,
+    agent_test_results,
+    agent_test_status,
     apply_feedback,
     feedback_blocking_issues,
     feedback_findings,
@@ -767,3 +773,376 @@ def test_loop_refuses_an_existing_round_before_spending_org_calls(tmp_path: Path
     assert calls == []
     assert (out_dir / "round-1" / "testSpec.yaml").read_text(encoding="utf-8") == "name: PRIOR_ROUND\n"
     assert json.loads((out_dir / "round-1" / "round.json").read_text(encoding="utf-8")) == {"round_number": 1}
+
+
+# ---------------------------------------------------------------------------
+# agent_test_create wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_create_builds_the_verified_argv(tmp_path):
+    """The create wrapper must emit exactly the argv the CLI expects."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = "Test suite created."
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "create"]
+    assert "--spec" in cmd
+    assert str(spec_file.resolve()) in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.org_alias == "AFT3"
+
+
+def test_agent_test_create_raises_stage5error_with_real_stderr(tmp_path):
+    """A non-zero exit must raise Stage5Error with the org's actual complaint."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+    real_error = "Error (DeployFailed): Not available for deploy for this organization"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "Not available for deploy" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_create_requires_an_existing_spec_file(tmp_path):
+    """The guard must fire before the runner is called."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called when spec file is missing")
+
+    with pytest.raises(Stage5Error, match="test spec not found"):
+        agent_test_create(tmp_path / "missing.yaml", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_create_injected_runner_is_not_real(tmp_path):
+    """An injected runner must never produce is_real=True."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+
+    class Done:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Done())
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert INJECTED_RUNNER_SOURCE not in REAL_FEEDBACK_SOURCES
+
+
+def test_agent_test_create_to_dict_carries_provenance(tmp_path):
+    """to_dict must include source and is_real so a log reader sees provenance."""
+    spec_file = tmp_path / "spec.yaml"
+    spec_file.write_text("name: T\n", encoding="utf-8")
+
+    class Done:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    result = agent_test_create(spec_file, org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["org_alias"] == "AFT3"
+
+
+# ---------------------------------------------------------------------------
+# agent_test_status wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_status_builds_the_verified_argv():
+    """The status wrapper must always include --result-format json."""
+    captured = {}
+    status_payload = {"result": {"status": "COMPLETED"}}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps(status_payload)
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_status("JOB-001", org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "status"]
+    assert "--job-id" in cmd and "JOB-001" in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    # The flag must be present — without it the CLI emits a table and silently
+    # discards the structured fields.
+    assert "--result-format" in cmd
+    assert "json" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.status == "COMPLETED"
+    assert result.job_id == "JOB-001"
+
+
+def test_agent_test_status_missing_result_format_flag_cannot_silently_drop_data():
+    """The --result-format flag is mandatory in the argv; its absence loses data.
+
+    This test verifies that the argv produced by agent_test_status always
+    contains --result-format so a caller never accidentally gets a text table
+    back from the CLI.
+    """
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"result": {"status": "IN_PROGRESS"}})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    agent_test_status("JOB-002", org_alias="AFT3", runner=runner)
+    cmd = captured["cmd"]
+    # Confirm the flag is present at the exact position the CLI reads it.
+    assert "--result-format" in cmd, (
+        "argv is missing --result-format; without it the CLI returns a human-readable "
+        "table and silently discards per-case verdicts"
+    )
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "json", f"expected json after --result-format, got {cmd[idx+1]!r}"
+
+
+def test_agent_test_status_raises_stage5error_with_real_stderr():
+    """A non-zero exit must surface the org's actual complaint."""
+    real_error = "Error (JobNotFound): No test job with id NOTEXIST"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_status("NOTEXIST", org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "JobNotFound" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_status_empty_job_id_raises_before_runner():
+    """An empty job_id must be caught locally, not sent to the org."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with an empty job_id")
+
+    with pytest.raises(Stage5Error, match="job_id must not be empty"):
+        agent_test_status("", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_status_parses_top_level_status():
+    """Status may appear at the top level or under result; both must be found."""
+    for payload in [
+        {"status": "IN_PROGRESS"},
+        {"result": {"status": "IN_PROGRESS"}},
+    ]:
+
+        class Done:
+            returncode = 0
+            stdout = json.dumps(payload)
+            stderr = ""
+
+        result = agent_test_status("JOB-003", org_alias="AFT3", runner=lambda c, t: Done())
+        assert result.status == "IN_PROGRESS", f"failed for payload {payload}"
+
+
+def test_agent_test_status_to_dict_carries_provenance():
+    """to_dict must include source and is_real so a log reader sees provenance."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"status": "COMPLETED"})
+        stderr = ""
+
+    result = agent_test_status("JOB-004", org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "job_id" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["job_id"] == "JOB-004"
+
+
+# ---------------------------------------------------------------------------
+# agent_test_results wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_agent_test_results_builds_the_verified_argv():
+    """The results wrapper must always include --result-format in the argv."""
+    captured = {}
+    results_payload = {"result": {"tests": []}}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps(results_payload)
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_results("JOB-005", org_alias="AFT3", runner=runner)
+
+    cmd = captured["cmd"]
+    assert cmd[:4] == ["sf", "agent", "test", "results"]
+    assert "--job-id" in cmd and "JOB-005" in cmd
+    assert "--target-org" in cmd and "AFT3" in cmd
+    assert "--result-format" in cmd and "json" in cmd
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert result.job_id == "JOB-005"
+    assert result.result_format == "json"
+
+
+def test_agent_test_results_missing_result_format_flag_cannot_silently_drop_data():
+    """The --result-format flag must always be in the argv produced.
+
+    Omitting it causes the CLI to emit a human-readable table that silently
+    discards verdicts, scores, and explanations — the exact data the caller
+    needs to learn from the run.
+    """
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    agent_test_results("JOB-006", org_alias="AFT3", runner=runner)
+    cmd = captured["cmd"]
+    assert "--result-format" in cmd, (
+        "argv is missing --result-format; without it the CLI returns a human-readable "
+        "table and silently discards per-case verdicts, scores, and explanations"
+    )
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "json"
+
+
+def test_agent_test_results_empty_result_format_raises_locally():
+    """An empty result_format must be caught before any subprocess is spawned.
+
+    Passing an empty string to the CLI would silently drop data; raising
+    locally is better than a confusing CLI error.
+    """
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with empty result_format")
+
+    with pytest.raises(Stage5Error, match="result_format must be specified"):
+        agent_test_results("JOB-007", org_alias="AFT3", result_format="", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_results_raises_stage5error_with_real_stderr():
+    """A non-zero exit must surface the org's actual complaint."""
+    real_error = "Error (JobNotFound): No test job with id BADID"
+
+    class Failed:
+        returncode = 1
+        stdout = ""
+        stderr = real_error
+
+    with pytest.raises(Stage5Error) as exc:
+        agent_test_results("BADID", org_alias="AFT3", runner=lambda c, t: Failed())
+    assert "JobNotFound" in str(exc.value)
+    assert "stderr" in str(exc.value)
+
+
+def test_agent_test_results_empty_job_id_raises_before_runner():
+    """An empty job_id must be caught locally."""
+    exploding_runner_called = []
+
+    def exploding_runner(cmd, timeout):  # pragma: no cover
+        exploding_runner_called.append(cmd)
+        raise AssertionError("runner must not be called with an empty job_id")
+
+    with pytest.raises(Stage5Error, match="job_id must not be empty"):
+        agent_test_results("", org_alias="AFT3", runner=exploding_runner)
+    assert exploding_runner_called == []
+
+
+def test_agent_test_results_injected_runner_is_not_real():
+    """An injected runner must never produce is_real=True."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    result = agent_test_results("JOB-008", org_alias="AFT3", runner=lambda c, t: Done())
+    assert result.source == INJECTED_RUNNER_SOURCE
+    assert result.is_real is False
+    assert INJECTED_RUNNER_SOURCE not in REAL_FEEDBACK_SOURCES
+
+
+def test_agent_test_results_to_dict_carries_provenance():
+    """to_dict must include source, is_real, result_format for audit readers."""
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    result = agent_test_results("JOB-009", org_alias="AFT3", runner=lambda c, t: Done())
+    d = result.to_dict()
+    assert "source" in d and "is_real" in d and "result_format" in d and "command" in d
+    assert d["is_real"] is False
+    assert d["result_format"] == "json"
+    assert d["job_id"] == "JOB-009"
+
+
+def test_agent_test_results_custom_result_format_travels_to_argv():
+    """result_format is forwarded to the CLI, not overridden silently."""
+    captured = {}
+
+    class Done:
+        returncode = 0
+        stdout = json.dumps({"tests": []})
+        stderr = ""
+
+    def runner(cmd, timeout):
+        captured["cmd"] = cmd
+        return Done()
+
+    result = agent_test_results("JOB-010", org_alias="AFT3", result_format="tap", runner=runner)
+    cmd = captured["cmd"]
+    idx = cmd.index("--result-format")
+    assert cmd[idx + 1] == "tap"
+    assert result.result_format == "tap"

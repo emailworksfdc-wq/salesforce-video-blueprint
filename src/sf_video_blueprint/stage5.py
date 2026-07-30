@@ -501,6 +501,299 @@ def _default_runner(cmd: list[str], timeout: int) -> subprocess.CompletedProcess
         raise Stage5Error(f"`sf agent test run-eval` timed out after {timeout}s") from exc
 
 
+
+# ---------------------------------------------------------------------------
+# Thin wrappers for the three CLI commands that complement run-eval.
+#
+# sf agent test create is noted as refused by the Metadata API on org AFT3
+# (see module docstring), but the wrapper is here so the CLI path can be
+# verified offline via runner injection — the same pattern as run_agent_eval.
+#
+# Provenance rules are identical: the source is stamped BEFORE the bytes are
+# read, based on who produced them (the OS subprocess vs. an injected fake).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class AgentTestCreateResult:
+    """The raw output of ``sf agent test create``.
+
+    The CLI emits only a success/error message, not structured JSON, so this
+    carries the raw stdout and the provenance stamp rather than parsed verdicts.
+    ``is_real`` is False when an injected runner produced the bytes — a real
+    deploy cannot have occurred.
+    """
+
+    source: str
+    org_alias: str | None
+    spec_path: str
+    stdout: str
+    command: str
+
+    @property
+    def is_real(self) -> bool:
+        return self.source != INJECTED_RUNNER_SOURCE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "is_real": self.is_real,
+            "org_alias": self.org_alias,
+            "spec_path": self.spec_path,
+            "command": self.command,
+            "stdout": self.stdout,
+        }
+
+
+@dataclass(slots=True)
+class AgentTestStatusResult:
+    """The parsed output of ``sf agent test status --result-format json``.
+
+    ``status`` is the job-level status string reported by the org (e.g.
+    ``"COMPLETED"``, ``"IN_PROGRESS"``).  The full JSON body is preserved in
+    ``raw`` so callers can read fields that a future CLI version may add.
+    The ``--result-format json`` flag is always passed explicitly: omitting it
+    returns a human-readable table that silently discards the structured fields
+    a caller needs to act on the status.
+    """
+
+    source: str
+    org_alias: str | None
+    job_id: str
+    status: str | None
+    raw: dict[str, Any]
+    command: str
+
+    @property
+    def is_real(self) -> bool:
+        return self.source != INJECTED_RUNNER_SOURCE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "is_real": self.is_real,
+            "org_alias": self.org_alias,
+            "job_id": self.job_id,
+            "status": self.status,
+            "command": self.command,
+            "raw": self.raw,
+        }
+
+
+@dataclass(slots=True)
+class AgentTestResultsPayload:
+    """The parsed output of ``sf agent test results --result-format json``.
+
+    ``result_format`` is carried here so a reader can verify that the payload
+    was retrieved with the right flag; omitting the flag at call time would
+    silently discard per-case verdicts, scores, and explanations.
+    """
+
+    source: str
+    org_alias: str | None
+    job_id: str
+    result_format: str
+    raw: dict[str, Any]
+    command: str
+
+    @property
+    def is_real(self) -> bool:
+        return self.source != INJECTED_RUNNER_SOURCE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "is_real": self.is_real,
+            "org_alias": self.org_alias,
+            "job_id": self.job_id,
+            "result_format": self.result_format,
+            "command": self.command,
+            "raw": self.raw,
+        }
+
+
+def agent_test_create(
+    spec_path: Path | str,
+    *,
+    org_alias: str,
+    timeout: int = 120,
+    runner: Any = None,
+) -> AgentTestCreateResult:
+    """Deploy a test spec to the org via ``sf agent test create``.
+
+    .. note::
+       On org ``AFT3`` this command is refused by the Metadata API with
+       ``Not available for deploy for this organization`` (see module docstring).
+       The wrapper is provided so the CLI argv and the error path can be
+       exercised offline via a ``runner`` injection.
+
+    Provenance is stamped before the bytes are read: ``source`` is
+    :data:`INJECTED_RUNNER_SOURCE` when ``runner`` is supplied, which signals
+    that no real deploy took place and a caller must not claim otherwise.
+    A non-zero exit raises :exc:`Stage5Error` with the real stderr attached.
+    """
+    spec_path = Path(spec_path)
+    if not spec_path.is_file():
+        raise Stage5Error(f"test spec not found: {spec_path}")
+
+    cmd = [
+        "sf",
+        "agent",
+        "test",
+        "create",
+        "--spec",
+        str(spec_path.resolve()),
+        "--target-org",
+        org_alias,
+    ]
+    invoke = runner if runner is not None else _default_runner
+    # Provenance is decided by who produced the bytes, before they are read.
+    source = INJECTED_RUNNER_SOURCE if runner is not None else "agent-test-create"
+    completed = invoke(cmd, timeout)
+
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    if getattr(completed, "returncode", 1) != 0:
+        raise Stage5Error(
+            f"`sf agent test create` failed (exit {completed.returncode}).\n"
+            f"stderr:\n{stderr.strip()}\nstdout:\n{stdout.strip()[:2000]}"
+        )
+
+    return AgentTestCreateResult(
+        source=source,
+        org_alias=org_alias,
+        spec_path=str(spec_path.resolve()),
+        stdout=stdout,
+        command=" ".join(cmd),
+    )
+
+
+def agent_test_status(
+    job_id: str,
+    *,
+    org_alias: str,
+    timeout: int = 60,
+    runner: Any = None,
+) -> AgentTestStatusResult:
+    """Poll the status of a running test job via ``sf agent test status``.
+
+    Always passes ``--result-format json`` so the output is parseable; omitting
+    it returns a human-readable table that silently discards the structured
+    fields a caller needs to act on the status.
+
+    Provenance is stamped before the bytes are read: ``source`` is
+    :data:`INJECTED_RUNNER_SOURCE` when ``runner`` is supplied.
+    A non-zero exit raises :exc:`Stage5Error` with the real stderr attached.
+    """
+    if not job_id:
+        raise Stage5Error("job_id must not be empty when calling sf agent test status")
+
+    cmd = [
+        "sf",
+        "agent",
+        "test",
+        "status",
+        "--job-id",
+        job_id,
+        "--target-org",
+        org_alias,
+        "--result-format",
+        "json",
+    ]
+    invoke = runner if runner is not None else _default_runner
+    source = INJECTED_RUNNER_SOURCE if runner is not None else "agent-test-status"
+    completed = invoke(cmd, timeout)
+
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    if getattr(completed, "returncode", 1) != 0:
+        raise Stage5Error(
+            f"`sf agent test status` failed (exit {completed.returncode}).\n"
+            f"stderr:\n{stderr.strip()}\nstdout:\n{stdout.strip()[:2000]}"
+        )
+
+    raw = _loads_lenient(stdout) if stdout.strip() else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    # The CLI may wrap under "result" or expose status at the top level.
+    result_body = raw.get("result") if isinstance(raw.get("result"), dict) else raw
+    status_val = result_body.get("status") if isinstance(result_body, dict) else None
+
+    return AgentTestStatusResult(
+        source=source,
+        org_alias=org_alias,
+        job_id=job_id,
+        status=_as_str(status_val),
+        raw=raw,
+        command=" ".join(cmd),
+    )
+
+
+def agent_test_results(
+    job_id: str,
+    *,
+    org_alias: str,
+    result_format: str = "json",
+    timeout: int = 120,
+    runner: Any = None,
+) -> AgentTestResultsPayload:
+    """Fetch the final results of a completed test job via ``sf agent test results``.
+
+    ``result_format`` defaults to ``"json"`` and is always passed explicitly.
+    Never omit this flag: without it the CLI returns a human-readable table that
+    silently discards per-case verdicts, scores, and explanations — the exact
+    data a caller needs to learn from the run.
+
+    Provenance is stamped before the bytes are read: ``source`` is
+    :data:`INJECTED_RUNNER_SOURCE` when ``runner`` is supplied.
+    A non-zero exit raises :exc:`Stage5Error` with the real stderr attached.
+    """
+    if not job_id:
+        raise Stage5Error("job_id must not be empty when calling sf agent test results")
+    if not result_format:
+        raise Stage5Error(
+            "result_format must be specified (use 'json'); omitting it silently drops "
+            "per-case verdicts and structured data from the response."
+        )
+
+    cmd = [
+        "sf",
+        "agent",
+        "test",
+        "results",
+        "--job-id",
+        job_id,
+        "--target-org",
+        org_alias,
+        "--result-format",
+        result_format,
+    ]
+    invoke = runner if runner is not None else _default_runner
+    source = INJECTED_RUNNER_SOURCE if runner is not None else "agent-test-results"
+    completed = invoke(cmd, timeout)
+
+    stdout = getattr(completed, "stdout", "") or ""
+    stderr = getattr(completed, "stderr", "") or ""
+    if getattr(completed, "returncode", 1) != 0:
+        raise Stage5Error(
+            f"`sf agent test results` failed (exit {completed.returncode}).\n"
+            f"stderr:\n{stderr.strip()}\nstdout:\n{stdout.strip()[:2000]}"
+        )
+
+    raw = _loads_lenient(stdout) if stdout.strip() else {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    return AgentTestResultsPayload(
+        source=source,
+        org_alias=org_alias,
+        job_id=job_id,
+        result_format=result_format,
+        raw=raw,
+        command=" ".join(cmd),
+    )
+
+
 def feedback_findings(feedback: AgentFeedback) -> list[str]:
     """Turn real verdicts into human-readable findings for the refinement loop.
 
