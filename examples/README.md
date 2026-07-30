@@ -66,6 +66,63 @@ path looked healthy. See `_shared/findings/lane-02.md` for the full defect list.
 This file is kept deliberately unfixed. It is the regression fixture that proves
 the ingest path is not yet real-DOM-capable.
 
+## What is `selector_confidence`, and why does it matter?
+
+Every DOM event in a capture carries one or more **selectors** — CSS paths,
+XPath strings, ARIA role+name pairs, Salesforce field names, and so on.
+`selector_confidence` is the float between 0.0 and 1.0 that the pipeline
+assigns to the **best** selector it found for each event, based on how stable
+and replay-safe that selector is expected to be.
+
+The mapping (`selectors.confidence_for_tier`) is:
+
+| Tier | Selector type | Confidence | Meaning |
+|------|---------------|------------|---------|
+| 1 | `data-testid` / `data-qa` attribute | 0.95 | Deliberate test contract; stable across deployments |
+| 2 | ARIA role + accessible name | 0.95 | Semantic identity; survives UI reskins |
+| 3 | `aria-label` / `aria-labelledby` | 0.85 | Stable in well-labelled UIs; breaks when labels change |
+| 4 | `<label for="...">` relationship | 0.85 | Reliable on standard record forms |
+| 5 | Salesforce `sf_field` attribute | 0.80 | Org-schema-stable; survives Lightning reskins |
+| 6 | Visible `text` content | 0.60 | Breaks on translation or label edits |
+| 7 | CSS path | 0.35 | Brittle; auto-generated Lightning IDs penalised further |
+| 8 | XPath | 0.35 | Most brittle; fallback of last resort |
+
+**What this means in practice:**
+
+- `selector_confidence` is **not** the same as intent confidence. A recording
+  where every click lands on a well-labelled ARIA button (`confidence=0.95`) can
+  still produce a low-intent-confidence spec if the captured events are
+  ambiguous about what the process was doing.
+
+- The `selector_confidence` of each action flows into `spec.confidence` via
+  `DomCaptureExtractor`. A session dominated by tier-7 CSS selectors will have
+  a lower aggregate confidence ceiling than one built on tier-1 test IDs, but
+  the intent-derivation logic may still produce a confident reading.
+
+- **For replay**: tier 7-8 selectors are brittle. If your recording has many
+  tier-7 CSS selectors, replaying it against a different org sandbox (or after
+  a Spring/Summer release) is likely to fail with "element not found". Prefer
+  recordings where the ARIA role+name or `sf_field` attributes are populated.
+
+- **For diagnosis**: run `selectors.explain(ranked_selectors)` to see the full
+  ranked list and the rationale for each candidate. The `selector_health()`
+  function summarises the list as `strong`, `moderate`, or `weak`.
+
+See `examples/PROCESS_CATALOG.md` for a per-process breakdown of which
+selector tiers to expect for each Salesforce process type.
+
+---
+
+## Process catalog
+
+Not sure what to record, or whether your capture event count is in the right
+range? See **[examples/PROCESS_CATALOG.md](PROCESS_CATALOG.md)** for ten
+canonical Salesforce processes with expected event counts, objects touched, and
+a description of what the pipeline can derive from each. The Case creation
+process already has an AFT3 capture annotated there.
+
+---
+
 ## Adding an example
 
 Two rules:
