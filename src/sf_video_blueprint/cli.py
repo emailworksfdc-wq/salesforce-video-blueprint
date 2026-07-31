@@ -224,7 +224,7 @@ def _read_event_count_from_manifest(capture_path: Path) -> "int | None":
     except (json.JSONDecodeError, ValueError, OSError):
         return None
 
-@app.command()
+@app.command(help="Derive a conversational agent spec from a capture file and score it.")
 def run(
     video_path: Path = typer.Argument(
         None,

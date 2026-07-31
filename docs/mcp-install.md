@@ -98,7 +98,9 @@ location and JSON shape differ.
 
 ### Claude Code
 
-Project-scoped, in `.mcp.json` at your repo root:
+The repo ships a `.mcp.json` at its root — cloning the repo is enough to wire up the server in Claude Code automatically.
+
+**If you installed with `pipx` or the binary is on your `$PATH`**, the default `.mcp.json` works as-is:
 
 ```json
 {
@@ -110,10 +112,22 @@ Project-scoped, in `.mcp.json` at your repo root:
 }
 ```
 
-Or add it from the command line:
+**If you installed with `pip install -e .` into a project venv**, the binary is at `.venv/bin/sf-blueprint-mcp` and is NOT on your system `$PATH`. Update `.mcp.json` to use the relative path:
+
+```json
+{
+  "mcpServers": {
+    "sf-blueprint": {
+      "command": ".venv/bin/sf-blueprint-mcp"
+    }
+  }
+}
+```
+
+Or add it from the command line using the absolute path:
 
 ```bash
-claude mcp add sf-blueprint -- sf-blueprint-mcp
+claude mcp add sf-blueprint -- "$(pwd)/.venv/bin/sf-blueprint-mcp"
 ```
 
 ### Claude Desktop

@@ -595,18 +595,19 @@ def score_spec(
     )
 
 
-def score_spec_file(path: Path) -> SpecScore:
+def score_spec_file(path: Path | str) -> SpecScore:
     """Load and score an agent-spec JSON written by spec_builder.write_spec.
 
     This reads the on-disk format, which includes the provenance key injected by
     write_spec(). Provenance is checked for stub/mock sources, which are blocking.
 
     Args:
-        path: Path to the agent-spec JSON file.
+        path: Path to the agent-spec JSON file. Accepts both Path and str.
 
     Returns:
         A SpecScore with provenance integrity checked.
     """
+    path = Path(path)
     if not path.exists():
         # Return a failing score for missing file.
         return SpecScore(

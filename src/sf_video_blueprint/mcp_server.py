@@ -517,6 +517,11 @@ def score_spec(spec_path: str) -> dict[str, Any]:
         # that is not evidence-backed at all. `total` stays raw for callers comparing
         # versions across refinement rounds. See SpecScore.display_total.
         displayTotal=score.display_total,
+        displayScoreNote=(
+            "Capped below the moderate band because blocking issues are present. "
+            "Use `total` for version comparisons; use `displayTotal` when showing a human."
+            if score.display_total < score.total else None
+        ),
         maxTotal=score.max_total,
         band=score.band,
         passed=score.passed,
@@ -1440,6 +1445,11 @@ def run_pipeline_full(
         confidence=final_spec.confidence,
         score=final_score.total,
         displayScore=final_score.display_total,
+        displayScoreNote=(
+            "Capped below the moderate band because blocking issues are present. "
+            "Use `score` for version comparisons; use `displayScore` when showing a human."
+            if final_score.display_total < final_score.total else None
+        ),
         maxScore=final_score.max_total,
         band=final_score.band,
         passed=effective_passed,
