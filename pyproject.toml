@@ -27,7 +27,7 @@ dependencies = [
 # because the CLI and library work without it, and `mcp` pulls in a web stack
 # (starlette, uvicorn, httpx) that a CLI-only user should not have to install.
 mcp = [
-  "mcp>=1.28,<2",
+  "mcp>=1.28,<3",
 ]
 dev = [
   # Lower bound rather than an exact pin: an exact pytest pin makes the package
