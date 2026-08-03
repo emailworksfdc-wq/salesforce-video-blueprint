@@ -99,13 +99,25 @@ def scan_spec(spec_dict: dict) -> list[str]:
     """Scan a DerivedAgentSpec (as dict) for placeholder/stub markers.
 
     This is the single entry point for scanning specs, so scope cannot diverge
-    between spec_score.py and scripts/score_run.py. Scans ALL human-readable
-    text in the spec, including evidence details where reviewers look for trust
-    signals.
+    between spec_score.py and scripts/score_run.py.
 
-    Fails closed: if spec_dict is malformed (None, non-dict, missing keys, wrong types),
-    returns empty list rather than crashing. A malformed spec is not evidence of
-    placeholder content; it will fail scoring elsewhere.
+    D7 FIX: previously this walked a WHITELIST of keys (intent, orchestration_steps,
+    guardrails, failure_handling, unknowns, entities[].name, entities[].evidence[].detail,
+    evidence[].detail). Any placeholder in a field NOT on that list — for example
+    evidence[].source, entities[].object_api_name, or any new field the builder adds
+    later — was missed here while scripts/score_run.py's raw-text JSON scan caught it.
+    The two gates then disagreed on the SAME artifact: in-process could score 100/100
+    while CI blocked. The whitelist was the divergence, so it is gone.
+
+    This function now walks the dict RECURSIVELY and collects every string it finds,
+    at any depth, in any key. That matches the scope of scripts/score_run.py's raw-JSON
+    scan by construction: if a marker is inside the serialized JSON, it will be inside
+    some string value here. New fields the builder adds are covered automatically —
+    the two gates cannot silently diverge again.
+
+    Fails closed: if spec_dict is malformed (None, non-dict, or contains cycles),
+    returns whatever markers were collected before the failure. A malformed spec is
+    not evidence of placeholder content; it will fail scoring elsewhere.
 
     Args:
         spec_dict: A DerivedAgentSpec.to_dict() result, or the parsed JSON form.
@@ -118,46 +130,35 @@ def scan_spec(spec_dict: dict) -> list[str]:
         return []
 
     text_parts: list[str] = []
+    seen_ids: set[int] = set()
 
-    def safe_append(value):
-        """Append value to text_parts if it's a string, else skip."""
+    def walk(value: object) -> None:
+        # Guard against pathological recursion (cycles or excessive nesting).
+        # We track ids of containers we've already visited; primitives don't need
+        # tracking because they can't cycle.
         if isinstance(value, str):
             text_parts.append(value)
-
-    def safe_extend(value):
-        """Extend text_parts with strings from value if it's a list, else skip."""
-        if isinstance(value, list):
+            return
+        if isinstance(value, dict):
+            if id(value) in seen_ids:
+                return
+            seen_ids.add(id(value))
+            for k, v in value.items():
+                # Keys can carry markers too (e.g. a dict keyed by "TODO: ...").
+                if isinstance(k, str):
+                    text_parts.append(k)
+                walk(v)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            if id(value) in seen_ids:
+                return
+            seen_ids.add(id(value))
             for item in value:
-                if isinstance(item, str):
-                    text_parts.append(item)
+                walk(item)
+            return
+        # Non-string primitives (int, float, bool, None) cannot contain markers.
 
-    # Top-level text fields
-    safe_append(spec_dict.get("intent", ""))
-    safe_extend(spec_dict.get("objects_touched", []))
-    safe_extend(spec_dict.get("orchestration_steps", []))
-    safe_extend(spec_dict.get("guardrails", []))
-    safe_extend(spec_dict.get("failure_handling", []))
-    safe_extend(spec_dict.get("unknowns", []))
-
-    # Entity names (the derived camelCase names)
-    entities = spec_dict.get("entities", [])
-    if isinstance(entities, list):
-        for entity in entities:
-            if isinstance(entity, dict):
-                safe_append(entity.get("name", ""))
-                # Entity evidence details - THIS WAS THE MISSING SCOPE
-                evidence_list = entity.get("evidence", [])
-                if isinstance(evidence_list, list):
-                    for evidence in evidence_list:
-                        if isinstance(evidence, dict):
-                            safe_append(evidence.get("detail", ""))
-
-    # Top-level evidence details - ALSO MISSING
-    top_evidence = spec_dict.get("evidence", [])
-    if isinstance(top_evidence, list):
-        for evidence in top_evidence:
-            if isinstance(evidence, dict):
-                safe_append(evidence.get("detail", ""))
+    walk(spec_dict)
 
     combined = " ".join(text_parts)
     return scan_text(combined)

@@ -136,6 +136,120 @@ MIN_INSTRUCTION_WORDS = 3
 # mostly empty cannot pass on the strength of its metadata.
 MAX_FILLER_INSTRUCTION_FRACTION = 0.4
 
+# NEAR-DUPLICATE INSTRUCTION DEFENSE:
+#
+# The existing distinctness check for steps/guardrails is EXACT-STRING after
+# lowercase + whitespace normalisation. That collapses only textual duplicates —
+# it does not close near-duplicates that differ only by trailing filler
+# ("... now" vs "... here"), punctuation ("safely" vs "safely."), or minor word
+# reorderings. MEASURED counter-example (the one this defense fixes):
+#
+#   orchestration_steps = ["Resolve the Case Status now", "Resolve the Case Status here"]
+#   guardrails          = ["Please handle input safely",   "Please handle input safely."]
+#
+# Both pairs were textually distinct so the exact-match set counted them as
+# two-of-two distinct, completeness scored full, and the spec totalled 82/100
+# passed=True — while carrying exactly the semantic defect the completeness
+# section claims to detect (duplicated instructions padding out the count).
+#
+# The signature below strips punctuation, strips a small English stopword set,
+# and keys on the frozenset of remaining content tokens. Two items with the same
+# signature but different exact text are near-duplicates. Kept intentionally
+# small so that legitimately-distinct enumerated steps (D3: "Escalate to tier 1"
+# vs "Escalate to tier 2") remain distinct — the digit is a content token, not a
+# stopword. Signatures under MIN_SIGNATURE_TOKENS are ignored (a two-token
+# instruction has too little content to reliably deduplicate on).
+INSTRUCTION_STOPWORDS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those",
+    "is", "are", "was", "were", "be", "been", "being",
+    "and", "or", "but", "for", "to", "of", "on", "in", "at", "by", "with",
+    "from", "as", "so", "if", "then", "than",
+    "now", "here", "there", "again", "also", "just", "very", "really",
+    "please", "kindly", "safely",  # generic hedge/filler adverbs
+    "it", "its", "we", "you", "they",
+    "do", "does", "did", "done",
+    "will", "would", "should", "could", "may", "might", "can",
+})
+
+# Minimum number of content tokens required to compare two signatures. A
+# signature of size < this floor is too small to make a reliable "these are
+# saying the same thing" claim. Set at 2 because a single content word ("save")
+# is also the shape of the shortest real instruction the builder emits.
+MIN_SIGNATURE_TOKENS = 2
+
+
+def _instruction_signature(text: str) -> frozenset[str] | None:
+    """Return an order-and-punctuation-insensitive signature for an instruction.
+
+    Two instructions with the same signature are near-duplicates: same content
+    tokens after stripping stopwords/punctuation, ignoring order and casing.
+
+    Returns None if the string is not usable or has too few content tokens; the
+    caller must treat None as "no comparable signature" rather than as a match.
+    """
+    import re as _re
+    if not isinstance(text, str):
+        return None
+    # Split on non-alphanumeric (keeps digits, drops punctuation).
+    tokens = _re.split(r"[^0-9a-zA-Z]+", text.lower())
+    content = frozenset(
+        tok for tok in tokens
+        if tok and tok not in INSTRUCTION_STOPWORDS
+    )
+    if len(content) < MIN_SIGNATURE_TOKENS:
+        return None
+    return content
+
+
+def _digit_stripped_key(text: str) -> str | None:
+    """Padding-only distinctness key: lowercased content with pure-digit tokens dropped.
+
+    Used ONLY by the padding-detector heuristic (raw count > 5 AND digit-stripped
+    distinct ratio > 3). Do NOT use for `distinct_steps` — D3 established that
+    trailing digits ARE legitimate content in short enumerations. But when a spec
+    contains many items whose ONLY differentiator is a rotating counter
+    ("Resolve the Case 0" … "Resolve the Case 9"), the digit is carrying zero
+    semantic weight and the shape is padding, not a real 10-step process. This
+    key collapses that case without collapsing "Escalate to tier 1..3" (which is
+    guarded by the raw-count > 5 gate).
+    """
+    import re as _re
+    if not isinstance(text, str):
+        return None
+    tokens = _re.split(r"[^0-9a-zA-Z]+", text.lower())
+    kept = [tok for tok in tokens if tok and not tok.isdigit()]
+    if not kept:
+        return None
+    return " ".join(kept)
+
+
+def _find_near_duplicate_groups(items: list[str]) -> list[list[str]]:
+    """Group items that share a signature but are not exact duplicates.
+
+    Exact duplicates are handled by the existing distinct-count logic; this
+    surface catches the near-duplicate case that logic misses. Only groups
+    where the exact strings differ are returned — an exact duplicate pair is a
+    different defect and is scored separately.
+    """
+    if not isinstance(items, list):
+        return []
+    buckets: dict[frozenset[str], list[str]] = {}
+    for item in items:
+        sig = _instruction_signature(item)
+        if sig is None:
+            continue
+        buckets.setdefault(sig, []).append(item)
+    groups: list[list[str]] = []
+    for group in buckets.values():
+        if len(group) < 2:
+            continue
+        # Only count as near-duplicate if the exact strings are not all identical
+        # (exact duplicates are handled by the distinct-set check).
+        if len({s.strip() for s in group}) < 2:
+            continue
+        groups.append(group)
+    return groups
+
 
 def score_provenance(provenance: dict[str, str] | None) -> tuple[DimensionScore, list[str]]:
     """Score provenance integrity dimension.
@@ -572,6 +686,52 @@ def score_spec(
                 "writes the observed field or target into the step it derived from it."
             )
 
+    # NEAR-DUPLICATE INSTRUCTION BLOCKER:
+    #
+    # The distinctness set in _score_completeness collapses only textually-identical
+    # entries. It cannot see near-duplicates that differ by trailing filler ("... now"
+    # vs "... here"), by punctuation ("safely" vs "safely."), or by minor
+    # reorderings — all three of which are the shape a refinement loop converges on
+    # when the F1 fix is a fixture-shape check rather than a semantic property.
+    #
+    # MEASURED (before this block): a spec with
+    #   orchestration_steps=["Resolve the Case Status now","Resolve the Case Status here"]
+    #   guardrails=["Please handle input safely","Please handle input safely."]
+    # scored 82/100 passed=True with no blocking issue, while carrying exactly the
+    # duplicated-instructions defect the F1 spec was written to fail on. Blocking
+    # here rather than docking, because near-duplicates are a claim about what the
+    # spec IS — a two-step process, a two-guardrail rule set — that the content of
+    # the pair contradicts. Averaging that into a partial score misrepresents the
+    # artifact, the same reason C8 filler and C10 coupling are blockers.
+    step_dup_groups = _find_near_duplicate_groups(
+        spec.orchestration_steps if isinstance(spec.orchestration_steps, list) else []
+    )
+    guardrail_dup_groups = _find_near_duplicate_groups(
+        spec.guardrails if isinstance(spec.guardrails, list) else []
+    )
+    if step_dup_groups:
+        preview = "; ".join(
+            " / ".join(repr(s)[:40] for s in group) for group in step_dup_groups[:2]
+        )
+        blocking.append(
+            f"Near-duplicate orchestration steps detected: {preview}. Two steps that "
+            "differ only by trailing filler, punctuation, or word order say the same "
+            "thing, so the spec is claiming a longer process than it describes. The "
+            "distinct-string check misses this shape; the honest builder does not "
+            "emit two steps with the same content signature."
+        )
+    if guardrail_dup_groups:
+        preview = "; ".join(
+            " / ".join(repr(g)[:40] for g in group) for group in guardrail_dup_groups[:2]
+        )
+        blocking.append(
+            f"Near-duplicate guardrails detected: {preview}. Two guardrails whose "
+            "content tokens match after stripping stopwords/punctuation are the same "
+            "rule stated twice, not two independent rules. The distinct-string check "
+            "misses this shape; the honest builder does not emit two guardrails with "
+            "the same content signature."
+        )
+
     # Band calculation: blocking issues force "low" band regardless of numeric score
     if blocking:
         band = "low"
@@ -763,8 +923,22 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
         if not hasattr(entity, 'evidence') or not hasattr(entity, 'field_api_name'):
             continue
         sources = [e.source for e in entity.evidence] if isinstance(entity.evidence, list) else []
-        # Mandated recordId: inference-only, field_api_name == "Id"
-        if entity.field_api_name == "Id" and sources == ["inference"]:
+        # Mandated recordId: field_api_name == "Id" and EVERY evidence source is
+        # inference.
+        #
+        # D2 SECONDARY FIX: this used to be `sources == ["inference"]`, an exact
+        # list-identity check. That defined "mandated" by list length: a recordId
+        # with two inference evidence entries escaped the filter and was scored
+        # as an observed entity, even though every one of its sources was
+        # inference and semantically it is still the builder's mandated
+        # inference-only record identifier. Test the semantics instead — all
+        # sources are inference — so the classification does not depend on
+        # accidental evidence-list cardinality.
+        if (
+            entity.field_api_name == "Id"
+            and sources
+            and all(s == "inference" for s in sources)
+        ):
             mandated_record_ids.append(entity)
         else:
             observed_entities.append(entity)
@@ -773,10 +947,40 @@ def _score_evidence_grounding(spec: DerivedAgentSpec) -> DimensionScore:
     total_entities = len(observed_entities)
 
     if total_entities == 0:
-        # Only mandated recordId exists -> score based on whether we have any real evidence at all
-        # This is low but not zero (we do know the object)
-        score = max_score // 4
-        findings.append("Only the mandated recordId entity exists; no field-level data observed.")
+        # C12 FIX: mandated-only branch must score 0, not max_score // 4.
+        #
+        # The old value was 7 (max_score // 4), defended by the comment "we do know
+        # the object". That claim is (a) redundant with objects_touched, which is
+        # already scored under completeness, and (b) a direct G1 violation.
+        #
+        # MEASURED counter-example: a spec with two entities — one honestly-labelled
+        # inference-only entity on a non-Id field (customer_name on Contact.Name,
+        # substantive detail) plus the mandated recordId — sends observed_entities
+        # to [customer_name] and scores it via the all-inference path (floor 0% +
+        # coverage 0%) = 0/30. Deleting the inference entity leaves
+        # observed_entities=[], falls into this branch, and used to return 7/30 —
+        # deletion of the honestly-labelled inference row PAID +7 points on
+        # evidence_grounding, which is the "concealing beats declaring" inversion
+        # the C5 comment already flags as the worst possible outcome, smuggled in
+        # via the mandated-only fallback rather than via ratio arithmetic.
+        #
+        # It also crossed HOLLOW_DIMENSION_FRACTION * max_score = 3, so the
+        # hollow-dimension blocker that fired at 0/30 stopped firing at 7/30 —
+        # deletion additionally REMOVED a blocking issue, which is strictly worse
+        # than merely inflating a raw score.
+        #
+        # Fix: the mandated-only score must be <= the score of any deletion
+        # predecessor. The all-inference-only-observed predecessor scores 0, so
+        # this branch must also score 0. This preserves G2 (adding a mandated
+        # recordId never lowers the score — 0 -> 0 is a no-op or an increase over
+        # the "no entities" branch's own 0) while closing the G1 hole.
+        score = 0
+        findings.append(
+            "Only the mandated recordId entity exists; no field-level data observed. "
+            "Scored 0 rather than a partial floor because a partial floor here would "
+            "reward deleting an honestly-labelled inference entity down to just the "
+            "mandated recordId — deletion must never raise the score."
+        )
         evidence_strs.append(f"{len(mandated_record_ids)} mandated recordId(s), 0 observed entities")
         return DimensionScore(
             name="evidence_grounding",
@@ -1053,23 +1257,40 @@ def _score_completeness(spec: DerivedAgentSpec) -> DimensionScore:
     else:
         findings.append("No entities.")
 
-    # F3: Count DISTINCT steps (normalize: strip, lowercase, collapse whitespace, strip trailing digits)
+    # F3: Count DISTINCT steps (normalize: strip, lowercase, collapse whitespace)
     # DEFECT 4 FIX: Defensive check - ensure orchestration_steps is a list of strings
+    # D3 COMPATIBILITY FIX: Do NOT strip trailing digits from the distinctness key.
+    # Enumerated steps like ["Escalate to tier 1", ..., "Escalate to tier 6"] or
+    # ["Step 1", "Step 2", "Step 3"] are legitimately distinct — the numeric suffix
+    # carries the semantic differentiation. Stripping it collapses N genuinely
+    # distinct actions into 1 and either zeroes the section or triggers a false
+    # PADDING DETECTED finding. Textually-identical duplicates still collapse via
+    # the exact-match set.
     distinct_steps = set()
     steps = spec.orchestration_steps if isinstance(spec.orchestration_steps, list) else []
     for step in steps:
         if not isinstance(step, str):
             continue
         normalized = " ".join(step.strip().lower().split())
-        # Strip trailing digits/numbers to detect padding like "Resolve Case 1", "Resolve Case 2", ...
-        # This catches patterns where the only difference is a numeric suffix.
-        normalized_without_numbers = re.sub(r'\s+\d+$', '', normalized)  # Strip " 123" at end
-        if normalized_without_numbers:  # non-empty after normalization
-            distinct_steps.add(normalized_without_numbers)
+        if normalized:  # non-empty after normalization
+            distinct_steps.add(normalized)
 
     # PADDING DETECTION (Attack 9): If we have >5 steps but only 1-3 distinct, it's padding.
+    # Two-signature rule (post-D3):
+    #   (a) Exact-string ratio > 3 on raw > 5      → padding (original rule)
+    #   (b) Digit-stripped ratio > 3 on raw > 8    → padding (post-D3 padded-enumeration)
+    # The stricter raw > 8 gate on the digit-stripped signal preserves D3's legitimate
+    # short enumerations (3, 6 items) — "Escalate to tier 1..6" and "Enforce FLS on Case
+    # 1..6" pass — while catching the padded-enumeration attack ("Resolve the Case 0..9")
+    # tests_gaming_resistance encodes. The exact-string ratio fires as before on
+    # textually-identical duplicates regardless of digit shape.
     steps_padding_ratio = len(spec.orchestration_steps) / max(len(distinct_steps), 1)
-    steps_padding_detected = len(spec.orchestration_steps) > 5 and steps_padding_ratio > 3
+    _dstripped_steps = {k for k in (_digit_stripped_key(s) for s in steps) if k}
+    steps_padding_ratio_dstrip = len(spec.orchestration_steps) / max(len(_dstripped_steps), 1)
+    steps_padding_detected = (
+        (len(spec.orchestration_steps) > 5 and steps_padding_ratio > 3)
+        or (len(spec.orchestration_steps) > 8 and steps_padding_ratio_dstrip > 3)
+    )
 
     if len(distinct_steps) > 1:  # >1 because a trivial spec has exactly 1
         step_score = section_score
@@ -1094,44 +1315,56 @@ def _score_completeness(spec: DerivedAgentSpec) -> DimensionScore:
 
     # F3: Also check for distinct guardrails (same logic as steps)
     # DEFECT 4 FIX: Defensive check - ensure guardrails is a list of strings
+    # D3 COMPATIBILITY FIX: Do NOT strip trailing digits from the distinctness key
+    # (see rationale on orchestration_steps above). Guardrails like
+    # ["Enforce FLS on Case 1", ..., "Enforce FLS on Case N"] are legitimately
+    # distinct — the trailing digit is the semantic differentiator.
     distinct_guardrails = set()
     guardrails = spec.guardrails if isinstance(spec.guardrails, list) else []
     for guardrail in guardrails:
         if not isinstance(guardrail, str):
             continue
         normalized = " ".join(guardrail.strip().lower().split())
-        # Strip trailing digits to detect padding like "Enforce FLS on Case 1", "Enforce FLS on Case 2", ...
-        normalized_without_numbers = re.sub(r'\s+\d+$', '', normalized)
-        if normalized_without_numbers:
-            distinct_guardrails.add(normalized_without_numbers)
+        if normalized:
+            distinct_guardrails.add(normalized)
 
     # PADDING DETECTION (Attack 10): Same logic as steps.
     # DEFECT 4 FIX: Use the defensive local guardrails variable, not spec.guardrails
+    # POST-D3: also compute digit-stripped distinctness so ["Enforce FLS on Case 0..9"]
+    # (10 exact-distinct items whose only differentiator is a rotating counter) is
+    # caught as padding, while ["Enforce FLS on Case 1..3"] (raw <= 5) stays safe.
     guardrails_padding_ratio = len(guardrails) / max(len(distinct_guardrails), 1)
-    guardrails_padding_detected = len(guardrails) > 5 and guardrails_padding_ratio > 3
+    _dstripped_guardrails = {k for k in (_digit_stripped_key(g) for g in guardrails) if k}
+    guardrails_padding_ratio_dstrip = len(guardrails) / max(len(_dstripped_guardrails), 1)
+    guardrails_padding_detected = (
+        (len(guardrails) > 5 and guardrails_padding_ratio > 3)
+        or (len(guardrails) > 8 and guardrails_padding_ratio_dstrip > 3)
+    )
 
     if guardrails and len(distinct_guardrails) > 0:
         guardrail_score = section_score
-        # Award full section score only if guardrails are non-duplicate
-        if len(distinct_guardrails) < len(guardrails):
-            # Duplicate guardrails detected
-            if guardrails_padding_detected:
-                guardrail_score = section_score // 4  # Heavy penalty for padding
-                findings.append(
-                    f"PADDING DETECTED in guardrails: {len(guardrails)} guardrails "
-                    f"but only {len(distinct_guardrails)} distinct (ratio {guardrails_padding_ratio:.1f}:1). "
-                    "This is likely an attack to inflate guardrail counts."
-                )
-            else:
-                guardrail_score = section_score // 2  # Partial penalty for normal duplicates
-                findings.append(
-                    f"{len(guardrails) - len(distinct_guardrails)} duplicate guardrail(s) detected "
-                    f"({len(distinct_guardrails)} distinct)"
-                )
+        if guardrails_padding_detected:
+            guardrail_score = section_score // 4  # Heavy penalty for padding
+            _report_ratio = max(guardrails_padding_ratio, guardrails_padding_ratio_dstrip)
+            findings.append(
+                f"PADDING DETECTED in guardrails: {len(guardrails)} guardrails "
+                f"but only {len(distinct_guardrails)} distinct exact "
+                f"(digit-stripped distinct: {len(_dstripped_guardrails)}, "
+                f"ratio {_report_ratio:.1f}:1). "
+                "This is likely an attack to inflate guardrail counts."
+            )
             evidence_strs.append(f"{len(distinct_guardrails)} distinct guardrails (from {len(guardrails)} total)")
-        score += guardrail_score
-        if not (len(distinct_guardrails) < len(guardrails)):
+        elif len(distinct_guardrails) < len(guardrails):
+            # Non-padding exact-string duplicate: partial penalty, keep pre-D3 behavior.
+            guardrail_score = section_score // 2
+            findings.append(
+                f"{len(guardrails) - len(distinct_guardrails)} duplicate guardrail(s) detected "
+                f"({len(distinct_guardrails)} distinct)"
+            )
+            evidence_strs.append(f"{len(distinct_guardrails)} distinct guardrails (from {len(guardrails)} total)")
+        else:
             evidence_strs.append(f"{len(guardrails)} guardrails")
+        score += guardrail_score
     else:
         findings.append("No guardrails.")
 

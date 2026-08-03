@@ -167,7 +167,7 @@ cd salesforce-video-blueprint
 
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,mcp]"
-.venv/bin/python -m pytest -q          # 1806 passed, 1 skipped
+.venv/bin/python -m pytest -q          # 1971 passed, 1 skipped
 ```
 
 Without the `mcp` extra you get `1718 passed, 12 skipped` — the MCP server tests
@@ -385,7 +385,7 @@ including where the gaps are. It is self-contained; no server needed.
 | `salesforce_collectors.py`, `telemetry.py` | REST/Tooling telemetry: `ApexLog`, `FlowInterview`, `ValidationRule`, `AsyncApexJob` |
 | `correlation.py` | Joins UI steps to backend evidence in a 5-second forward window |
 | `spec_builder.py` | Derives the agent spec from correlated evidence. Never invents. |
-| `spec_score.py` | The falsifiable quality gate (7 weighted dimensions, threshold 75) |
+| `spec_score.py` | The falsifiable quality gate (7 weighted dimensions summing to 100, `PASS_THRESHOLD = 75`, `MAX_BLOCKED_DISPLAY_TOTAL = 59`, `provenance_integrity` fail-closed) |
 | `naming.py` | Single source of truth for API names across every artifact |
 | `agent_script.py` | `.agent` (Agent Script) + `.bundle-meta.xml` emitters |
 | `org_validation.py` | Calls Salesforce's Agent Script compiler; skips cleanly with no org |
@@ -415,6 +415,13 @@ flagged rather than passed.
 
 > **Contract:** never raise a score by weakening the gate. Making the gate
 > weaker is a defect, not a fix. Raise it by capturing better evidence.
+
+**Round 2 scoring.** The gate is 7 weighted dimensions summing to 100 with
+`PASS_THRESHOLD = 75`. `provenance_integrity` is fail-closed: a spec built from
+non-real sources caps the *displayed* total at `MAX_BLOCKED_DISPLAY_TOTAL = 59`
+regardless of how the other dimensions score. See
+[`docs/INTERFACE_CONTRACT_ROUND2.md`](docs/INTERFACE_CONTRACT_ROUND2.md) for the
+authoritative dimension list, weights, and blocking rules.
 
 ---
 

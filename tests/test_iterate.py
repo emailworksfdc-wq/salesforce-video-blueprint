@@ -1641,3 +1641,88 @@ def test_write_iteration_summary_full_run(tmp_path: Path) -> None:
 
     # Blocking issues section
     assert "Blocking Issues" in content
+
+
+# ---------------------------------------------------------------------------
+# G5 regression: refinement must be EFFECTIVE on genuinely-derived input
+# ---------------------------------------------------------------------------
+#
+# Defect D9 (INTERFACE_CONTRACT_ROUND?): refine() proved effective only on
+# synthetic fixtures. On a real DOM capture (examples/case_creation_aft3), the
+# offline loop returns "No offline improvements applied" every round and score
+# never moves. This regression pins the minimum viable proof: given a spec
+# derived from a REAL dom_capture.jsonl with a below-threshold perturbation the
+# loop demonstrably CAN fix (duplicated guardrails + duplicated orchestration
+# steps), refine() must raise the score by at least +1 before it stops. A run
+# that never fires any lever on real data is proof G5 is decorative.
+
+
+def _case_creation_capture_path() -> Path:
+    """Locate the case-creation DOM capture fixture from the repo root."""
+    here = Path(__file__).resolve()
+    for parent in [here.parent, *here.parents]:
+        candidate = parent / "examples" / "case_creation_aft3.dom_capture.jsonl"
+        if candidate.is_file():
+            return candidate
+    pytest.skip("examples/case_creation_aft3.dom_capture.jsonl not present")
+
+
+def test_refine_effective_on_real_derived_input(tmp_path: Path) -> None:
+    """G5: refine() must raise the score by >= +1 on real DOM-derived input.
+
+    Build a spec from examples/case_creation_aft3.dom_capture.jsonl via the
+    production pipeline, apply a minimal perturbation the offline levers are
+    supposed to cure (duplicated guardrails + duplicated orchestration steps),
+    run refine(), and assert the loop actually improved the score.
+    """
+    from sf_video_blueprint.pipeline import run_pipeline
+
+    capture = _case_creation_capture_path()
+    pipeline_result = run_pipeline(
+        capture,
+        org_url="https://x.sandbox.my.salesforce.com",
+    )
+    base_spec = pipeline_result.spec
+    provenance = pipeline_result.provenance
+
+    # Perturbation: duplicate guardrails and duplicate first few orchestration
+    # steps. Both are levers _apply_offline_improvements advertises. If the loop
+    # cannot cure a perturbation it *itself claims to fix*, G5 is broken.
+    perturbed = copy.deepcopy(base_spec)
+    perturbed.guardrails = list(perturbed.guardrails) + list(perturbed.guardrails)
+    if len(perturbed.orchestration_steps) >= 2:
+        perturbed.orchestration_steps = (
+            list(perturbed.orchestration_steps)
+            + list(perturbed.orchestration_steps[:2])
+        )
+
+    result = refine(
+        perturbed,
+        out_dir=tmp_path / "g5_run",
+        company_name="Acme",
+        company_description="Regression harness for G5",
+        max_rounds=5,
+        epsilon=2,
+        use_cli=False,
+        provenance=provenance,
+    )
+
+    first_score = result.versions[0].score.total
+    best_score = max(v.score.total for v in result.versions)
+    delta = best_score - first_score
+
+    # A refinement lever must have fired somewhere across the rounds.
+    lever_fired = any(
+        any("Applied" in n for n in v.notes) for v in result.versions[1:]
+    )
+
+    assert delta >= 1, (
+        f"G5 FAILURE: refine() did not raise the score on real derived input. "
+        f"first={first_score} best={best_score} delta={delta} "
+        f"rounds={result.rounds_run} stop={result.stop_reason!r} "
+        f"notes={[v.notes for v in result.versions]}"
+    )
+    assert lever_fired, (
+        "G5 FAILURE: refine() finished without any _apply_offline_improvements "
+        "lever firing on real derived input."
+    )

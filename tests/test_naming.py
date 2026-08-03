@@ -834,3 +834,150 @@ def test_prefixed_api_name_refuses_a_prefix_that_eats_the_whole_cap():
 def test_prefixed_api_name_with_no_prefix_is_just_the_topic_name():
     """An empty prefix must not invent a separator or change the derivation."""
     assert prefixed_api_name("", "Update Case (Status)") == topic_api_name("Update Case (Status)")
+
+
+# === PYTHON KEYWORD COLLISION GUARD (D8) ===
+#
+# subagent_name() emits snake_case names consumed by Agent Script tooling that
+# parses the emitted `.agent` via Python identifier paths. If a recording's
+# intent normalises to `class`, `return`, `if`, etc., the compiler rejects the
+# emitted `@subagent.class` reference. Guard by asserting that the reserved
+# set escapes EVERY entry in `keyword.kwlist` (and soft keywords), for both
+# dialects, so `names_agree` still holds.
+
+import keyword as _kw
+
+
+@pytest.mark.parametrize("kw", sorted(_kw.kwlist))
+def test_subagent_name_never_equals_a_python_keyword(kw: str):
+    """Every HARD Python keyword must be escaped by subagent_name().
+
+    Soft keywords (`match`, `case`, `type`, `_`) are deliberately NOT in scope
+    here — they are legal Python identifiers, `class Foo: case = 5; obj.case`
+    compiles and runs. Escaping them was an over-eager guard that silently
+    renamed the Salesforce standard object `Case` to `case_topic`. See
+    ``test_soft_keywords_are_legal_identifiers_and_not_escaped`` below.
+    """
+    subagent = subagent_name(kw)
+    assert subagent not in _kw.kwlist, (
+        f"subagent_name({kw!r}) = {subagent!r} collides with a Python keyword"
+    )
+
+
+@pytest.mark.parametrize("kw", sorted(_kw.kwlist))
+def test_topic_api_name_never_equals_a_python_keyword(kw: str):
+    """Every HARD Python keyword must be escaped by topic_api_name() too, in its own dialect."""
+    topic = topic_api_name(kw)
+    # Compare in the snake_case dialect since keywords are lowercase.
+    assert topic.lower() not in _kw.kwlist, (
+        f"topic_api_name({kw!r}) = {topic!r} snakes to a Python keyword"
+    )
+
+
+@pytest.mark.parametrize("kw", sorted(_kw.kwlist))
+def test_keyword_escape_preserves_linkage(kw: str):
+    """After escaping, `names_agree(topic, subagent)` must still hold."""
+    topic = topic_api_name(kw)
+    subagent = subagent_name(kw)
+    assert names_agree(topic, subagent), (
+        f"Linkage broken for keyword {kw!r}: topic={topic!r}, subagent={subagent!r}"
+    )
+
+
+@pytest.mark.parametrize("kw", sorted(_kw.kwlist))
+def test_keyword_escape_uses_topic_suffix(kw: str):
+    """The chosen escape is the stable `_topic` suffix, matching grammar-keyword handling."""
+    subagent = subagent_name(kw)
+    # For a bare keyword input, the escape should append _topic.
+    assert subagent.endswith("_topic"), (
+        f"subagent_name({kw!r}) = {subagent!r} did not receive the _topic escape"
+    )
+
+
+# === REGRESSION: soft keywords are legal identifiers, must NOT be escaped ===
+#
+# `keyword.softkwlist` (`match`, `case`, `type`, `_` as of 3.10+) are legal
+# Python identifiers — `class Foo: case = 5; obj.case` compiles and runs. The
+# empirical justification for escaping HARD keywords (`class`, `return`) does
+# NOT carry over. Including softkwlist in the reserved set caused a silent
+# false positive: intent "Case" (the Salesforce standard object) tokenised to
+# `["Case"]`, joined to `case`, and was suffixed to `Case_topic` / `case_topic`,
+# silently breaking backward compatibility with any prior generated spec whose
+# topic was `Case`. Same false positive for `"Type"`, `"Match"`.
+#
+# This test locks in the fix: soft keywords must round-trip cleanly.
+
+
+@pytest.mark.parametrize(
+    "intent,expected_topic,expected_subagent",
+    [
+        # The headline counter-example: Salesforce standard object.
+        ("Case", "Case", "case"),
+        # Account.Type is a real Salesforce field-name pattern.
+        ("Type", "Type", "type"),
+        # A plausible business verb.
+        ("Match", "Match", "match"),
+        # Lowercased forms of the same intents must not be escaped either.
+        ("case", "Case", "case"),
+        ("type", "Type", "type"),
+        ("match", "Match", "match"),
+    ],
+)
+def test_soft_keywords_are_legal_identifiers_and_not_escaped(
+    intent: str, expected_topic: str, expected_subagent: str
+):
+    """Soft-keyword intents must NOT receive the `_topic` suffix.
+
+    Regression for the D8 compatibility defect: including `keyword.softkwlist`
+    in `_RESERVED_SUBAGENT_NAMES` mislabelled the Salesforce standard object
+    `Case` (and other soft-keyword-named intents) as a grammar collision and
+    silently renamed it. Soft keywords are legal Python identifiers, so no
+    escape is warranted.
+    """
+    assert topic_api_name(intent) == expected_topic, (
+        f"topic_api_name({intent!r}) should not receive a keyword-collision suffix"
+    )
+    assert subagent_name(intent) == expected_subagent, (
+        f"subagent_name({intent!r}) should not receive a keyword-collision suffix"
+    )
+    # is_reserved must also agree — soft keywords are not reserved.
+    assert not is_reserved(intent), (
+        f"is_reserved({intent!r}) must be False; soft keywords are legal identifiers"
+    )
+
+
+def test_underscore_soft_keyword_is_not_reserved():
+    """`_` is a soft keyword in 3.10+ but a legal identifier; must not be treated as reserved.
+
+    Bare `_` tokenises to a single token; the name-derivation path applies its
+    non-alpha-prefix rule (`T_` prefix) which is unrelated to the reserved-set
+    question. What we assert here is that the reserved-set check itself does
+    not flag `_` as a collision.
+    """
+    assert not is_reserved("_"), "'_' is a soft keyword but a legal identifier; not reserved"
+
+
+# === GOLDEN TEST: non-colliding inputs still produce byte-identical output ===
+
+@pytest.mark.parametrize(
+    "intent,expected_topic,expected_subagent,expected_router",
+    [
+        ("Update Case (Status)", "Update_Case_Status", "update_case_status", "go_to_update_case_status"),
+        ("Close Opportunity", "Close_Opportunity", "close_opportunity", "go_to_close_opportunity"),
+        ("Create Contact", "Create_Contact", "create_contact", "go_to_create_contact"),
+        ("HTTPResponse", "HTTP_Response", "http_response", "go_to_http_response"),
+        ("updateCaseStatus", "Update_Case_Status", "update_case_status", "go_to_update_case_status"),
+    ],
+)
+def test_golden_non_colliding_inputs_are_byte_identical(
+    intent: str, expected_topic: str, expected_subagent: str, expected_router: str
+):
+    """The Python-keyword fix MUST NOT alter output for non-colliding inputs.
+
+    This locks in byte-identical output for the intents that dominate real
+    recordings, so a future change to the reserved set cannot silently drift
+    the emitted names.
+    """
+    assert topic_api_name(intent) == expected_topic
+    assert subagent_name(intent) == expected_subagent
+    assert router_action_name(intent) == expected_router

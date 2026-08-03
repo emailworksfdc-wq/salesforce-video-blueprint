@@ -568,6 +568,134 @@ def test_stub_extraction_still_caught():
     assert "Heuristic extraction in use" in placeholder_dim.findings
 
 
+def test_d7_stub_marker_in_entity_evidence_detail_blocks_spec():
+    """D7: in-process scanner must catch stub markers anywhere in the spec.
+
+    scripts/score_run.py greps the raw JSON text for PLACEHOLDER_MARKERS +
+    STUB_FINGERPRINTS across the WHOLE serialized artifact. scan_spec previously
+    walked a whitelist of keys and missed content in fields that weren't on the
+    list — evidence[].source, or any new field the builder adds later. That let
+    an artifact score 100/100 in-process while CI blocked the same file.
+
+    The regression prevention: put a STUB_FINGERPRINT in a spot the old whitelist
+    scan didn't cover — evidence[].source, an entity.evidence.detail with a stub
+    fingerprint, and a top-level evidence.detail with a placeholder marker — on
+    an otherwise clean spec, and assert the placeholder_freedom dimension flags it
+    and a blocking issue fires.
+    """
+    # Case 1: STUB_FINGERPRINT in entity.evidence[].detail
+    # (the scenario explicitly named in the D7 report: entity.evidence.detail).
+    spec_a = _make_spec(
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[
+                    SpecEvidence(
+                        "data-delta",
+                        # STUB_FINGERPRINT embedded in an otherwise plausible detail.
+                        "Case.Status observed; Heuristic extraction in use during derivation",
+                    )
+                ],
+            ),
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("inference", "recordId required to act on the record")],
+            ),
+        ],
+    )
+    result_a = score_spec(spec_a)
+    assert result_a.dimensions["placeholder_freedom"].score == 0, (
+        f"D7: stub fingerprint in entity.evidence[].detail was NOT caught in-process. "
+        f"placeholder_freedom={result_a.dimensions['placeholder_freedom'].score}"
+    )
+    assert any("Heuristic extraction in use" in issue for issue in result_a.blocking_issues), (
+        f"D7: stub in entity.evidence[].detail did not raise a blocking issue. "
+        f"blocking={result_a.blocking_issues}"
+    )
+    assert not result_a.passed, "D7: spec with stub in entity.evidence.detail must not pass"
+
+    # Case 2: PLACEHOLDER_MARKER in evidence[].source (a field the old whitelist
+    # scan did NOT read — evidence[].source is not on the whitelist, only
+    # evidence[].detail was).
+    spec_b = _make_spec(
+        evidence=[
+            # A source value that also carries a placeholder marker. The old
+            # whitelist walked evidence[].detail but never evidence[].source, so
+            # this was invisible to scan_spec while score_run.py's raw-text
+            # scan caught it.
+            SpecEvidence("telemetry TODO: link source not yet wired", "validation observed"),
+            SpecEvidence("data-delta", "Case mutated"),
+        ],
+    )
+    result_b = score_spec(spec_b)
+    assert result_b.dimensions["placeholder_freedom"].score == 0, (
+        f"D7: TODO marker in evidence[].source was NOT caught in-process. "
+        f"placeholder_freedom={result_b.dimensions['placeholder_freedom'].score}, "
+        f"findings={result_b.dimensions['placeholder_freedom'].findings}"
+    )
+    assert any(
+        "TODO" in issue or "Placeholder" in issue for issue in result_b.blocking_issues
+    ), (
+        f"D7: TODO in evidence[].source did not raise a blocking issue. "
+        f"blocking={result_b.blocking_issues}"
+    )
+
+
+def test_d7_in_process_scan_matches_raw_json_scan():
+    """D7: in-process scan_spec must find every marker scripts/score_run.py's raw scan would find.
+
+    The invariant that keeps the two gates from diverging: for any serialized spec
+    JSON, `scan_spec(loaded_dict)` and the raw-text scan performed by
+    `scripts/score_run.py:_scan_placeholders` must return the SAME set of markers.
+    We plant one STUB_FINGERPRINT and one PLACEHOLDER_MARKER in fields the old
+    whitelist scan didn't cover, serialize, and compare.
+    """
+    spec = _make_spec(
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[
+                    SpecEvidence(
+                        "data-delta",
+                        "Case.Status observed; Baseline extraction. Replace with CV pipeline",
+                    )
+                ],
+            ),
+        ],
+        evidence=[
+            SpecEvidence("telemetry", "validation observed"),
+            SpecEvidence("extraction", "TODO: capture the 3 action(s) properly"),
+        ],
+    )
+
+    serialized = json.dumps(spec.to_dict())
+
+    from sf_video_blueprint.markers import (
+        PLACEHOLDER_MARKERS as PM,
+        STUB_FINGERPRINTS as SF,
+        scan_spec,
+    )
+
+    raw_hits = {m for m in (*PM, *SF) if m in serialized}
+    scan_hits = set(scan_spec(spec.to_dict()))
+
+    # Every marker the raw-JSON scan would find must also be found by scan_spec.
+    # (scan_spec may find additional occurrences via deduplication of counts, so
+    # we check set containment in one direction rather than equality of counts.)
+    assert raw_hits.issubset(scan_hits), (
+        f"D7: scan_spec missed markers the raw-JSON scan caught. "
+        f"raw_only={raw_hits - scan_hits}, raw={raw_hits}, scan={scan_hits}"
+    )
+    # And the raw scan must have found something, or this test is vacuous.
+    assert raw_hits, "Test setup error: raw scan found no markers to verify against"
+
+
 # === TEST 17: Weights sum to 100 and no dimension exceeds max ===
 
 def test_weights_sum_to_100():
@@ -794,6 +922,150 @@ def test_f1_bad_spec_from_contract_must_fail():
     )
 
 
+def test_f1_near_duplicate_content_bypass_is_blocked():
+    """F1 REGRESSION (anti-gaming): a spec that keeps the three named F1 defects
+    (dup-in-spirit steps, generic-tone guardrails, UNTESTED failure) but paraphrases
+    around the fixture's incidental blockers must not pass.
+
+    The F1 fix, as originally written, was a check on the exact-string shape of the
+    F1 fixture: it relied on empty evidence trail, 1-char evidence detail 'x',
+    literal "Validate input" guardrails, and steps that never name Status to trip
+    other blockers (hollow evidence_grounding, C8 filler, C10 coupling). A
+    refinement loop that reads the scorer converges on a spec that keeps the three
+    named semantic defects while patching those four incidentals — and it scored
+    82/100 passed=True with no blocking issue, because none of the surviving
+    checks look at NEAR-duplication of instructions.
+
+    This test pins the semantic property the F1 fix advertises: near-duplicate
+    orchestration steps and near-duplicate guardrails must block the spec, even
+    when the exact strings differ by trailing filler, punctuation, or word order.
+    """
+    counter_example = DerivedAgentSpec(
+        intent="Update Case Status",
+        confidence=0.7,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="status",
+                object_api_name="Case",
+                field_api_name="Status",
+                evidence=[
+                    SpecEvidence(
+                        "data-delta",
+                        "Case.Status changed New -> Working at step-004",
+                    )
+                ],
+            )
+        ],
+        # Near-duplicates: identical content tokens after stripping stopwords
+        # ("now"/"here"). The exact-string set counts these as 2 distinct steps,
+        # so the completeness section awards full credit and the earlier F1 fix
+        # sees nothing to fail on.
+        orchestration_steps=[
+            "Resolve the Case Status now",
+            "Resolve the Case Status here",
+        ],
+        # Near-duplicates: differ only by a trailing period, and the generic-guardrail
+        # blocklist does not contain "handle input safely".
+        guardrails=[
+            "Please handle input safely",
+            "Please handle input safely.",
+        ],
+        failure_handling=[
+            "No failures were observed in this run, so error paths are UNTESTED. "
+            "Record a failing variant before relying on this spec."
+        ],
+        unknowns=[],
+        # Non-empty evidence trail so the "no top-level evidence trail" blocker
+        # does not fire.
+        evidence=[SpecEvidence("extraction", "4 actions in recording")],
+    )
+
+    result = score_spec(counter_example)
+
+    assert not result.passed, (
+        f"F1 ANTI-GAMING REGRESSION: near-duplicate paraphrase spec passed "
+        f"(score={result.total}/100). The F1 fix must reject two steps or two "
+        "guardrails that carry the same content tokens after stopword/punctuation "
+        "stripping, not merely two textually-identical strings."
+    )
+
+    # The blocker must explicitly cite near-duplication so the failure is
+    # auditable — a spec author who fixes an unrelated defect must not
+    # accidentally make this one silently pass.
+    near_dup_blockers = [
+        issue for issue in result.blocking_issues
+        if "near-duplicate" in issue.lower()
+    ]
+    assert near_dup_blockers, (
+        f"F1 ANTI-GAMING REGRESSION: spec blocked but not with a near-duplicate "
+        f"reason. Blocking issues: {result.blocking_issues}"
+    )
+
+    # Both surfaces (steps AND guardrails) must be called out; otherwise a spec
+    # can shed one and slip through by paraphrasing on the other side.
+    step_blocker = [i for i in near_dup_blockers if "orchestration step" in i.lower()]
+    guardrail_blocker = [i for i in near_dup_blockers if "guardrail" in i.lower()]
+    assert step_blocker, (
+        f"F1 ANTI-GAMING REGRESSION: near-duplicate steps not flagged. "
+        f"Blocking issues: {result.blocking_issues}"
+    )
+    assert guardrail_blocker, (
+        f"F1 ANTI-GAMING REGRESSION: near-duplicate guardrails not flagged. "
+        f"Blocking issues: {result.blocking_issues}"
+    )
+
+
+def test_f1_near_duplicate_check_does_not_fire_on_legitimate_enumeration():
+    """F1 REGRESSION guard: the near-duplicate check must not fire on
+    legitimately-distinct enumerated steps like D3's "Escalate to tier N", where
+    the numeric suffix is the semantic differentiator.
+
+    Digits are content tokens, not stopwords, so a signature over the token set
+    preserves the distinction. This test pins that: if the check ever starts
+    stripping digits (the same mistake the D3 fix corrected in the distinct-set
+    logic), it will fail here.
+    """
+    spec = DerivedAgentSpec(
+        intent="Escalate Case through tiers",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="CaseAgent",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("data-delta", "Case observed at step-001")],
+            ),
+        ],
+        orchestration_steps=[
+            "Escalate to tier 1",
+            "Escalate to tier 2",
+            "Escalate to tier 3",
+        ],
+        guardrails=[
+            "Enforce FLS on Case 1",
+            "Enforce FLS on Case 2",
+        ],
+        failure_handling=[
+            "Observed validation failure during recording: tier locked at step-003"
+        ],
+        unknowns=[],
+        evidence=[SpecEvidence("data-delta", "Case observed")],
+    )
+
+    result = score_spec(spec)
+    near_dup_blockers = [
+        issue for issue in result.blocking_issues
+        if "near-duplicate" in issue.lower()
+    ]
+    assert not near_dup_blockers, (
+        f"F1 ANTI-GAMING REGRESSION guard: near-duplicate check falsely fired on "
+        f"legitimately-distinct enumerated steps/guardrails. Blocking issues: "
+        f"{result.blocking_issues}"
+    )
+
+
 # === F2: Untested != observed ===
 
 def test_f2_untested_failure_handling_scores_zero():
@@ -878,6 +1150,136 @@ def test_f3_distinct_steps_score_correctly():
     assert completeness_dim.score == completeness_dim.max_score, (
         f"F3 FAILED: Distinct steps scored {completeness_dim.score} on completeness, "
         f"expected {completeness_dim.max_score}."
+    )
+
+
+# === D3 COMPATIBILITY: numbered-suffix enumerations are legitimately distinct ===
+
+def test_d3_enumerated_orchestration_steps_are_not_padding():
+    """D3: Six semantically-distinct enumerated escalation steps must score full marks.
+
+    The prior fix stripped a trailing `\\s+\\d+$` before hashing into
+    `distinct_steps`. That collapsed legitimately-distinct enumerated steps like
+    ["Escalate to tier 1", ..., "Escalate to tier 6"] into a single bucket
+    ("escalate to tier"), tripping PADDING DETECTED and knocking the section
+    score down to section_score // 4.
+
+    The counter-example from the D3 report: six semantically-distinct escalation
+    paths. After the fix, each retains its digit suffix, all six are distinct,
+    the padding ratio is 1.0, and the orchestration section awards full credit.
+    """
+    from sf_video_blueprint.spec_builder import DerivedAgentSpec, DerivedEntity, SpecEvidence
+
+    spec = DerivedAgentSpec(
+        intent="Escalate Case through tiers",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="CaseAgent",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("data-delta", "Case observed")],
+            ),
+        ],
+        orchestration_steps=[
+            "Escalate to tier 1",
+            "Escalate to tier 2",
+            "Escalate to tier 3",
+            "Escalate to tier 4",
+            "Escalate to tier 5",
+            "Escalate to tier 6",
+        ],
+        guardrails=["Do not leak PII"],
+        failure_handling=["Retry once"],
+        unknowns=[],
+        evidence=[SpecEvidence("data-delta", "Case observed")],
+    )
+
+    result = score_spec(spec)
+    completeness_dim = result.dimensions["completeness"]
+    section_score = DIMENSION_WEIGHTS["completeness"] // 5
+
+    # PADDING DETECTED must NOT appear for legitimately-distinct enumerated steps.
+    padding_findings = [f for f in completeness_dim.findings if "PADDING DETECTED" in f and "orchestration_steps" in f]
+    assert not padding_findings, (
+        f"D3 FAILED: PADDING DETECTED falsely fired for enumerated escalation steps. "
+        f"findings={completeness_dim.findings}"
+    )
+
+    # All 5 sections present -> full score; orchestration must get section_score, not section_score // 4.
+    assert completeness_dim.score == completeness_dim.max_score, (
+        f"D3 FAILED: Six distinct enumerated steps scored {completeness_dim.score} on completeness, "
+        f"expected {completeness_dim.max_score}. The orchestration section was likely knocked to "
+        f"section_score // 4 = {section_score // 4} instead of section_score = {section_score}."
+    )
+
+
+def test_d3_step_1_step_2_step_3_convention_is_not_padding():
+    """D3: The common ["Step 1","Step 2","Step 3"] naming convention must not zero the section."""
+    spec = _make_spec(
+        orchestration_steps=["Step 1", "Step 2", "Step 3"],
+    )
+    result = score_spec(spec)
+    completeness_dim = result.dimensions["completeness"]
+
+    # "Step 1"/"Step 2"/"Step 3" previously collapsed to {"step"} -> distinct_count == 1
+    # -> else branch -> orchestration section = 0 points. After fix, all three are
+    # distinct -> full section credit.
+    assert completeness_dim.score == completeness_dim.max_score, (
+        f"D3 FAILED: ['Step 1','Step 2','Step 3'] scored {completeness_dim.score} on completeness, "
+        f"expected {completeness_dim.max_score}. Numbered-label convention was wrongly collapsed."
+    )
+
+
+def test_d3_enumerated_guardrails_are_not_padding():
+    """D3: Enumerated guardrails like ['Enforce FLS on Case 1'..'..N'] must not trigger PADDING DETECTED.
+
+    The identical regex was reused for guardrails; the same defect applied.
+    """
+    spec = _make_spec(
+        guardrails=[
+            "Enforce FLS on Case 1",
+            "Enforce FLS on Case 2",
+            "Enforce FLS on Case 3",
+            "Enforce FLS on Case 4",
+            "Enforce FLS on Case 5",
+            "Enforce FLS on Case 6",
+        ],
+    )
+    result = score_spec(spec)
+    completeness_dim = result.dimensions["completeness"]
+
+    padding_findings = [f for f in completeness_dim.findings if "PADDING DETECTED" in f and "guardrails" in f]
+    assert not padding_findings, (
+        f"D3 FAILED: PADDING DETECTED falsely fired for enumerated guardrails. "
+        f"findings={completeness_dim.findings}"
+    )
+
+    # Six textually-distinct guardrails => full guardrail-section credit, no duplicate penalty.
+    assert completeness_dim.score == completeness_dim.max_score, (
+        f"D3 FAILED: Six distinct enumerated guardrails scored {completeness_dim.score} on completeness, "
+        f"expected {completeness_dim.max_score}."
+    )
+
+
+def test_d3_actual_duplicate_steps_still_penalized():
+    """D3 GUARDRAIL: textually-identical duplicates must still collapse and trigger padding penalty.
+
+    The fix removes trailing-digit stripping but must NOT weaken detection of
+    true duplicates like ["Save Case","Save Case",...] (which the exact-match
+    set still collapses).
+    """
+    spec = _make_spec(
+        orchestration_steps=["Save Case"] * 6,
+    )
+    result = score_spec(spec)
+    completeness_dim = result.dimensions["completeness"]
+
+    padding_findings = [f for f in completeness_dim.findings if "PADDING DETECTED" in f and "orchestration_steps" in f]
+    assert padding_findings, (
+        f"D3 REGRESSION: True duplicates no longer trigger PADDING DETECTED. "
+        f"findings={completeness_dim.findings}"
     )
 
 
@@ -1515,4 +1917,405 @@ def test_provenance_kwarg_none():
     provenance_blockers = [issue for issue in result.blocking_issues if "provenance" in issue.lower()]
     assert len(provenance_blockers) == 0, (
         f"Expected no provenance-related blocker when provenance=None, got: {provenance_blockers}"
+    )
+
+
+# === C12: Mandated-only branch must not reward deleting an inference entity ===
+
+def test_c12_deleting_inference_entity_down_to_mandated_recordid_never_raises_score():
+    """C12 REGRESSION: G1 violation via the mandated-only branch.
+
+    Pre-fix: a spec with one honestly-labelled inference-only observed entity
+    (customer_name on Contact.Name) plus the mandated recordId scored
+    evidence_grounding=0 (all-inference path, floor 0% + coverage 0%). Deleting
+    the inference entity left ONLY the mandated recordId, sending the scorer
+    into the `if total_entities == 0` branch, which returned max_score // 4 = 7.
+
+    That is a G1 violation: deletion of the honestly-labelled inference entity
+    raised evidence_grounding by 7. It also crossed
+    HOLLOW_DIMENSION_FRACTION * 30 = 3, so the hollow-dimension blocker that
+    fired at 0/30 stopped firing at 7/30 — deletion additionally REMOVED a
+    blocking issue.
+
+    This is the exact "concealing beats declaring" inversion the C5 fix
+    already removed from the ratio arithmetic, smuggled back in through the
+    mandated-only fallback.
+
+    Fix: the mandated-only branch must score no higher than an all-inference
+    observed spec (which scores 0). This test pins both invariants:
+      1. evidence_grounding does not RISE on deletion,
+      2. the hollow-dimension blocker does not DISAPPEAR on deletion.
+    """
+    spec_before = DerivedAgentSpec(
+        intent="Look up customer for case",
+        confidence=0.5,
+        objects_touched=["Case", "Contact"],
+        entities=[
+            DerivedEntity(
+                name="customer_name",
+                object_api_name="Contact",
+                field_api_name="Name",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "customer name is likely needed for the process",
+                )],
+            ),
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "a Case record must be identified",
+                )],
+            ),
+        ],
+        orchestration_steps=[
+            "Resolve and load the target Case record",
+            "SUBMIT on button:Save -> writes Status",
+        ],
+        guardrails=["Require explicit user confirmation before writing: Status."],
+        failure_handling=[
+            "Observed validation failure during recording: Status must be one of approved values",
+        ],
+        unknowns=[],
+        evidence=[SpecEvidence("telemetry", "validation observed")],
+    )
+
+    # Delete the inference entity, leaving only the mandated recordId.
+    spec_after = DerivedAgentSpec(
+        intent=spec_before.intent,
+        confidence=spec_before.confidence,
+        objects_touched=spec_before.objects_touched,
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "a Case record must be identified",
+                )],
+            ),
+        ],
+        orchestration_steps=list(spec_before.orchestration_steps),
+        guardrails=list(spec_before.guardrails),
+        failure_handling=list(spec_before.failure_handling),
+        unknowns=list(spec_before.unknowns),
+        evidence=list(spec_before.evidence),
+    )
+
+    score_before = score_spec(spec_before)
+    score_after = score_spec(spec_after)
+
+    grounding_before = score_before.dimensions["evidence_grounding"].score
+    grounding_after = score_after.dimensions["evidence_grounding"].score
+
+    # (1) Deletion must not RAISE evidence_grounding.
+    assert grounding_after <= grounding_before, (
+        f"C12 VIOLATED: Deleting the honestly-labelled inference entity raised "
+        f"evidence_grounding from {grounding_before}/30 to {grounding_after}/30. "
+        "Deletion of an honestly-declared inference row must never pay."
+    )
+
+    # (2) Deletion must not remove the hollow-dimension blocker on
+    #     evidence_grounding. If the pre-deletion spec was blocked as hollow on
+    #     evidence_grounding (score <= 10% of 30 = 3), the post-deletion spec
+    #     must be at least as hollow.
+    def _hollow_on_grounding(result):
+        return any(
+            "Hollow dimension" in issue and "evidence_grounding" in issue
+            for issue in result.blocking_issues
+        )
+
+    if _hollow_on_grounding(score_before):
+        assert _hollow_on_grounding(score_after), (
+            "C12 VIOLATED: Pre-deletion spec was blocked as hollow on "
+            "evidence_grounding; post-deletion spec no longer trips the "
+            "hollow-dimension blocker. Deletion must not clear a blocking issue."
+        )
+
+    # (3) Belt-and-braces: total score must also not rise.
+    assert score_after.total <= score_before.total, (
+        f"C12 VIOLATED: Total rose on deletion, "
+        f"{score_before.total} -> {score_after.total}."
+    )
+
+
+# === D2 COMPLETENESS: mandated-only branch must not reward deletion ===
+
+def test_d2_deleting_declared_inference_into_mandated_only_branch_never_raises_score():
+    """D2 COMPLETENESS: Deleting an honestly-declared inference entity, so that only
+    the mandated recordId remains, must not raise evidence_grounding.
+
+    The counter-example: a spec with entities=[recordId(inference), priority(inference)]
+    is scored via the all-inference observed-entity path -> 0/30. Deleting `priority`
+    used to fall into the `if total_entities == 0:` shortcut and jump to
+    max_score // 4 = 7/30. That paid +7 for concealment and symmetrically cost 7
+    for honestly declaring an inference — the "concealing beats declaring" inversion
+    the C5 comment in spec_score.py names as the worst possible outcome.
+    """
+    spec_declared = DerivedAgentSpec(
+        intent="Update Case",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("inference", "a Case record must be identified to act on it")],
+            ),
+            DerivedEntity(
+                name="priority",
+                object_api_name="Case",
+                field_api_name="Priority",
+                evidence=[SpecEvidence("inference", "priority may be adjusted during triage based on customer type")],
+            ),
+        ],
+        orchestration_steps=[
+            "Resolve and load the target Case record",
+            "SUBMIT on button:Save -> writes Priority",
+        ],
+        guardrails=["Enforce object- and field-level security on Case for the running user."],
+        failure_handling=["No failures were observed in this run, so error paths are UNTESTED."],
+        unknowns=[],
+        evidence=[SpecEvidence("extraction", "2 action(s) in recording")],
+    )
+
+    spec_deleted = DerivedAgentSpec(
+        intent="Update Case",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("inference", "a Case record must be identified to act on it")],
+            ),
+        ],
+        orchestration_steps=[
+            "Resolve and load the target Case record",
+            "SUBMIT on button:Save -> writes Priority",
+        ],
+        guardrails=["Enforce object- and field-level security on Case for the running user."],
+        failure_handling=["No failures were observed in this run, so error paths are UNTESTED."],
+        unknowns=[],
+        evidence=[SpecEvidence("extraction", "2 action(s) in recording")],
+    )
+
+    score_declared = score_spec(spec_declared)
+    score_deleted = score_spec(spec_deleted)
+
+    declared_grounding = score_declared.dimensions["evidence_grounding"].score
+    deleted_grounding = score_deleted.dimensions["evidence_grounding"].score
+
+    # (1) The dimension score cannot rise on deletion.
+    assert deleted_grounding <= declared_grounding, (
+        f"D2 COMPLETENESS VIOLATED: Deleting the honestly-declared inference entity "
+        f"raised evidence_grounding from {declared_grounding} to {deleted_grounding}. "
+        "The `if total_entities == 0:` mandated-only shortcut still pays for concealment."
+    )
+
+    # (2) The total also cannot rise on deletion.
+    assert score_deleted.total <= score_declared.total, (
+        f"D2 COMPLETENESS VIOLATED: Deletion raised total {score_declared.total} -> {score_deleted.total}."
+    )
+
+    # (3) Concrete pin: the pre-fix behaviour was exactly declared=0, deleted=7.
+    # After the fix both must be 0, so declaring an inference costs nothing on grounding.
+    assert declared_grounding == 0, (
+        f"D2 setup precondition: declared-inference spec must score 0 on grounding, "
+        f"got {declared_grounding}."
+    )
+    assert deleted_grounding == 0, (
+        f"D2 COMPLETENESS VIOLATED: Mandated-only branch returned {deleted_grounding}, "
+        "should be 0. Otherwise deletion is rewarded on this branch."
+    )
+
+
+def test_d2_mandated_filter_uses_semantic_all_inference_not_list_identity():
+    """D2 SECONDARY: The mandated-recordId filter must treat a recordId whose EVERY
+    evidence entry is inference as mandated, regardless of how many inference entries
+    it carries. The previous `sources == ['inference']` list-identity check let a
+    recordId with two inference evidence entries escape the filter and be scored as
+    an observed entity — so "mandated" was defined by list length, not semantics.
+
+    Behavioural pin: a spec whose ONLY entity is a recordId with two inference
+    entries must be indistinguishable, on evidence_grounding, from a spec whose
+    ONLY entity is a recordId with one inference entry. Both are the mandated-only
+    case and must score identically (0/30 after the D2 fix).
+    """
+    spec_single = _make_spec(
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence("inference", "a Case record must be identified to act on it")],
+            ),
+        ],
+    )
+    spec_multi = _make_spec(
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[
+                    SpecEvidence("inference", "a Case record must be identified to act on it"),
+                    SpecEvidence("inference", "the record id anchors the write target for downstream steps"),
+                ],
+            ),
+        ],
+    )
+
+    g_single = score_spec(spec_single).dimensions["evidence_grounding"].score
+    g_multi = score_spec(spec_multi).dimensions["evidence_grounding"].score
+
+    assert g_single == g_multi, (
+        f"D2 SECONDARY VIOLATED: recordId with a single inference entry scored "
+        f"{g_single}, with two inference entries scored {g_multi}. The mandated "
+        "filter must be defined by evidence semantics ('all sources are inference'), "
+        "not by list length."
+    )
+
+
+def test_d2_anti_gaming_subject_inference_deletion_never_pays_seam_check():
+    """D2 ANTI-GAMING: pin the exact counter-example from the D2-followup review.
+
+    Claim to disprove: 'When only the mandated recordId remains (total_entities==0),
+    score is max_score//4 = 7. When one all-inference observed entity is added,
+    floor_pct=0 and coverage_bonus=0, so score is 0. Deleting the honest inference
+    entity therefore raises the score from 0 to 7.'
+
+    Since `spec_builder` emits `source='inference'` for asserted/ambiguous inputs
+    (lines ~292/300 at the time of writing), teaching the refinement loop that
+    deleting those inference rows PAYS +7 is the same 'concealing beats declaring'
+    inversion the C5 comment in spec_score.py names as the worst possible outcome.
+
+    This test pins:
+      1. deleting the honest inference `subject` entity does NOT raise
+         evidence_grounding;
+      2. it does NOT raise the total either;
+      3. it does NOT remove a hollow-dimension blocker on evidence_grounding.
+
+    Uses the review's exact entity shapes (recordId + subject inference detail)
+    verbatim, so the two branches at the seam (`total_entities==0` and
+    `total_entities>0, all-inference`) are compared on the exact input the review
+    used to construct the inversion.
+    """
+    with_subject = DerivedAgentSpec(
+        intent="Update Case subject",
+        confidence=0.5,
+        objects_touched=["Case"],
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "a Case record must be identified to act on it",
+                )],
+            ),
+            DerivedEntity(
+                name="subject",
+                object_api_name="Case",
+                field_api_name="Subject",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "input observed at step-005; no data delta could be resolved within window",
+                )],
+            ),
+        ],
+        orchestration_steps=[
+            "Resolve and load the target Case record",
+            "SUBMIT on button:Save -> writes Subject",
+        ],
+        guardrails=["Require explicit user confirmation before writing: Subject."],
+        failure_handling=["Observed validation failure during recording: Subject required"],
+        unknowns=[],
+        evidence=[SpecEvidence("extraction", "2 action(s) in recording")],
+    )
+
+    # Delete the honestly-declared subject inference entity, leaving only the
+    # mandated recordId. This is the exact deletion the review claimed pays +7.
+    only_mandated = DerivedAgentSpec(
+        intent=with_subject.intent,
+        confidence=with_subject.confidence,
+        objects_touched=list(with_subject.objects_touched),
+        entities=[
+            DerivedEntity(
+                name="recordId",
+                object_api_name="Case",
+                field_api_name="Id",
+                evidence=[SpecEvidence(
+                    "inference",
+                    "a Case record must be identified to act on it",
+                )],
+            ),
+        ],
+        orchestration_steps=list(with_subject.orchestration_steps),
+        guardrails=list(with_subject.guardrails),
+        failure_handling=list(with_subject.failure_handling),
+        unknowns=list(with_subject.unknowns),
+        evidence=list(with_subject.evidence),
+    )
+
+    score_with = score_spec(with_subject)
+    score_deleted = score_spec(only_mandated)
+
+    grounding_with = score_with.dimensions["evidence_grounding"].score
+    grounding_deleted = score_deleted.dimensions["evidence_grounding"].score
+
+    # (1) The seam invariant: crossing between the `total_entities==0` shortcut and
+    # the all-inference general path must not reward deletion.
+    assert grounding_deleted <= grounding_with, (
+        f"D2 ANTI-GAMING VIOLATED: deleting the honest inference `subject` entity "
+        f"raised evidence_grounding {grounding_with}/30 -> {grounding_deleted}/30. "
+        "The mandated-only shortcut is again paying for concealing an "
+        "honestly-declared inference row — the exact 'concealing beats declaring' "
+        "inversion the C5 comment forbids."
+    )
+
+    # (2) Total must not rise either — a rise on the seam can leak into the total
+    # even if the dimension is separately capped.
+    assert score_deleted.total <= score_with.total, (
+        f"D2 ANTI-GAMING VIOLATED: deleting the honest inference `subject` entity "
+        f"raised total {score_with.total} -> {score_deleted.total}."
+    )
+
+    # (3) Hollow-dimension blocker preservation. If the pre-deletion spec was
+    # blocked as hollow on evidence_grounding, deletion must NOT clear that
+    # blocker — otherwise the fabricator gains a strictly-better outcome than the
+    # score alone reveals (fewer blocking issues => higher band, potentially
+    # passed=True even if the raw number is unchanged).
+    def _hollow_on_grounding(result):
+        return any(
+            "Hollow dimension" in issue and "evidence_grounding" in issue
+            for issue in result.blocking_issues
+        )
+
+    if _hollow_on_grounding(score_with):
+        assert _hollow_on_grounding(score_deleted), (
+            "D2 ANTI-GAMING VIOLATED: pre-deletion spec was blocked as hollow on "
+            "evidence_grounding; post-deletion spec no longer trips the "
+            "hollow-dimension blocker. Deletion silently cleared a blocker."
+        )
+
+    # (4) Concrete pins on the review's numeric claim. Both branches at the seam
+    # must be exactly 0/30 — not 7 in one and 0 in the other. If a future edit
+    # restores `max_score // 4` on the mandated-only branch, this line fires.
+    assert grounding_with == 0, (
+        f"Setup precondition: all-inference (recordId + subject inference) must "
+        f"score 0/30 on evidence_grounding, got {grounding_with}."
+    )
+    assert grounding_deleted == 0, (
+        f"D2 ANTI-GAMING VIOLATED: mandated-only branch scored {grounding_deleted}/30, "
+        "must be 0 to match the all-inference general path. Any positive value "
+        "on this branch re-establishes the +7 inversion the review described."
     )

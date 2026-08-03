@@ -31,6 +31,7 @@ Two output dialects, one source:
 
 from __future__ import annotations
 
+import keyword
 import re
 
 # The Agentforce compilation API rejects a subagent name longer than 80
@@ -96,6 +97,26 @@ _UNRESOLVED_PREFIX = "UNRESOLVED:"
 #
 # Suffixing is preferred over raising: the recording is real evidence and the
 # operator cannot rename a business process to satisfy our parser.
+# Python reserved words (HARD keywords only). Included because Agent Script
+# consumers (validators, transpilers, and tooling that pipes the emitted
+# `.agent` file through Python identifier paths) treat these as illegal
+# identifiers. Empirically, a subagent named `class` or `return` in
+# `@subagent.class` produces a compiler-rejected script — the emitted token
+# collides with a Python keyword in the toolchain that parses it. Guarding
+# here (in the shared token list) keeps `topic_api_name` and `subagent_name`
+# escaping in lockstep so `names_agree` still holds.
+#
+# **Soft keywords are deliberately excluded.** `keyword.softkwlist` (`match`,
+# `case`, `type`, `_` as of 3.10+) are legal Python identifiers — `class Foo:
+# case = 5; obj.case` compiles and runs. The empirical justification above
+# cites hard keywords only and does NOT carry over to soft keywords. Including
+# them causes false positives: intent `"Case"` (the Salesforce standard object)
+# tokenizes to `["Case"]`, joins to `case`, and would be suffixed to
+# `Case_topic` / `case_topic`, silently breaking backward compatibility with
+# any prior generated spec whose topic was `Case`. Same false positive for
+# `"Type"`, `"Match"`, `"_"`.
+_PYTHON_KEYWORDS: frozenset[str] = frozenset(kw.lower() for kw in keyword.kwlist)
+
 _RESERVED_SUBAGENT_NAMES = frozenset(
     {
         # Standard subagents present in every emitted script.
@@ -111,6 +132,7 @@ _RESERVED_SUBAGENT_NAMES = frozenset(
         "subagent",
         "utils",
     }
+    | _PYTHON_KEYWORDS
 )
 
 # Appended to a derived name that collides with a reserved word. Reads as a topic
